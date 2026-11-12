@@ -1,0 +1,161 @@
+.layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: #F1F5F9;
+}
+
+.header {
+  background: #FFFFFF;
+  border-bottom: 1px solid #E2E8F0;
+  padding: 12px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logoIcon {
+  font-size: 28px;
+}
+
+.appTitle {
+  font-size: 16px;
+  font-weight: 700;
+  color: #1976D2;
+  margin: 0;
+  letter-spacing: 0.5px;
+}
+
+.appSubtitle {
+  font-size: 11px;
+  color: #64748B;
+  margin: 2px 0 0 0;
+}
+
+.nav {
+  display: flex;
+  gap: 8px;
+}
+
+.navLink {
+  text-decoration: none;
+  font-size: 14px;
+  font-weight: 600;
+  color: #475569;
+  padding: 8px 16px;
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+
+.navLink:hover {
+  background: #F1F5F9;
+  color: #0F172A;
+}
+
+.navLink.active {
+  background: #EFF6FF;
+  color: #1976D2;
+}
+
+.statusArea {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.connectionBadges {
+  display: flex;
+  gap: 6px;
+}
+
+.badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+}
+
+.badge.ok {
+  background: #DCFCE7;
+  color: #15803D;
+  border-color: #86EFAC;
+}
+
+.badge.warn {
+  background: #FEF3C7;
+  color: #B45309;
+  border-color: #FDE68A;
+}
+
+.badge.error {
+  background: #FEE2E2;
+  color: #B91C1C;
+  border-color: #FCA5A5;
+}
+
+.authInfo {
+  display: flex;
+  align-items: center;
+}
+
+.userBox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.userName {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1E293B;
+}
+
+.logoutBtn {
+  background: #F1F5F9;
+  border: 1px solid #CBD5E1;
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  color: #475569;
+}
+
+.logoutBtn:hover {
+  background: #E2E8F0;
+  color: #0F172A;
+}
+
+.loginBtn {
+  background: #1976D2;
+  color: #FFFFFF;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.loginBtn:hover {
+  background: #1565C0;
+}
+
+.content {
+  flex: 1;
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 16px 24px;
+  box-sizing: border-box;
+}

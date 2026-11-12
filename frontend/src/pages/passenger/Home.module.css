@@ -1,0 +1,235 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.alertBanner {
+  background: #FEF2F2;
+  border: 1px solid #F87171;
+  color: #991B1B;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.manualNotice {
+  background: #EFF6FF;
+  border: 1px solid #60A5FA;
+  color: #1E40AF;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.mainGrid {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 900px) {
+  .mainGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.card {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.cardTitle {
+  font-size: 16px;
+  font-weight: 600;
+  color: #0F172A;
+  margin: 0 0 12px 0;
+}
+
+.emptyText {
+  font-size: 13px;
+  color: #64748B;
+  font-style: italic;
+}
+
+.destList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  margin-bottom: 16px;
+}
+
+.destItem {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid #E2E8F0;
+  border-radius: 6px;
+  background: #F8FAFC;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s;
+}
+
+.destItem:hover:not(:disabled) {
+  background: #EFF6FF;
+  border-color: #3B82F6;
+}
+
+.destItem.selected {
+  background: #EFF6FF;
+  border-color: #1D4ED8;
+  box-shadow: 0 0 0 2px rgba(29, 78, 216, 0.2);
+}
+
+.destItem:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.destName {
+  font-weight: 500;
+  color: #1E293B;
+  font-size: 14px;
+}
+
+.destCoord {
+  font-size: 11px;
+  color: #64748B;
+}
+
+.statusSection {
+  border-top: 1px solid #E2E8F0;
+  padding-top: 14px;
+}
+
+.subTitle {
+  font-size: 13px;
+  color: #64748B;
+  text-transform: uppercase;
+  margin: 0 0 8px 0;
+  font-weight: 600;
+}
+
+.statusBox {
+  background: #F8FAFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 12px;
+}
+
+.statusRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+}
+
+.statusMessage {
+  margin: 6px 0 0 0;
+  font-size: 12px;
+  color: #475569;
+}
+
+.navigating { color: #2563EB; }
+.succeeded { color: #16A34A; }
+.failed { color: #DC2626; }
+.canceled { color: #D97706; }
+.idle { color: #64748B; }
+
+.errorText {
+  color: #DC2626;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.primaryBtn {
+  flex: 1;
+  background: #1976D2;
+  color: #FFFFFF;
+  border: none;
+  padding: 12px;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.primaryBtn:hover:not(:disabled) {
+  background: #1565C0;
+}
+
+.primaryBtn:disabled {
+  background: #94A3B8;
+  cursor: not-allowed;
+}
+
+.cancelBtn {
+  flex: 1;
+  background: #DC2626;
+  color: #FFFFFF;
+  border: none;
+  padding: 12px;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cancelBtn:hover:not(:disabled) {
+  background: #B91C1C;
+}
+
+.mapArea {
+  display: flex;
+  flex-direction: column;
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.mapHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  background: #F8FAFC;
+  border-bottom: 1px solid #E2E8F0;
+}
+
+.mapTitle {
+  font-weight: 600;
+  font-size: 14px;
+  color: #1E293B;
+}
+
+.mapHelp {
+  font-size: 11px;
+  color: #64748B;
+}
+
+.mapWrapper {
+  flex: 1;
+  height: 520px;
+}

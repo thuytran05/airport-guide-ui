@@ -1,0 +1,154 @@
+.voiceCard {
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.title {
+  font-weight: 600;
+  color: #1E293B;
+  font-size: 15px;
+}
+
+.stateBadge {
+  font-size: 11px;
+  font-weight: bold;
+  padding: 3px 8px;
+  border-radius: 12px;
+  text-transform: uppercase;
+}
+
+.stateBadge.idle {
+  background: #F1F5F9;
+  color: #64748B;
+}
+
+.stateBadge.listening {
+  background: #DCFCE7;
+  color: #15803D;
+  animation: pulse 1.5s infinite;
+}
+
+.stateBadge.processing {
+  background: #FEF3C7;
+  color: #B45309;
+}
+
+.stateBadge.speaking {
+  background: #DBEAFE;
+  color: #1D4ED8;
+}
+
+.stateBadge.error {
+  background: #FEE2E2;
+  color: #B91C1C;
+}
+
+.micSection {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+}
+
+.micButton {
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  border: none;
+  background: #1976D2;
+  color: #FFFFFF;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  box-shadow: 0 4px 6px rgba(25, 118, 210, 0.25);
+}
+
+.micButton:hover:not(:disabled) {
+  background: #1565C0;
+  transform: scale(1.05);
+}
+
+.micButton.active {
+  background: #16A34A;
+  animation: pulse 1.5s infinite;
+}
+
+.micButton:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.statusDescription {
+  font-size: 13px;
+  color: #475569;
+  text-align: center;
+  margin: 0;
+  min-height: 18px;
+}
+
+.errorMessage {
+  background: #FEF2F2;
+  border: 1px solid #F87171;
+  color: #991B1B;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  text-align: center;
+}
+
+.dialogBox {
+  background: #F8FAFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.transcriptRow strong, .responseRow strong {
+  display: block;
+  font-size: 11px;
+  color: #64748B;
+  text-transform: uppercase;
+}
+
+.transcriptRow p, .responseRow p {
+  margin: 2px 0 0 0;
+  color: #0F172A;
+}
+
+.footerNote {
+  border-top: 1px dashed #E2E8F0;
+  padding-top: 8px;
+  text-align: center;
+  color: #94A3B8;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 12px rgba(22, 163, 74, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0);
+  }
+}

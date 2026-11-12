@@ -1,0 +1,67 @@
+# Danh sách điểm đến lưu bền vững của robot (Destinations Database)
+# Tệp này được quản lý và đọc bởi ROS / Adapter, dùng chung cho Web và Giọng nói.
+map_id: "airport_floor_1"
+destinations:
+  - id: "gate_1"
+    name: "Cổng khởi hành số 1"
+    map_id: "airport_floor_1"
+    pose:
+      header:
+        frame_id: "map"
+      position:
+        x: 18.5
+        y: 4.2
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        w: 1.0
+
+  - id: "gate_2"
+    name: "Cổng khởi hành số 2"
+    map_id: "airport_floor_1"
+    pose:
+      header:
+        frame_id: "map"
+      position:
+        x: 24.0
+        y: 8.5
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: 0.7071
+        w: 0.7071
+
+  - id: "info_desk"
+    name: "Quầy thông tin"
+    map_id: "airport_floor_1"
+    pose:
+      header:
+        frame_id: "map"
+      position:
+        x: 10.0
+        y: 12.0
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: 1.0
+        w: 0.0
+
+  - id: "restroom"
+    name: "Khu vệ sinh công cộng"
+    map_id: "airport_floor_1"
+    pose:
+      header:
+        frame_id: "map"
+      position:
+        x: 5.5
+        y: 3.8
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: -0.7071
+        w: 0.7071

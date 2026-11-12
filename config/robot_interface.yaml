@@ -1,0 +1,291 @@
+# ==============================================================================
+# TỆP CẤU HÌNH GIAO TIẾP ROS CHO ROBOT DẪN ĐƯỜNG SÂN BAY (AIRPORT GUIDE ROBOT)
+# ==============================================================================
+# Đây là nơi DUY NHẤT để sửa tên topic, service, action, QoS và các tham số
+# kết nối ROS 2 của hệ thống Web Gateway.
+# Không lưu mật khẩu hoặc token bí mật trong tệp này.
+# ==============================================================================
+
+schema_version: "1.0"
+
+# Profile hoạt động hiện tại: "sim" (Mô phỏng Gazebo) hoặc "real" (Robot thật)
+# Đổi giá trị này rồi khởi động lại backend để áp dụng.
+active_profile: "sim"
+
+# ------------------------------------------------------------------------------
+# 1. THÔNG SỐ KẾT NỐI MẠNG GIỮA TRÌNH DUYỆT VÀ WEB GATEWAY
+# (Phân biệt URL HTTP/WS của Web với các tên topic/service của ROS)
+# ------------------------------------------------------------------------------
+connection:
+  gateway_http_url: "http://localhost:8000"
+  gateway_ws_url: "ws://localhost:8000/ws"
+  # ros_domain_id mặc định cho hệ thống (profile sim hoặc real có thể ghi đè)
+  ros_domain_id: 42
+
+# ------------------------------------------------------------------------------
+# 2. CÁC HỆ QUY CHIẾU TỌA ĐỘ (COORDINATE FRAMES)
+# ------------------------------------------------------------------------------
+frames:
+  map: "map"              # Frame bản đồ gốc và tọa độ các điểm đến
+  odom: "odom"            # Frame đo quãng đường định vị cục bộ
+  base_link: "base_link"  # Frame tâm thân xe robot (dùng cho lệnh vận tốc điều khiển)
+
+# ------------------------------------------------------------------------------
+# 3. DANH SÁCH TOPIC (GATEWAY ĐỌC HOẶC GHI)
+# direction: "subscribe" (Robot -> Web) hoặc "publish" (Web -> Robot)
+# required: true (bắt buộc theo hợp đồng), false (tùy chọn)
+# ------------------------------------------------------------------------------
+topics:
+  # Bản đồ chiếm dụng 2D dạng OccupancyGrid
+  map:
+    name: "/airport/map"
+    type: "nav_msgs/msg/OccupancyGrid"
+    direction: "subscribe"
+    enabled: true
+    required: true
+    qos:
+      reliability: "reliable"
+      durability: "transient_local"
+      depth: 1
+    description: "Bản đồ tĩnh sân bay để hiển thị trên web"
+
+  # Vị trí và hướng của robot trong hệ tọa độ map
+  robot_pose:
+    name: "/airport/pose"
+    type: "geometry_msgs/msg/PoseStamped"
+    direction: "subscribe"
+    enabled: true
+    required: true
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 5
+    description: "Tọa độ và góc xoay của robot trong hệ quy chiếu map (khoảng 10Hz)"
+
+  # Trạng thái tổng quát của robot (chế độ điều khiển, trạng thái dẫn đường, goal_id)
+  robot_state:
+    name: "/airport/state"
+    type: "airport_robot_interfaces/msg/RobotState"
+    direction: "subscribe"
+    enabled: true
+    required: true
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 5
+    description: "Trạng thái dẫn đường, chế độ AUTO/MANUAL, goal hiện tại và thông báo"
+
+  # Danh sách toàn bộ điểm đến trong bản đồ hiện tại
+  destinations:
+    name: "/airport/destinations"
+    type: "airport_robot_interfaces/msg/DestinationList"
+    direction: "subscribe"
+    enabled: true
+    required: true
+    qos:
+      reliability: "reliable"
+      durability: "transient_local"
+      depth: 1
+    description: "Danh sách điểm đón/trả khách dùng chung giữa Web và Voice Node"
+
+  # Trạng thái phiên tương tác giọng nói
+  voice_state:
+    name: "/airport/voice/state"
+    type: "std_msgs/msg/String"
+    direction: "subscribe"
+    enabled: true
+    required: true
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 5
+    description: "Trạng thái giọng nói: IDLE, LISTENING, PROCESSING, SPEAKING, ERROR"
+
+  # Cảnh báo và chẩn đoán lỗi phần cứng/phần mềm từ các node ROS
+  alerts:
+    name: "/airport/alerts"
+    type: "diagnostic_msgs/msg/DiagnosticArray"
+    direction: "subscribe"
+    enabled: true
+    required: true
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 10
+    description: "Mảng cảnh báo chẩn đoán hệ thống"
+
+  # Lệnh vận tốc điều khiển thủ công từ bàn phím / nút web của Admin
+  cmd_vel_manual:
+    name: "/airport/cmd_vel_manual"
+    type: "geometry_msgs/msg/TwistStamped"
+    direction: "publish"
+    enabled: true
+    required: false
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 1
+    description: "Lệnh vận tốc thủ công gửi vào bộ phân xử (chỉ dùng khi ở chế độ MANUAL)"
+
+  # [Tùy chọn] Đường dẫn lộ trình quy hoạch toàn cục của Nav2
+  path:
+    name: "/airport/path"
+    type: "nav_msgs/msg/Path"
+    direction: "subscribe"
+    enabled: true
+    required: false
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 1
+    description: "Đường đi dự kiến robot đang di chuyển theo"
+
+  # [Tùy chọn] Tình trạng pin
+  battery:
+    name: "/airport/battery"
+    type: "sensor_msgs/msg/BatteryState"
+    direction: "subscribe"
+    enabled: true
+    required: false
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 1
+    description: "Thông tin mức pin (0.0 đến 1.0) và trạng thái sạc"
+
+  # [Tùy chọn] Văn bản nhận dạng từ giọng nói người dùng
+  voice_transcript:
+    name: "/airport/voice/transcript"
+    type: "std_msgs/msg/String"
+    direction: "subscribe"
+    enabled: true
+    required: false
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 1
+    description: "Câu nói người dùng vừa được ROS nhận dạng thành công"
+
+  # [Tùy chọn] Câu trả lời phản hồi dạng chữ do ROS tạo ra
+  voice_response:
+    name: "/airport/voice/response"
+    type: "std_msgs/msg/String"
+    direction: "subscribe"
+    enabled: true
+    required: false
+    qos:
+      reliability: "reliable"
+      durability: "volatile"
+      depth: 1
+    description: "Phản hồi bằng văn bản của robot"
+
+# ------------------------------------------------------------------------------
+# 4. DANH SÁCH SERVICE (GATEWAY GỌI ĐẾN ROS)
+# direction: "service_client"
+# ------------------------------------------------------------------------------
+services:
+  # Bắt đầu lượt nghe bằng microphone của robot (Web chỉ kích hoạt, không thu âm)
+  voice_start:
+    name: "/airport/voice/start"
+    type: "std_srvs/srv/Trigger"
+    direction: "service_client"
+    enabled: true
+    required: false
+    timeout_sec: 5.0
+    description: "Yêu cầu node giọng nói ROS bắt đầu thu âm bằng mic phần cứng của robot"
+
+  # Chuyển đổi qua lại giữa chế độ AUTO và MANUAL
+  set_manual_control:
+    name: "/airport/control/set_manual"
+    type: "std_srvs/srv/SetBool"
+    direction: "service_client"
+    enabled: true
+    required: false
+    timeout_sec: 3.0
+    description: "Gửi data=true để xin chuyển sang MANUAL, data=false để về AUTO"
+
+  # Thêm hoặc cập nhật một điểm đến trong danh sách lưu trữ trên robot
+  destinations_upsert:
+    name: "/airport/destinations/upsert"
+    type: "airport_robot_interfaces/srv/UpsertDestination"
+    direction: "service_client"
+    enabled: true
+    required: false
+    timeout_sec: 5.0
+    description: "Thêm mới hoặc cập nhật tọa độ/tên điểm đến lưu bền vững trên robot"
+
+# ------------------------------------------------------------------------------
+# 5. DANH SÁCH ACTION (ĐIỀU PHỐI ĐIỀU HƯỚNG)
+# direction: "action_client"
+# ------------------------------------------------------------------------------
+actions:
+  # Action gửi mục tiêu điều hướng tới vị trí pose chỉ định
+  navigate:
+    name: "/airport/navigate_to_pose"
+    type: "nav2_msgs/action/NavigateToPose"
+    direction: "action_client"
+    enabled: true
+    required: true
+    timeout_sec: 5.0
+    description: "Gửi goal điều hướng và nhận feedback/result. Hủy chuyến qua cancel action."
+
+# ------------------------------------------------------------------------------
+# 6. TÊN CÁC NODE GỢI Ý CỦA DỰ ÁN
+# ------------------------------------------------------------------------------
+nodes:
+  interface_node: "/airport/interface_node"
+  voice_node: "/airport/voice_node"
+  web_gateway: "/airport/web_gateway"
+
+# ------------------------------------------------------------------------------
+# 7. GIỚI HẠN VẬN TỐC VÀ TIMEOUT AN TOÀN ĐIỀU KHIỂN THỦ CÔNG
+# ------------------------------------------------------------------------------
+velocity_limits:
+  linear_max: 0.3          # Vận tốc tiến/lùi tối đa (m/s)
+  angular_max: 0.5         # Vận tốc xoay góc tối đa (rad/s)
+  cmd_publish_rate_hz: 10  # Tần suất gửi gói tin cmd_vel khi đang giữ nút (Hz)
+  cmd_timeout_sec: 0.5     # Robot tự động dừng nếu không nhận được lệnh sau khoảng này
+
+# Đường dẫn tệp lưu trữ danh sách điểm đến bền vững phía robot
+destinations_storage_path: "config/destinations.yaml"
+
+# ------------------------------------------------------------------------------
+# 8. CẤU HÌNH GHI ĐÈ THEO TỪNG PROFILE (PROFILES OVERRIDES)
+# Chỉ ghi đè những thuộc tính khác biệt so với cấu hình chung ở trên.
+# ------------------------------------------------------------------------------
+profiles:
+  # Profile dành cho mô phỏng Gazebo
+  sim:
+    connection:
+      ros_domain_id: 42    # Tách biệt Domain ID của môi trường mô phỏng
+    use_sim_time: true     # Đồng bộ thời gian với /clock của Gazebo
+    topics:
+      clock:
+        name: "/clock"
+        type: "rosgraph_msgs/msg/Clock"
+        direction: "subscribe"
+        enabled: true
+        required: true
+        qos:
+          reliability: "best_effort"
+          durability: "volatile"
+          depth: 1
+        description: "Xung nhịp mô phỏng thời gian từ Gazebo"
+    # Ánh xạ nguồn nội bộ (nếu Nav2 hoặc Gazebo phát tên mặc định)
+    internal_sources:
+      gazebo_scan: "/scan"
+      gazebo_odom: "/odom"
+
+  # Profile dành cho robot thật
+  real:
+    connection:
+      ros_domain_id: 0     # Domain ID mặc định của robot thật
+    use_sim_time: false    # Sử dụng đồng hồ thực tế của hệ điều hành
+    topics:
+      # Khi nối robot thật, có thể kích hoạt các cảm biến vật lý nếu có
+      battery:
+        enabled: true
+        name: "/airport/battery"
+    internal_sources:
+      lidar_scan: "/scan"
+      hardware_diagnostics: "/diagnostics"
