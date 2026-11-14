@@ -1,5 +1,6 @@
+import uuid
 from typing import Optional
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Header, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from .models import User, UserRole, ROLE_HIERARCHY
 from .security import decode_access_token
@@ -8,45 +9,92 @@ from .service import user_service
 bearer_scheme = HTTPBearer(auto_error=False)
 
 GUEST_PASSENGER = User(
-    id="guest-passenger",
-    username="passenger",
+    id="passenger-guest",
+    username="guest",
     full_name="Hành khách",
     role=UserRole.PASSENGER,
     hashed_password="",
     is_active=True
 )
 
-async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> User:
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    x_passenger_token: Optional[str] = Header(None, alias="X-Passenger-Token"),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID")
+) -> User:
     """
-    Xác thực token JWT từ HTTP Authorization Header.
-    Nếu không có token, mặc định xem là hành khách (PASSENGER).
+    Xác thực token JWT từ HTTP Authorization Header hoặc X-Passenger-Token.
+    - Token của Admin/Staff phải có chữ ký hợp lệ và tồn tại trong user_service.
+    - Token của Hành khách phải là JWT do server cấp (/api/auth/session) có chữ ký bí mật.
+    - Tuyệt đối không chấp nhận định danh tự xưng (chống giả mạo chủ chuyến đi).
     """
-    if not credentials:
-        return GUEST_PASSENGER
-    
-    payload = decode_access_token(credentials.credentials)
-    if not payload:
+    # 1. Bearer Token
+    if credentials:
+        payload = decode_access_token(credentials.credentials)
+        if not payload:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token không hợp lệ hoặc đã hết hạn",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        username = payload.get("username")
+        if username:
+            user = user_service.get_by_username(username)
+            if not user or not user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Tài khoản không tồn tại hoặc đã bị khóa",
+                )
+            return user
+        
+        if payload.get("role") == UserRole.PASSENGER.value and payload.get("sub"):
+            return User(
+                id=payload["sub"],
+                username=payload["sub"],
+                full_name="Hành khách",
+                role=UserRole.PASSENGER,
+                hashed_password="",
+                is_active=True
+            )
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token không hợp lệ hoặc đã hết hạn",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Payload token không hợp lệ",
         )
-    
-    username = payload.get("username")
-    if not username:
+
+    # 2. X-Passenger-Token Header
+    if x_passenger_token and x_passenger_token.strip():
+        payload = decode_access_token(x_passenger_token.strip())
+        if not payload:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token phiên hành khách không hợp lệ hoặc đã bị chỉnh sửa",
+            )
+        if payload.get("role") == UserRole.PASSENGER.value and payload.get("sub"):
+            return User(
+                id=payload["sub"],
+                username=payload["sub"],
+                full_name="Hành khách",
+                role=UserRole.PASSENGER,
+                hashed_password="",
+                is_active=True
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Payload token thiếu thông tin người dùng",
+            detail="Token phiên hành khách không đúng định dạng quy định",
         )
-    
-    user = user_service.get_by_username(username)
-    if not user or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Tài khoản không tồn tại hoặc đã bị khóa",
-        )
-    
-    return user
+
+    # 3. Yêu cầu vãng lai không có token: cấp định danh ngẫu nhiên dùng một lần (ephemeral)
+    ephemeral_id = f"passenger-guest-{uuid.uuid4().hex}"
+    return User(
+        id=ephemeral_id,
+        username=ephemeral_id[:20],
+        full_name="Hành khách vãng lai",
+        role=UserRole.PASSENGER,
+        hashed_password="",
+        is_active=True
+    )
 
 def require_role(required_role: UserRole):
     """
@@ -67,8 +115,9 @@ def require_role(required_role: UserRole):
 def authenticate_ws_token(token: Optional[str]) -> User:
     """
     Xác thực token dùng cho WebSocket:
-    - Nếu không có token hoặc token rỗng: gán quyền Hành khách (PASSENGER).
-    - Nếu có token: giải mã, nếu đúng là admin thì gán quyền ADMIN.
+    - Nếu không có token: gán khách vãng lai.
+    - Nếu có token Admin: gán ADMIN từ user_service.
+    - Nếu có token Passenger: gán User PASSENGER với ID xác thực của token đó.
     """
     if not token or token in ("null", "undefined", ""):
         return GUEST_PASSENGER
@@ -78,8 +127,18 @@ def authenticate_ws_token(token: Optional[str]) -> User:
         return GUEST_PASSENGER
     
     username = payload.get("username")
-    if not username:
-        return GUEST_PASSENGER
+    if username:
+        user = user_service.get_by_username(username)
+        return user if user else GUEST_PASSENGER
+
+    if payload.get("role") == UserRole.PASSENGER.value and payload.get("sub"):
+        return User(
+            id=payload["sub"],
+            username=payload["sub"],
+            full_name="Hành khách",
+            role=UserRole.PASSENGER,
+            hashed_password="",
+            is_active=True
+        )
     
-    user = user_service.get_by_username(username)
-    return user if user else GUEST_PASSENGER
+    return GUEST_PASSENGER

@@ -60,6 +60,66 @@
   font-weight: 500;
   z-index: 10;
   box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  pointer-events: none;
+}
+
+.mapLoadingOverlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: rgba(248, 250, 252, 0.85);
+  z-index: 20;
+  color: #475569;
+  font-size: 14px;
+  font-weight: 500;
+  gap: 8px;
+}
+
+.passengerMapPlaceholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #F8FAFC;
+  z-index: 15;
+  padding: 24px;
+  pointer-events: none;
+}
+
+.placeholderCard {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  background: #FFFFFF;
+  padding: 28px 36px;
+  border-radius: 12px;
+  border: 1px solid #E2E8F0;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+  max-width: 360px;
+}
+
+.placeholderIcon {
+  font-size: 36px;
+  margin-bottom: 12px;
+}
+
+.placeholderTitle {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1E293B;
+  margin: 0 0 8px 0;
+}
+
+.placeholderSubtitle {
+  font-size: 13px;
+  color: #64748B;
+  margin: 0;
+  line-height: 1.5;
 }
 
 .svgMap {
@@ -70,5 +130,28 @@
 
 .markerLabel {
   text-shadow: 0 1px 2px rgba(255, 255, 255, 0.9);
+  pointer-events: none;
+}
+
+.coordinatePickerBanner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(30, 41, 59, 0.92);
+  color: #F8FAFC;
+  padding: 6px 16px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.15);
+  pointer-events: none;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.previewPinGroup {
   pointer-events: none;
 }

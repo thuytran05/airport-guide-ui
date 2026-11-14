@@ -147,10 +147,20 @@
 }
 
 .navigating { color: #2563EB; }
+.accepted { color: #2563EB; }
+.pending { color: #D97706; }
+.canceling { color: #DC2626; }
 .succeeded { color: #16A34A; }
 .failed { color: #DC2626; }
 .canceled { color: #D97706; }
 .idle { color: #64748B; }
+
+.disabledHelpText {
+  font-size: 11px;
+  color: #64748B;
+  margin: 6px 0 0 0;
+  line-height: 1.4;
+}
 
 .errorText {
   color: #DC2626;
@@ -232,4 +242,15 @@
 .mapWrapper {
   flex: 1;
   height: 520px;
+}
+
+.otherPassengerNotice {
+  padding: 10px 14px;
+  background-color: #F1F5F9;
+  border: 1px solid #CBD5E1;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #475569;
+  text-align: center;
+  font-weight: 500;
 }

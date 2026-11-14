@@ -11,12 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-jazzy-geometry-msgs \
     ros-jazzy-sensor-msgs \
     ros-jazzy-nav-msgs \
+    ros-jazzy-nav2-msgs \
     ros-jazzy-tf2-ros \
     && rm -rf /var/lib/apt/lists/*
 
-# Cài đặt requirements cho FastAPI (break-system-packages để dùng chung với rclpy của hệ thống)
+# Cai dat Python virtual environment
+# Cho phep truy cap thu vien ROS 2 cua he thong
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+
+RUN python3 -m venv --system-site-packages /opt/venv
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
 # Copy mã nguồn backend
 COPY . /app/

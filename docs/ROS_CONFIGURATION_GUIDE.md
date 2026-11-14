@@ -1,165 +1,160 @@
 # HƯỚNG DẪN CẤU HÌNH VÀ VẬN HÀNH AIRPORT GUIDE ROBOT
 
-Tài liệu hướng dẫn quản trị giao tiếp ROS 2 bằng một file cấu hình duy nhất và kết nối hệ thống giao diện web với mô phỏng Gazebo hoặc Robot thật.
+Tài liệu hướng dẫn quản trị giao tiếp ROS 2 bằng file cấu hình tập trung, ánh xạ giao tiếp với Nav2/Gazebo trong VS Code Dev Container, và kế hoạch tích hợp từng bước.
 
 ---
 
-## 1. FILE CẤU HÌNH DUY NHẤT: `config/robot_interface.yaml`
+## 1. FILE CẤU HÌNH TRUNG TÂM: `config/robot_interface.yaml`
 
-Đường dẫn file: `config/robot_interface.yaml`.
+Đường dẫn: `config/robot_interface.yaml`.
 
-Đây là nơi **DUY NHẤT** bạn cần chỉnh sửa bằng tay khi muốn đổi tên topic, service, action, QoS hoặc chuyển đổi giữa Gazebo (`sim`) và Robot thật (`real`).
+Đây là nơi **DUY NHẤT** quản lý cấu hình tên topic, service, action, QoS và chuyển đổi giữa môi trường Mô phỏng Gazebo (`sim`) và Robot thật (`real`).
 
-### Cấu trúc các nhóm trong file:
+### Cấu trúc chính trong file:
 - `schema_version`: Phiên bản cấu hình (mặc định: `"1.0"`).
-- `active_profile`: Chọn profile hoạt động (`"sim"` cho Gazebo hoặc `"real"` cho robot vật lý).
-- `connection`: Địa chỉ IP/Port kết nối HTTP/WebSocket và `ros_domain_id`.
-- `frames`: Tên các frame tọa độ chuẩn: `map`, `odom`, `base_link`.
-- `topics`: Danh sách các topic ROS (Bản đồ `/airport/map`, Vị trí `/airport/pose`, Trạng thái `/airport/state`, Điểm đến `/airport/destinations`, Giọng nói `/airport/voice/state`, Cảnh báo `/airport/alerts`, Lệnh vận tốc thủ công `/airport/cmd_vel_manual`, Đường đi `/airport/path`, Pin `/airport/battery`, v.v.).
-- `services`: Các service gọi đến ROS (`/airport/voice/start`, `/airport/control/set_manual`, `/airport/destinations/upsert`).
-- `actions`: Action Nav2 Jazzy (`/airport/navigate_to_pose`).
-- `velocity_limits`: Giới hạn vận tốc an toàn khi điều khiển thủ công (`linear_max`, `angular_max`, `cmd_timeout_sec`).
-- `destinations_storage_path`: Tệp lưu trữ cơ sở dữ liệu điểm đến bền vững (`config/destinations.yaml`).
-- `profiles.sim` / `profiles.real`: Chỉ định các thông số ghi đè (overrides) riêng cho từng môi trường (ví dụ `use_sim_time: true` cho Gazebo và `false` cho Robot thật).
+- `active_profile`: Profile đang chọn (`"sim"` cho Gazebo hoặc `"real"` cho robot vật lý).
+- `connection.ros_domain_id`: Đã đồng bộ thành `0` cho cả profile `sim` và `real`, khớp hoàn toàn với `ROS_DOMAIN_ID=0` của VS Code Dev Container (`ws`).
+- `frames`: `map` (frame bản đồ gốc), `odom` (frame đo quãng đường), `base_link` (thân robot).
+- `topics`: Định nghĩa danh sách các topic ROS (Bản đồ `/map`, Vị trí `/amcl_pose` hoặc `/airport/pose`, Cảnh báo `/airport/alerts`, Lệnh vận tốc `/airport/cmd_vel_manual`, v.v.).
+- `actions`: Action Nav2 Jazzy (`/navigate_to_pose`).
+- `profiles.sim` / `profiles.real`: Các thông số ghi đè cho từng môi trường (ví dụ `use_sim_time: true` cho Gazebo và `false` cho Robot thật).
 
 ---
 
-## 2. VÍ DỤ CHỈNH SỬA CẤU HÌNH
+## 2. RÀ SOÁT ÁNH XẠ GIAO TIẾP VỚI NAV2 / GAZEBO THỰC TẾ
 
-### a. Chuyển đổi giữa Mô phỏng Gazebo và Robot Thật
-Mở `config/robot_interface.yaml`, sửa dòng:
-```yaml
-# Dùng Gazebo:
-active_profile: "sim"
+Dựa trên kết quả khảo sát thực tế trên môi trường ROS 2 Jazzy chạy trong Dev Container:
 
-# Hoặc chuyển sang Robot thật:
-active_profile: "real"
-```
-*Lưu ý:* Sau khi lưu file, bạn chỉ cần khởi động lại Backend (`uvicorn` hoặc Docker Backend) để áp dụng.
-
-### b. Đổi tên Topic ROS (ví dụ đổi topic bản đồ)
-```yaml
-topics:
-  map:
-    name: "/my_robot/custom_map"   # Sửa tên ở đây
-    type: "nav_msgs/msg/OccupancyGrid"
-    direction: "subscribe"
-    enabled: true
-    required: true
-```
-
-### c. Đổi tên Service bắt đầu giọng nói
-```yaml
-services:
-  voice_start:
-    name: "/my_voice_node/trigger_listen"  # Sửa tên ở đây
-    type: "std_srvs/srv/Trigger"
-    direction: "service_client"
-```
-
----
-
-## 3. LỆNH KIỂM TRA CẤU HÌNH ĐANG ÁP DỤNG (CLI)
-
-Để kiểm tra xem cấu hình nào đang có hiệu lực mà không cần mở code:
-```bash
-# Chạy trong thư mục backend:
-cd backend
-python -m app.ros_config
-```
-Lệnh sẽ in ra bảng chi tiết tất cả các topic, service, action, trạng thái BẬT/TẮT, frame và giới hạn vận tốc.
-
----
-
-## 4. BẢNG ÁNH XẠ CHỨC NĂNG WEB ↔ GIAO TIẾP ROS ↔ NODE CUNG CẤP
-
-| Chức năng trên Web | Chiều | Giao tiếp ROS | Kiểu dữ liệu (Message/Service/Action) | Node cung cấp đề xuất |
+| Thành phần Web cần | Nguồn thực tế trong Dev Container | Topic / Action ROS thực tế | Kiểu dữ liệu ROS 2 | Đánh giá tính tương thích |
 |---|---|---|---|---|
-| Hiển thị bản đồ tĩnh | Nhận | `/airport/map` | `nav_msgs/msg/OccupancyGrid` | Node Bản đồ / Nav2 Map Server |
-| Hiển thị vị trí Robot | Nhận | `/airport/pose` | `geometry_msgs/msg/PoseStamped` | Node Định vị (AMCL / TF / SLAM) |
-| Trạng thái điều hướng & Chế độ | Nhận | `/airport/state` | `airport_robot_interfaces/msg/RobotState` | `/airport/interface_node` |
-| Danh sách điểm đến đón/trả | Nhận | `/airport/destinations` | `airport_robot_interfaces/msg/DestinationList` | `/airport/interface_node` |
-| Trạng thái tương tác giọng nói | Nhận | `/airport/voice/state` | `std_msgs/msg/String` | `/airport/voice_node` |
-| Văn bản nhận dạng giọng nói | Nhận | `/airport/voice/transcript` | `std_msgs/msg/String` | `/airport/voice_node` |
-| Câu phản hồi chữ của robot | Nhận | `/airport/voice/response` | `std_msgs/msg/String` | `/airport/voice_node` |
-| Cảnh báo phần cứng/phần mềm | Nhận | `/airport/alerts` | `diagnostic_msgs/msg/DiagnosticArray` | Diagnostics aggregator / ROS nodes |
-| Mức pin và trạng thái sạc | Nhận | `/airport/battery` | `sensor_msgs/msg/BatteryState` | Driver pin / Battery publisher |
-| Lộ trình đường đi dự kiến | Nhận | `/airport/path` | `nav_msgs/msg/Path` | Nav2 Global Planner |
-| Bấm microphone để nói | Gửi | `/airport/voice/start` | `std_srvs/srv/Trigger` | `/airport/voice_node` |
-| Bật/Tắt chế độ thủ công (Admin) | Gửi | `/airport/control/set_manual` | `std_srvs/srv/SetBool` | `/airport/interface_node` |
-| Điều khiển lái robot (Admin) | Gửi | `/airport/cmd_vel_manual` | `geometry_msgs/msg/TwistStamped` | Bộ phân xử vận tốc (Twist Mux) |
-| Thêm/Sửa điểm đến (Admin) | Gửi | `/airport/destinations/upsert` | `airport_robot_interfaces/srv/UpsertDestination` | `/airport/interface_node` |
-| Bắt đầu chuyến dẫn đường | Gửi | `/airport/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | Nav2 BT Navigator |
-| Hủy chuyến dẫn đường | Gửi | Action Cancel | `action_msgs/srv/CancelGoal` | Nav2 BT Navigator |
+| **Bản đồ tĩnh** | `map_server` | `/map` | `nav_msgs/msg/OccupancyGrid` | Cần ánh xạ tên topic từ `/airport/map` sang `/map`. |
+| **Vị trí robot** | `amcl` | `/amcl_pose` | `geometry_msgs/msg/PoseWithCovarianceStamped` | **Lệch kiểu & tên:** Cần ánh xạ tên `/amcl_pose` và chuyển đổi từ `PoseWithCovarianceStamped` sang định dạng pose nội bộ. |
+| **Hành trình Nav2** | Nav2 BT Navigator | `/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | Cần ánh xạ action name sang `/navigate_to_pose` và đã cài `ros-jazzy-nav2-msgs`. |
+| **Đường đi dự kiến** | Nav2 Planner | `/plan` hoặc `/airport/path` | `nav_msgs/msg/Path` | Tùy chọn, Nav2 thường phát `/plan`. |
+| **Trạng thái robot** | Custom node | `/airport/state` | `airport_robot_interfaces/msg/RobotState` | Chưa có package custom; backend đang dùng fallback an toàn. |
+| **Điều khiển vận tốc** | Twist Mux | `/cmd_vel` hoặc `/airport/cmd_vel_manual` | `geometry_msgs/msg/Twist` hoặc `TwistStamped` | Cần bộ phân xử an toàn trước khi kích hoạt. |
 
 ---
 
-## 5. DANH SÁCH MÃ NGUỒN ĐÃ ĐƯỢC CHỈNH SỬA
+## 3. PHÂN TÍCH PHƯƠNG ÁN CHUYỂN ĐỔI DỮ LIỆU `/amcl_pose` SANG VỊ TRÍ BACKEND
 
-1. `config/robot_interface.yaml`: Tệp cấu hình gốc quản lý toàn bộ giao tiếp ROS.
-2. `config/destinations.yaml`: Cơ sở dữ liệu điểm đến lưu bền vững, không bị ghi đè khi sửa cấu hình mạng.
-3. `backend/app/ros_config.py`: Module đọc, validate YAML, gộp profile (`sim`/`real`) và cung cấp CLI `python -m app.ros_config`.
-4. `backend/app/adapters/ros_adapter.py`: Adapter kết nối ROS 2 thật, nạp toàn bộ topic/service/action từ `ros_config.py`.
-5. `backend/app/adapters/mock_adapter.py`: Adapter mô phỏng hoạt động độc lập trên Windows mà không cần ROS 2.
-6. `backend/app/auth/models.py` & `backend/app/auth/dependencies.py`: Đơn giản hóa về đúng 2 vai trò: **Passenger** (không cần đăng nhập) và **Admin** (đăng nhập bảo mật).
-7. `backend/app/api/robot_router.py`: API chuẩn cho các chức năng Navigate, Cancel, Voice Start, Set Manual, Cmd Vel, Upsert Destination.
-8. `frontend/src/types/index.ts`: Khớp đúng 2 role và các interfaces ROS.
-9. `frontend/src/contexts/RobotContext.tsx` & `AuthContext.tsx`: Quản lý WebSocket và REST APIs.
-10. `frontend/src/pages/passenger/Home.tsx`: Màn hình Hành khách (chọn điểm đến, bắt đầu/hủy chuyến, voice trigger, xem bản đồ).
-11. `frontend/src/pages/admin/Dashboard.tsx`: Màn hình Quản trị (điều khiển vận tốc d-pad với watchdog an toàn, thêm/sửa điểm đến, xem cảnh báo).
-12. `frontend/src/pages/Login.tsx`: Form đăng nhập Quản trị viên.
+### Vấn đề kỹ thuật:
+- Backend `RosRobotAdapter` trước đây đăng ký nhận `geometry_msgs/msg/PoseStamped` từ `/airport/pose`.
+- Trong khi đó, node AMCL thực tế công bố vị trí qua topic `/amcl_pose` với kiểu **`geometry_msgs/msg/PoseWithCovarianceStamped`**.
+- Do kiểu message khác nhau, DDS middleware từ chối kết nối subscriber (Type Incompatibility), khiến backend **chưa nhận được dữ liệu vị trí robot**.
 
----
-
-## 6. HƯỚNG DẪN CHẠY TRÊN WINDOWS VÀ CHUYỂN SANG UBUNTU
-
-### a. Chạy phát triển trên Windows (Không cần cài ROS):
-```powershell
-# 1. Chạy Backend (chế độ mock độc lập)
-cd backend
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-# 2. Mở một terminal khác, chạy Frontend
-cd frontend
-npm run dev
+### Cấu trúc message `/amcl_pose`:
+```text
+geometry_msgs/msg/PoseWithCovarianceStamped
+  std_msgs/Header header
+    builtin_interfaces/Time stamp
+    string frame_id                # "map"
+  geometry_msgs/PoseWithCovariance pose
+    geometry_msgs/Pose pose
+      geometry_msgs/Point position
+        float64 x
+        float64 y
+        float64 z
+      geometry_msgs/Quaternion orientation
+        float64 x
+        float64 y
+        float64 z
+        float64 w
+    float64[36] covariance        # Ma trận hiệp phương sai 6x6
 ```
-Truy cập trình duyệt: `http://localhost:5173`.
-- Hành khách vào thẳng không cần đăng nhập.
-- Admin bấm "Đăng nhập Admin", tài khoản mặc định: `admin` / `admin123`.
 
-### b. Chuyển sang máy Ubuntu 22 (Chạy nối với ROS 2 / Docker):
-> **QUAN TRỌNG:** KHÔNG copy thư mục `node_modules` hoặc môi trường ảo Python từ Windows sang Ubuntu!
+### Phương án giải mã:
+1. **Lấy tọa độ vị trí:**
+   - $x = \text{msg.pose.pose.position.x}$
+   - $y = \text{msg.pose.pose.position.y}$
+2. **Lấy góc quay Yaw (hướng robot):**
+   Chuyển đổi quaternion sang góc quay quanh trục Z (Yaw):
+   $$\text{yaw} = \text{atan2}(2(w \cdot z + x \cdot y), 1 - 2(y^2 + z^2))$$
+3. **Độ tin cậy định vị (Tùy chọn):**
+   Kiểm tra phương sai vị trí $\text{covariance}[0]$ (trục X) và $\text{covariance}[7]$ (trục Y). Nếu phương sai vượt ngưỡng an toàn (ví dụ $> 0.5\text{ m}^2$), robot đang bị mất định vị (lost localization).
+4. **Cập nhật trạng thái:**
+   Gán vào từ điển pose nội bộ: `{"x": x, "y": y, "theta": yaw}` và đánh dấu thời điểm `_last_pose_time = time.time()`. Khi đó `is_connected` tự động chuyển thành `True`.
 
-1. Sao chép toàn bộ mã nguồn sang Ubuntu (trừ `node_modules` và `.venv`).
-2. Tại Ubuntu, cài đặt lại dependencies sạch bằng lockfile:
+---
+
+## 4. PHÂN BIỆT DỮ LIỆU BẢN ĐỒ THẬT VÀ SVG MINH HỌA
+
+1. **Bản đồ SVG trên Frontend (`MapView.tsx` & `AirportMapSvg.tsx`):**
+   - Hiện tại là **sơ đồ kiến trúc vector tĩnh (Mock Layout)** thể hiện các khu vực nhà ga (Cánh A, Cánh B, Hành lang).
+   - Dùng hàm `rosToSvg(x, y)` để quy đổi tọa độ mét sang pixel SVG:
+     $$\text{pixel\_x} = 50 + x \cdot 25, \quad \text{pixel\_y} = 450 - y \cdot 25$$
+2. **Bản đồ OccupancyGrid thật từ ROS (`/map`):**
+   - Là ma trận 2D dạng lưới ô chiếm dụng phát bởi `map_server` chứa thông số chướng ngại vật thực tế.
+   - Backend `ros_adapter.py` đã nhận `MapMetadata` (resolution, width, height, origin).
+   - **Lưu ý:** Giao diện web hiện tại chưa render lưới OccupancyGrid trực tiếp lên canvas HTML5, mà chiếu tọa độ robot thật lên sơ đồ SVG minh họa. Khi chưa có tọa độ thật từ AMCL, giao diện hiển thị nhãn cảnh báo rõ ràng: `⚠️ Chưa có dữ liệu vị trí robot`.
+
+---
+
+## 5. PHÂN LOẠI CÁC PACKAGE, TOPIC, SERVICE VÀ ACTION CÒN THIẾU
+
+### Nhóm 1: Thành phần BẮT BUỘC để hoàn tất tích hợp Gazebo / Nav2
+| Tên thành phần | Loại | Mục đích | Tình trạng |
+|---|---|---|---|
+| `ros-jazzy-nav2-msgs` | Package hệ thống | Giao tiếp Action NavigateToPose với Nav2 | Đã bổ sung vào Dockerfile backend |
+| Topic `/map` | ROS Topic (`nav_msgs/OccupancyGrid`) | Đồng bộ thông số bản đồ và tọa độ gốc | Đang có trên Gazebo/Nav2 |
+| Topic `/amcl_pose` | ROS Topic (`PoseWithCovarianceStamped`) | Nhận vị trí thực tế của robot trong frame `map` | Đang có trên Gazebo/Nav2, cần đổi adapter giải mã |
+| Action `/navigate_to_pose` | ROS Action (`nav2_msgs/NavigateToPose`) | Gửi điểm đến dẫn đường và xử lý hủy chuyến | Đang có trên Gazebo/Nav2 |
+
+### Nhóm 2: Thành phần CÓ THỂ BỔ SUNG SAU (Không chặn luồng cơ bản)
+| Tên thành phần | Loại | Mục đích | Giải pháp tạm thời hiện tại |
+|---|---|---|---|
+| `airport_robot_interfaces` | Package tùy chỉnh | Đồng bộ `RobotState`, `DestinationList`, `UpsertDestination` | Backend dùng fallback tự sinh trạng thái từ Nav2 và lưu điểm đến trong `destinations.yaml`. |
+| Topic `/airport/alerts` | ROS Topic (`DiagnosticArray`) | Báo cáo chẩn đoán lỗi phần cứng | Trả về mảng rỗng nếu chưa có node chẩn đoán. |
+| Topic `/battery` | ROS Topic (`BatteryState`) | Hiển thị mức pin | Trả về `null` (hiển thị "Chưa có dữ liệu" trên UI). |
+| Topic `/plan` | ROS Topic (`Path`) | Vẽ lộ trình di chuyển Nav2 trên bản đồ | Ẩn đường đi khi chưa có dữ liệu. |
+| Service `/airport/voice/*` | ROS Service/Topic | Kích hoạt microphone trên robot | Nút microphone trên web hiển thị chế độ mô phỏng/chờ node giọng nói. |
+
+---
+
+## 6. KẾ HOẠCH TÍCH HỢP GAZEBO THEO THỨ TỰ TỪNG BƯỚC
+
+Quy trình tích hợp đảm bảo an toàn tuyệt đối, tuân thủ nguyên tắc không can thiệp vào workspace `ws` của robot:
+
+```mermaid
+flowchart TD
+    Step1["Bước 1: Nhận Bản Đồ\nÁnh xạ /map từ map_server\nLấy MapMetadata (origin, resolution)"]
+    Step2["Bước 2: Nhận Vị Trí Robot\nSubscribe /amcl_pose (PoseWithCovarianceStamped)\nGiải mã x, y, theta sang backend"]
+    Step3["Bước 3: Hiển Thị Lên Web\nChuyển đổi tọa độ robot lên MapView\nKiểm tra robot_connected=true"]
+    Step4["Bước 4: Gửi Mục Tiêu Nav2\nKết nối Action Client /navigate_to_pose\nGửi goal pose từ danh sách điểm đến"]
+    Step5["Bước 5: Xử Lý Phản Hồi & Hủy Chuyến\nLắng nghe feedback/status/result\nHủy chuyến qua CancelGoal"]
+
+    Step1 --> Step2 --> Step3 --> Step4 --> Step5
+```
+
+### Chi tiết các bước thực hiện:
+
+1. **Bước 1 — Nhận thông tin Bản đồ (`/map`):**
+   - Cấu hình backend subscribe topic `/map` phát từ `map_server`.
+   - Kiểm tra `_map_meta` trong backend nhận đúng kích thước `width`, `height`, `resolution`, `origin`.
+2. **Bước 2 — Nhận dữ liệu vị trí robot (`/amcl_pose`):**
+   - Cập nhật adapter hỗ trợ kiểu `PoseWithCovarianceStamped`.
+   - Đo đạc tần suất nhận dữ liệu (khoảng 5–10 Hz từ AMCL).
+   - Xác nhận trường `robot_connected` trong `http://localhost:8000/api/health` chuyển sang `true`.
+3. **Bước 3 — Hiển thị vị trí robot trên giao diện Web:**
+   - Kiểm tra biểu tượng robot (vòng tròn xanh và mũi tên hướng nhìn) xuất hiện trên `http://localhost:5173`.
+   - Di chuyển robot trong Gazebo (bằng bàn phím teleop trong Dev Container `ws`) và kiểm tra biểu tượng trên web di chuyển đồng bộ thời gian thực qua WebSocket.
+4. **Bước 4 — Gửi mục tiêu dẫn đường Nav2 (`/navigate_to_pose`):**
+   - Khởi tạo `ActionClient(NavigateToPose, "/navigate_to_pose")`.
+   - Chọn một điểm đến trên giao diện web (hoặc qua API `/api/robot/navigate`) và gửi `goal_pose` sang Nav2.
+   - Quan sát robot trong Gazebo bắt đầu xoay và di chuyển theo quy hoạch đường đi.
+5. **Bước 5 — Xử lý Feedback, Kết quả và Hủy chuyến:**
+   - Cập nhật tiến trình dẫn đường từ feedback của Nav2.
+   - Kiểm tra nút "Hủy chuyến" trên web gửi yêu cầu hủy goal an toàn qua `cancel_goal_async()`.
+   - Xác nhận robot dừng di chuyển trong Gazebo khi nhận lệnh hủy.
+
+---
+
+## 7. CÂU LỆNH KIỂM TRA NHANH CẤU HÌNH TRÊN UBUNTU
+
 ```bash
-# Cài thư viện Frontend bằng package-lock.json chuẩn:
-cd frontend
-npm ci
-npm run build
+# Kiểm tra cấu hình đang nạp (chạy trực tiếp trong container backend)
+docker compose exec backend python3 -m app.ros_config
 
-# Cài thư viện Backend:
-cd ../backend
-pip install -r requirements.txt
+# Kiểm tra sức khỏe hệ thống
+curl -s http://localhost:8000/api/health | jq .
 ```
-3. Chạy qua Docker Compose trong mạng ROS Jazzy:
-```bash
-docker compose up -d
-```
-
----
-
-## 7. CÁC TÀI NGUYÊN CÒN THIẾU ĐỂ MÔ PHỎNG VỚI GAZEBO HARMONIC
-
-Web UI và Backend Gateway đã sẵn sàng 100%. Để chạy mô phỏng hoàn chỉnh trong Gazebo, bạn cần bổ sung:
-1. **Gói interface ROS**: Tạo và build package `airport_robot_interfaces` trên môi trường ROS 2 Jazzy chứa:
-   - `msg/RobotState.msg`
-   - `msg/DestinationList.msg`
-   - `msg/Destination.msg`
-   - `srv/UpsertDestination.srv`
-2. **Mô hình Robot & Bản đồ**: Tệp URDF/SDF của robot và file bản đồ OccupancyGrid (`map.yaml` và `map.pgm`) của sân bay để Nav2 Map Server nạp.
-3. **Bộ chuyển đổi ros_gz_bridge**: Nếu dùng Gazebo Transport để truyền cảm biến, cần cấu hình bridge cho:
-   - `/clock` (`rosgraph_msgs/msg/Clock`)
-   - `/scan` (`sensor_msgs/msg/LaserScan`)
-   - `/odom` (`nav_msgs/msg/Odometry`)
-4. **Node điều phối (`/airport/interface_node`)**: Node trung gian quản lý trạng thái máy và chuyển tiếp action `NavigateToPose` tới Nav2.

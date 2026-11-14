@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useRobot } from '../../contexts/RobotContext';
 import { MapView } from '../../components/MapView/MapView';
 import { VoicePanel } from '../../components/VoicePanel/VoicePanel';
@@ -17,9 +17,49 @@ export default function PassengerHome() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Nếu điểm đang chọn bị xóa khỏi hệ thống, bỏ lựa chọn đó và khóa nút "Bắt đầu dẫn đường"
+  useEffect(() => {
+    if (selectedDestId && !destinations.some((d) => d.id === selectedDestId)) {
+      setSelectedDestId('');
+    }
+  }, [destinations, selectedDestId]);
+
   const selectedDest = destinations.find((d) => d.id === selectedDestId);
-  const isNavigating = status.navigationState === 'NAVIGATING' || status.navigationState === 'ACCEPTED';
+  const isNavigating =
+    status.navigationState === 'NAVIGATING' ||
+    status.navigationState === 'ACCEPTED' ||
+    status.navigationState === 'PENDING' ||
+    status.navigationState === 'CANCELING';
   const isCanceling = status.navigationState === 'CANCELING';
+
+  // Lý do khóa nút Bắt đầu (nếu có) để hiển thị tooltip/thông báo rõ ràng
+  let startDisabledReason = '';
+  if (!status.isConnected) {
+    startDisabledReason = 'Chưa kết nối với hệ thống robot';
+  } else if (status.controlMode === 'MANUAL') {
+    startDisabledReason = 'Robot đang ở chế độ điều khiển thủ công (MANUAL)';
+  } else if (!status.pose) {
+    startDisabledReason = 'Chưa có vị trí định vị robot từ AMCL';
+  } else if (status.isDataStale) {
+    startDisabledReason = 'Dữ liệu vị trí robot chưa cập nhật';
+  } else if (!selectedDestId) {
+    startDisabledReason = 'Vui lòng chọn một điểm đến trong danh sách';
+  } else if (isNavigating) {
+    startDisabledReason = 'Robot đang thực hiện một chuyến đi khác';
+  }
+
+  const STATE_LABELS: Record<string, string> = {
+    IDLE: 'Sẵn sàng đón khách',
+    PENDING: 'Đang gửi yêu cầu...',
+    ACCEPTED: 'Nav2 đã chấp nhận',
+    NAVIGATING: 'Đang di chuyển dẫn đường',
+    CANCELING: 'Đang dừng và hủy chuyến...',
+    SUCCEEDED: 'Đã đến đích thành công',
+    CANCELED: 'Chuyến đi đã bị hủy',
+    FAILED: 'Dẫn đường thất bại',
+  };
+
+  const activeDest = destinations.find((d) => d.id === status.destinationId);
 
   const handleStart = async () => {
     if (!selectedDestId) return;
@@ -90,10 +130,22 @@ export default function PassengerHome() {
               <div className={styles.statusBox}>
                 <div className={styles.statusRow}>
                   <span>Trạng thái:</span>
-                  <strong className={styles[status.navigationState.toLowerCase()]}>
-                    {status.navigationState}
+                  <strong className={styles[status.navigationState.toLowerCase()] || styles.idle}>
+                    {STATE_LABELS[status.navigationState] || status.navigationState}
                   </strong>
                 </div>
+                {activeDest && (
+                  <div className={styles.statusRow} style={{ marginTop: '6px' }}>
+                    <span>Điểm đến:</span>
+                    <strong>{activeDest.name}</strong>
+                  </div>
+                )}
+                {status.distanceRemaining !== null && status.distanceRemaining !== undefined && (
+                  <div className={styles.statusRow} style={{ marginTop: '6px' }}>
+                    <span>Khoảng cách còn lại:</span>
+                    <strong>~{status.distanceRemaining.toFixed(1)} m</strong>
+                  </div>
+                )}
                 {status.message && <p className={styles.statusMessage}>{status.message}</p>}
               </div>
 
@@ -105,20 +157,29 @@ export default function PassengerHome() {
                   <button
                     className={styles.primaryBtn}
                     onClick={handleStart}
-                    disabled={!selectedDestId || isSubmitting || status.controlMode === 'MANUAL' || !status.isConnected}
+                    disabled={Boolean(startDisabledReason) || isSubmitting}
+                    title={startDisabledReason || 'Bắt đầu chuyến đi'}
                   >
                     {isSubmitting ? 'Đang gửi lệnh...' : 'Bắt Đầu Dẫn Đường'}
                   </button>
-                ) : (
+                ) : status.isOwner ? (
                   <button
                     className={styles.cancelBtn}
                     onClick={handleCancel}
                     disabled={isCanceling || isSubmitting}
+                    title="Dừng robot và hủy chuyến dẫn đường của bạn"
                   >
                     {isCanceling ? 'Đang dừng và hủy...' : 'Hủy Chuyến Đi'}
                   </button>
+                ) : (
+                  <div className={styles.otherPassengerNotice}>
+                    <span>ℹ️ Robot đang thực hiện chuyến đi của hành khách khác.</span>
+                  </div>
                 )}
               </div>
+              {!isNavigating && startDisabledReason && (
+                <p className={styles.disabledHelpText}>ℹ️ {startDisabledReason}</p>
+              )}
             </div>
           </div>
 
@@ -134,6 +195,7 @@ export default function PassengerHome() {
           </div>
           <div className={styles.mapWrapper}>
             <MapView
+              backgroundMode="passenger"
               robotPose={status.pose}
               destinations={destinations}
               selectedDestinationId={selectedDestId}

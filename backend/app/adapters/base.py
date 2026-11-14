@@ -36,6 +36,11 @@ class BaseRobotAdapter(ABC):
         pass
 
     @abstractmethod
+    def delete_destination(self, destination_id: str) -> Dict[str, Any]:
+        """Xóa điểm đến theo destination_id"""
+        pass
+
+    @abstractmethod
     def start_navigation(self, destination_id: str, owner_id: str) -> Dict[str, Any]:
         """Bắt đầu điều hướng tới một destination_id"""
         pass
@@ -43,6 +48,11 @@ class BaseRobotAdapter(ABC):
     @abstractmethod
     def cancel_navigation(self, owner_id: str, is_admin: bool = False) -> Dict[str, Any]:
         """Hủy nhiệm vụ điều hướng hiện tại bằng cơ chế cancel của ROS action"""
+        pass
+
+    @abstractmethod
+    def get_owner_id(self) -> str:
+        """Trả về ID người sở hữu chuyến đi hiện tại (rỗng nếu robot đang rảnh)"""
         pass
 
     @abstractmethod
@@ -68,6 +78,25 @@ class BaseRobotAdapter(ABC):
     @abstractmethod
     def get_path(self) -> Optional[List[Dict[str, float]]]:
         """Lấy danh sách các điểm trên đường đi nav_msgs/Path nếu có"""
+        pass
+
+    @abstractmethod
+    def get_path_version(self) -> int:
+        """Trả về số phiên bản của đường đi (tăng khi có đường đi mới hoặc khi xóa)"""
+        pass
+
+    def get_destinations_version(self) -> int:
+        """Trả về số phiên bản của danh sách điểm đến (tăng khi thêm hoặc cập nhật điểm đến)"""
+        return 0
+
+    @abstractmethod
+    def get_map_metadata(self) -> Optional[Dict[str, Any]]:
+        """Lấy thông tin metadata của bản đồ OccupancyGrid hiện hành"""
+        pass
+
+    @abstractmethod
+    def get_map_image(self, version: str) -> Optional[bytes]:
+        """Lấy dữ liệu bytes PNG của đúng phiên bản bản đồ được yêu cầu"""
         pass
 
     @abstractmethod

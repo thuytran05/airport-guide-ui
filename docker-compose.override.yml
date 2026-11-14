@@ -1,0 +1,13 @@
+services:
+  backend:
+    user: "1000:1000"
+    ipc: host
+    environment:
+      ROBOT_CONFIG_PATH: /app/config/robot_interface.yaml
+      DESTINATIONS_STORAGE_PATH: /app/data/destinations.yaml
+      DESTINATIONS_SEED_PATH: /app/config/destinations.yaml
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data

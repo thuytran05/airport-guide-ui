@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useRobot } from '../../contexts/RobotContext';
 import { Destination } from '../../types';
-import { MapView } from '../../components/MapView/MapView';
+import { MapView, MapBackgroundMode } from '../../components/MapView/MapView';
 import styles from './Dashboard.module.css';
 
 export default function AdminDashboard() {
@@ -10,13 +10,30 @@ export default function AdminDashboard() {
     destinations,
     alerts,
     path,
+    mapData,
     setManualControl,
     sendManualVelocity,
     upsertDestination,
+    deleteDestination,
+    startNavigation,
+    cancelNavigation,
   } = useRobot();
 
   const [isSwitchingMode, setIsSwitchingMode] = useState(false);
   const [controlMsg, setControlMsg] = useState<string | null>(null);
+  const [mapMode, setMapMode] = useState<MapBackgroundMode>('ros');
+
+  // Điều khiển dẫn đường Nav2 phía Admin
+  const [selectedNavDestId, setSelectedNavDestId] = useState('');
+  const [navActionMsg, setNavActionMsg] = useState<string | null>(null);
+  const [isNavSubmitting, setIsNavSubmitting] = useState(false);
+
+  // Nếu điểm đang chọn bị xóa khỏi hệ thống, bỏ lựa chọn đó và khóa nút "Bắt đầu dẫn đường"
+  useEffect(() => {
+    if (selectedNavDestId && !destinations.some((d) => d.id === selectedNavDestId)) {
+      setSelectedNavDestId('');
+    }
+  }, [destinations, selectedNavDestId]);
 
   // Form thêm / sửa điểm đến
   const [destId, setDestId] = useState('');
@@ -25,6 +42,108 @@ export default function AdminDashboard() {
   const [destY, setDestY] = useState('0.0');
   const [destYaw, setDestYaw] = useState('0');
   const [destMsg, setDestMsg] = useState<string | null>(null);
+  const [isSavingDest, setIsSavingDest] = useState(false);
+
+  // Quản lý xóa điểm đến
+  const [destToDelete, setDestToDelete] = useState<Destination | null>(null);
+  const [isDeletingDest, setIsDeletingDest] = useState(false);
+  const [deleteModalError, setDeleteModalError] = useState<string | null>(null);
+  const [deleteActionError, setDeleteActionError] = useState<string | null>(null);
+  const [deleteSuccessMsg, setDeleteSuccessMsg] = useState<string | null>(null);
+
+  // Chế độ chọn tọa độ trên bản đồ ROS và sao chép YAML
+  const [isPickingCoord, setIsPickingCoord] = useState(false);
+  const [copySuccessMsg, setCopySuccessMsg] = useState<string | null>(null);
+  const [showCopyModal, setShowCopyModal] = useState(false);
+  const [copiedYamlSnippet, setCopiedYamlSnippet] = useState('');
+
+  const hasValidMap = Boolean(
+    mapData &&
+    mapData.metadata &&
+    mapData.metadata.width > 0 &&
+    mapData.metadata.height > 0 &&
+    mapData.metadata.resolution > 0
+  );
+
+  const handleCoordinateSelect = useCallback((coords: { x: number; y: number }) => {
+    setDestX(coords.x.toFixed(2));
+    setDestY(coords.y.toFixed(2));
+    setIsPickingCoord(false);
+    setDestMsg(`📍 Đã lấy tọa độ từ bản đồ: X=${coords.x.toFixed(2)}m, Y=${coords.y.toFixed(2)}m`);
+  }, []);
+
+  const handleTogglePicking = () => {
+    if (!isPickingCoord) {
+      if (!hasValidMap) {
+        setDestMsg('⚠️ Chưa có metadata bản đồ ROS hợp lệ để chọn tọa độ.');
+        return;
+      }
+      if (mapMode !== 'ros') {
+        setMapMode('ros');
+      }
+      setIsPickingCoord(true);
+      setDestMsg('ℹ️ Chế độ chọn tọa độ: Click một điểm trên Bản đồ ROS để lấy X/Y.');
+    } else {
+      setIsPickingCoord(false);
+      setDestMsg(null);
+    }
+  };
+
+  // Preview Pin xem trước trên bản đồ (Điểm nháp)
+  const previewPoint = useMemo(() => {
+    const x = parseFloat(destX);
+    const y = parseFloat(destY);
+    const yawDeg = parseFloat(destYaw);
+    if (isNaN(x) || isNaN(y)) return null;
+    return {
+      x,
+      y,
+      yawDeg: isNaN(yawDeg) ? 0 : yawDeg,
+    };
+  }, [destX, destY, destYaw]);
+
+  const generateYamlSnippet = () => {
+    const id = destId.trim() || 'destination_id';
+    const name = destName.trim() || 'Tên điểm đến';
+    const x = parseFloat(destX) || 0.0;
+    const y = parseFloat(destY) || 0.0;
+    const yawDeg = parseFloat(destYaw) || 0.0;
+    const yawRad = (yawDeg * Math.PI) / 180.0;
+    const qz = Number(Math.sin(yawRad / 2).toFixed(4));
+    const qw = Number(Math.cos(yawRad / 2).toFixed(4));
+
+    return `  - id: "${id}"
+    name: "${name}"
+    map_id: "airport_floor_1"
+    pose:
+      header:
+        frame_id: "map"
+      position:
+        x: ${x}
+        y: ${y}
+        z: 0.0
+      orientation:
+        x: 0.0
+        y: 0.0
+        z: ${qz}
+        w: ${qw}`;
+  };
+
+  const handleCopyYaml = async () => {
+    const snippet = generateYamlSnippet();
+    setCopiedYamlSnippet(snippet);
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(snippet);
+        setCopySuccessMsg('Đã sao chép cấu hình YAML vào clipboard!');
+        setTimeout(() => setCopySuccessMsg(null), 4000);
+      } else {
+        setShowCopyModal(true);
+      }
+    } catch {
+      setShowCopyModal(true);
+    }
+  };
 
   // Vòng lặp gửi vận tốc 10Hz khi giữ nút điều khiển
   const driveTimerRef = useRef<any>(null);
@@ -84,8 +203,14 @@ export default function AdminDashboard() {
       return;
     }
 
-    const x = parseFloat(destX) || 0.0;
-    const y = parseFloat(destY) || 0.0;
+    const x = parseFloat(destX);
+    const y = parseFloat(destY);
+    if (isNaN(x) || isNaN(y)) {
+      setDestMsg('Tọa độ X và Y phải là số thực hợp lệ.');
+      return;
+    }
+
+    setIsSavingDest(true);
     const yawDeg = parseFloat(destYaw) || 0.0;
     const yawRad = (yawDeg * Math.PI) / 180;
 
@@ -105,6 +230,7 @@ export default function AdminDashboard() {
     };
 
     const res = await upsertDestination(newDest);
+    setIsSavingDest(false);
     if (res.success) {
       setDestMsg(`✅ ${res.message || 'Đã lưu điểm đến thành công.'}`);
       setDestId('');
@@ -112,6 +238,80 @@ export default function AdminDashboard() {
     } else {
       setDestMsg(`❌ ${res.message || 'Lỗi khi lưu điểm đến.'}`);
     }
+  };
+
+  const isNavigating =
+    status.navigationState === 'NAVIGATING' ||
+    status.navigationState === 'ACCEPTED' ||
+    status.navigationState === 'PENDING' ||
+    status.navigationState === 'CANCELING';
+  const isCanceling = status.navigationState === 'CANCELING';
+
+  const handleAdminStart = async () => {
+    if (!selectedNavDestId) return;
+    setNavActionMsg(null);
+    setIsNavSubmitting(true);
+    const res = await startNavigation(selectedNavDestId);
+    setIsNavSubmitting(false);
+    if (!res.success) {
+      setNavActionMsg(`❌ ${res.message || 'Không thể bắt đầu dẫn đường.'}`);
+    } else {
+      setNavActionMsg(`✅ ${res.message || 'Đã gửi lệnh dẫn đường tới Nav2.'}`);
+    }
+  };
+
+  const handleAdminCancel = async () => {
+    setNavActionMsg(null);
+    setIsNavSubmitting(true);
+    const res = await cancelNavigation();
+    setIsNavSubmitting(false);
+    if (!res.success) {
+      setNavActionMsg(`❌ ${res.message || 'Không thể hủy chuyến.'}`);
+    } else {
+      setNavActionMsg(`✅ ${res.message || 'Đã gửi lệnh hủy chuyến.'}`);
+    }
+  };
+
+  const handleRequestDelete = (dest: Destination) => {
+    setDestToDelete(dest);
+    setDeleteModalError(null);
+    setDeleteActionError(null);
+    setDeleteSuccessMsg(null);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!destToDelete) return;
+    setIsDeletingDest(true);
+    setDeleteModalError(null);
+    setDeleteActionError(null);
+    setDeleteSuccessMsg(null);
+
+    const res = await deleteDestination(destToDelete.id);
+    setIsDeletingDest(false);
+
+    if (res.success) {
+      setDeleteSuccessMsg(`✅ Đã xóa điểm đến '${destToDelete.name}' thành công.`);
+      if (destId === destToDelete.id) {
+        setDestId('');
+        setDestName('');
+      }
+      setDestToDelete(null);
+    } else {
+      setDeleteModalError(`❌ ${res.message || 'Lỗi khi xóa điểm đến.'}`);
+      setDeleteActionError(`❌ ${res.message || 'Lỗi khi xóa điểm đến.'}`);
+    }
+  };
+
+  const handleLoadToForm = (d: Destination) => {
+    setDestId(d.id);
+    setDestName(d.name);
+    setDestX(d.pose.position.x.toFixed(2));
+    setDestY(d.pose.position.y.toFixed(2));
+    const qz = d.pose.orientation.z;
+    const qw = d.pose.orientation.w;
+    const yawRad = 2 * Math.atan2(qz, qw);
+    const yawDeg = Math.round((yawRad * 180) / Math.PI);
+    setDestYaw(yawDeg.toString());
   };
 
   return (
@@ -232,9 +432,109 @@ export default function AdminDashboard() {
             </div>
           </div>
 
+          {/* Quản lý & Điều khiển dẫn đường Nav2 */}
+          <div className={styles.card}>
+            <div className={styles.cardHeader}>
+              <h2 className={styles.cardTitle}>Giám Sát & Điều Khiển Dẫn Đường (Nav2)</h2>
+              <span className={`${styles.navStateBadge} ${styles[status.navigationState.toLowerCase()] || ''}`}>
+                {status.navigationState}
+              </span>
+            </div>
+
+            {isNavigating ? (
+              <div className={styles.activeNavBox}>
+                <div className={styles.activeNavRow}>
+                  <span>Trạng thái:</span>
+                  <strong>{status.message || status.navigationState}</strong>
+                </div>
+                {status.distanceRemaining !== null && status.distanceRemaining !== undefined && (
+                  <div className={styles.activeNavRow}>
+                    <span>Khoảng cách còn lại:</span>
+                    <strong>{status.distanceRemaining.toFixed(1)} m</strong>
+                  </div>
+                )}
+                {status.hasActiveTrip && (
+                  <div className={styles.activeNavRow}>
+                    <span>Chuyến dẫn đường:</span>
+                    <span>Đang hoạt động</span>
+                  </div>
+                )}
+                <div className={styles.navActions}>
+                  <button
+                    type="button"
+                    className={styles.adminCancelBtn}
+                    onClick={handleAdminCancel}
+                    disabled={isNavSubmitting || isCanceling}
+                  >
+                    {isCanceling || isNavSubmitting ? 'Đang gửi lệnh hủy...' : 'HỦY CHUYẾN ĐI'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className={styles.navStartSection}>
+                {destinations.length === 0 ? (
+                  <p className={styles.helpText}>
+                    Chưa có điểm đến hợp lệ nào trên bản đồ hiện tại. Vui lòng thêm điểm đến bên dưới để bắt đầu.
+                  </p>
+                ) : (
+                  <div className={styles.formGroup}>
+                    <label htmlFor="adminNavDestSelect">Chọn điểm đến:</label>
+                    <select
+                      id="adminNavDestSelect"
+                      className={styles.selectInput}
+                      value={selectedNavDestId}
+                      onChange={(e) => setSelectedNavDestId(e.target.value)}
+                      disabled={isNavigating || isManual}
+                    >
+                      <option value="" disabled>-- Vui lòng chọn một điểm đến --</option>
+                      {destinations.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.name} ({d.id}) — [{d.pose.position.x.toFixed(1)}, {d.pose.position.y.toFixed(1)}]
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {isManual && (
+                  <div className={styles.warnText}>
+                    ⚠️ Robot đang ở chế độ MANUAL. Vui lòng tắt thủ công trước khi kích hoạt Nav2.
+                  </div>
+                )}
+
+                <div className={styles.navActions}>
+                  <button
+                    type="button"
+                    className={styles.adminStartBtn}
+                    onClick={handleAdminStart}
+                    disabled={
+                      !selectedNavDestId ||
+                      destinations.length === 0 ||
+                      isNavigating ||
+                      isManual ||
+                      !status.isConnected ||
+                      isNavSubmitting
+                    }
+                  >
+                    {isNavSubmitting ? 'Đang gửi lệnh...' : 'BẮT ĐẦU DẪN ĐƯỜNG'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {navActionMsg && <div className={styles.feedbackMsg}>{navActionMsg}</div>}
+          </div>
+
           {/* Form thêm/sửa điểm đến */}
           <div className={styles.card}>
-            <h2 className={styles.cardTitle}>Thêm / Cập Nhật Điểm Đến</h2>
+            <div className={styles.cardHeader}>
+              <h2 className={styles.cardTitle}>Thêm / Cập Nhật Điểm Đến</h2>
+              {previewPoint && (
+                <span className={styles.draftBadge}>
+                  📍 Điểm nháp ({previewPoint.x.toFixed(1)}, {previewPoint.y.toFixed(1)})
+                </span>
+              )}
+            </div>
             <form onSubmit={handleSaveDestination} className={styles.destForm}>
               <div className={styles.formRow}>
                 <div className={styles.formGroup}>
@@ -289,11 +589,81 @@ export default function AdminDashboard() {
                   />
                 </div>
               </div>
+              <div className={styles.destToolRow}>
+                <button
+                  type="button"
+                  className={`${styles.toolBtn} ${isPickingCoord ? styles.activeToolBtn : ''}`}
+                  onClick={handleTogglePicking}
+                  disabled={!hasValidMap}
+                  title={!hasValidMap ? 'Cần có metadata bản đồ ROS hợp lệ' : undefined}
+                >
+                  {isPickingCoord ? '✖ Hủy chọn tọa độ' : '📍 Chọn tọa độ trên bản đồ'}
+                </button>
+                <button
+                  type="button"
+                  className={styles.toolBtn}
+                  onClick={handleCopyYaml}
+                  title="Sao chép cấu hình YAML cho config/destinations.yaml"
+                >
+                  📋 Sao chép cấu hình YAML
+                </button>
+              </div>
+              {copySuccessMsg && <div className={styles.copySuccessMsg}>{copySuccessMsg}</div>}
               {destMsg && <div className={styles.feedbackMsg}>{destMsg}</div>}
-              <button type="submit" className={styles.submitBtn}>
-                Lưu Điểm Đến (ROS Upsert)
+              <button
+                type="submit"
+                className={styles.submitBtn}
+                disabled={isSavingDest || !hasValidMap}
+                title={!hasValidMap ? 'Cần có metadata bản đồ ROS hợp lệ' : undefined}
+              >
+                {isSavingDest ? 'Đang lưu điểm đến...' : 'Lưu Điểm Đến (Lưu Bền Vững)'}
               </button>
             </form>
+          </div>
+
+          {/* Card Quản lý danh sách điểm đến đã lưu */}
+          <div className={styles.card}>
+            <div className={styles.cardHeader}>
+              <h2 className={styles.cardTitle}>Danh Sách Điểm Đến ({destinations.length})</h2>
+            </div>
+            {deleteSuccessMsg && <div className={styles.copySuccessMsg}>{deleteSuccessMsg}</div>}
+            {deleteActionError && <div className={styles.errorText}>{deleteActionError}</div>}
+            {destinations.length === 0 ? (
+              <p className={styles.helpText}>Chưa có điểm đến nào trong hệ thống. Hãy thêm điểm đến ở form trên.</p>
+            ) : (
+              <div className={styles.destManageList}>
+                {destinations.map((d) => (
+                  <div key={d.id} className={styles.destManageItem}>
+                    <div className={styles.destManageInfo}>
+                      <span className={styles.destManageName}>{d.name}</span>
+                      <span className={styles.destManageId}>{d.id}</span>
+                      <span className={styles.destManageCoords}>
+                        ({d.pose.position.x.toFixed(1)}m, {d.pose.position.y.toFixed(1)}m)
+                      </span>
+                    </div>
+                    <div className={styles.destManageActions}>
+                      <button
+                        type="button"
+                        className={styles.destEditBtn}
+                        onClick={() => handleLoadToForm(d)}
+                        title="Nạp vào form để xem hoặc sửa"
+                      >
+                        Sửa
+                      </button>
+                      <button
+                        type="button"
+                        className={styles.destDeleteBtn}
+                        onClick={() => handleRequestDelete(d)}
+                        title={`Xóa điểm đến '${d.name}'`}
+                        disabled={isNavigating && status.destinationId === d.id}
+                      >
+                        Xóa
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -302,15 +672,39 @@ export default function AdminDashboard() {
           {/* Bản đồ */}
           <div className={styles.card} style={{ padding: 0, overflow: 'hidden' }}>
             <div className={styles.mapHeader}>
-              <span className={styles.cardTitle} style={{ margin: 0, padding: '12px 16px' }}>
+              <span className={styles.cardTitle}>
                 Bản Đồ Giám Sát Vận Hành
               </span>
+              <div className={styles.mapTabs} role="tablist">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mapMode === 'ros'}
+                  className={`${styles.mapTabBtn} ${mapMode === 'ros' ? styles.activeTab : ''}`}
+                  onClick={() => setMapMode('ros')}
+                >
+                  Bản đồ ROS
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mapMode === 'passenger'}
+                  className={`${styles.mapTabBtn} ${mapMode === 'passenger' ? styles.activeTab : ''}`}
+                  onClick={() => setMapMode('passenger')}
+                >
+                  Sơ đồ hành khách
+                </button>
+              </div>
             </div>
             <div style={{ height: '360px' }}>
               <MapView
+                backgroundMode={mapMode}
                 robotPose={status.pose}
                 destinations={destinations}
                 path={path}
+                isSelectingCoordinate={isPickingCoord}
+                onCoordinateSelect={handleCoordinateSelect}
+                previewPoint={previewPoint}
               />
             </div>
           </div>
@@ -339,6 +733,87 @@ export default function AdminDashboard() {
           </div>
         </div>
       </div>
+
+      {showCopyModal && (
+        <div className={styles.modalOverlay} onClick={() => setShowCopyModal(false)}>
+          <div className={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+            <div className={styles.modalHeader}>
+              <h3>Cấu Hình YAML Điểm Đến</h3>
+              <button
+                type="button"
+                className={styles.closeBtn}
+                onClick={() => setShowCopyModal(false)}
+              >
+                ✕
+              </button>
+            </div>
+            <p className={styles.modalHelp}>
+              Trình duyệt không cho phép truy cập Clipboard tự động. Vui lòng chọn và sao chép đoạn mã YAML bên dưới rồi dán vào <code>config/destinations.yaml</code> trên máy Host:
+            </p>
+            <textarea
+              className={styles.yamlTextarea}
+              rows={12}
+              readOnly
+              value={copiedYamlSnippet}
+              onFocus={(e) => e.target.select()}
+            />
+            <div className={styles.modalActions}>
+              <button
+                type="button"
+                className={styles.toolBtn}
+                onClick={() => setShowCopyModal(false)}
+              >
+                Đóng
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {destToDelete && (
+        <div className={styles.modalOverlay} onClick={() => !isDeletingDest && setDestToDelete(null)}>
+          <div className={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+            <div className={styles.modalHeader}>
+              <h3>Xác Nhận Xóa Điểm Đến</h3>
+              <button
+                type="button"
+                className={styles.closeBtn}
+                onClick={() => !isDeletingDest && setDestToDelete(null)}
+                disabled={isDeletingDest}
+              >
+                ✕
+              </button>
+            </div>
+            <p className={styles.modalHelp}>
+              Xóa điểm đến <strong>&ldquo;{destToDelete.name}&rdquo;</strong> (<code>{destToDelete.id}</code>)?
+            </p>
+            <p className={styles.modalSubHelp}>
+              Điểm này sẽ bị xóa khỏi tệp lưu trữ <code>data/destinations.yaml</code> và tự động đồng bộ gỡ bỏ trên tất cả các tab đang mở.
+            </p>
+            {deleteModalError && (
+              <div className={styles.modalError}>{deleteModalError}</div>
+            )}
+            <div className={styles.modalConfirmActions}>
+              <button
+                type="button"
+                className={styles.cancelModalBtn}
+                onClick={() => setDestToDelete(null)}
+                disabled={isDeletingDest}
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                className={styles.confirmDeleteBtn}
+                onClick={handleConfirmDelete}
+                disabled={isDeletingDest}
+              >
+                {isDeletingDest ? 'Đang xóa...' : 'Xác Nhận Xóa'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -89,7 +89,8 @@ class RosConfig:
             "actions": self.raw_data.get("actions", {}),
             "nodes": self.raw_data.get("nodes", {}),
             "velocity_limits": self.raw_data.get("velocity_limits", {}),
-            "destinations_storage_path": self.raw_data.get("destinations_storage_path", "config/destinations.yaml"),
+            "destinations_storage_path": self.raw_data.get("destinations_storage_path", "data/destinations.yaml"),
+            "destinations_seed_path": self.raw_data.get("destinations_seed_path", "config/destinations.yaml"),
             "use_sim_time": False
         }
 
@@ -162,7 +163,17 @@ class RosConfig:
 
     @property
     def destinations_storage_path(self) -> str:
-        return self.merged_config.get("destinations_storage_path", "config/destinations.yaml")
+        env_val = os.getenv("DESTINATIONS_STORAGE_PATH")
+        if env_val:
+            return env_val
+        return self.merged_config.get("destinations_storage_path", "data/destinations.yaml")
+
+    @property
+    def destinations_seed_path(self) -> str:
+        env_val = os.getenv("DESTINATIONS_SEED_PATH")
+        if env_val:
+            return env_val
+        return self.merged_config.get("destinations_seed_path", "config/destinations.yaml")
 
     def print_active_config(self):
         """In ra bảng cấu hình đang kích hoạt theo định dạng CLI dễ nhìn"""

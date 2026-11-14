@@ -43,6 +43,7 @@ export type ControlMode = 'AUTO' | 'MANUAL' | 'TRANSITION' | 'FAULT';
 
 export type NavigationState =
   | 'IDLE'
+  | 'PENDING'
   | 'ACCEPTED'
   | 'NAVIGATING'
   | 'CANCELING'
@@ -55,18 +56,30 @@ export type VoiceState = 'IDLE' | 'LISTENING' | 'PROCESSING' | 'SPEAKING' | 'ERR
 
 export interface RobotStatus {
   pose: RobotPose | null;
+  frame_id?: string;
+  stamp?: {
+    sec: number;
+    nanosec: number;
+  } | null;
   batteryPercent: number | null; // null nếu chưa có dữ liệu đo
   isConnected: boolean;
   isDataStale: boolean;
+  simClockStalled?: boolean;
+  mapVersion?: string | null;
   controlMode: ControlMode;
   navigationState: NavigationState;
   hasGoal: boolean;
   goalId: string;
   destinationId: string;
+  isOwner?: boolean;
+  hasActiveTrip?: boolean;
+  distanceRemaining?: number | null;
+  estimatedTimeRemaining?: number | null;
   voiceState: VoiceState;
   voiceTranscript: string | null;
   voiceResponse: string | null;
   message: string;
+  destinationsVersion?: number;
   lastUpdated: number;
 }
 
@@ -83,3 +96,29 @@ export interface PathPoint {
   x: number;
   y: number;
 }
+
+// 6. Bản đồ OccupancyGrid 2D từ /map
+export interface MapMetadata {
+  width: number;
+  height: number;
+  resolution: number;
+  origin_x: number;
+  origin_y: number;
+  origin_yaw: number;
+}
+
+export interface MapData {
+  status: string;
+  map_version: string;
+  frame_id: string;
+  stamp?: {
+    sec: number;
+    nanosec: number;
+  };
+  metadata: MapMetadata;
+  image_url: string;
+  imageBlobUrl?: string;
+}
+
+// 7. Chế độ hiển thị ảnh nền bản đồ (Bản đồ ROS và Sơ đồ hành khách)
+export type MapBackgroundMode = 'ros' | 'passenger';

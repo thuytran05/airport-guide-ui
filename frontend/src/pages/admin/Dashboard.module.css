@@ -250,3 +250,472 @@
   font-size: 12px;
   margin-bottom: 8px;
 }
+
+.draftBadge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 9999px;
+  background: #FEF3C7;
+  color: #B45309;
+  border: 1px solid #FCD34D;
+}
+
+.mapHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  background: #F8FAFC;
+  border-bottom: 1px solid #E2E8F0;
+}
+
+.mapTabs {
+  display: flex;
+  gap: 4px;
+  background: #E2E8F0;
+  padding: 3px;
+  border-radius: 6px;
+}
+
+.mapTabBtn {
+  border: none;
+  background: transparent;
+  padding: 5px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748B;
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+}
+
+.mapTabBtn:hover {
+  color: #1E293B;
+}
+
+.mapTabBtn.activeTab {
+  background: #FFFFFF;
+  color: #1D4ED8;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.navStateBadge {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 9999px;
+  background: #F1F5F9;
+  color: #475569;
+  border: 1px solid #CBD5E1;
+  text-transform: uppercase;
+}
+
+.navStateBadge.navigating,
+.navStateBadge.accepted,
+.navStateBadge.pending {
+  background: #EFF6FF;
+  color: #1D4ED8;
+  border-color: #93C5FD;
+}
+
+.navStateBadge.canceling {
+  background: #FEF3C7;
+  color: #D97706;
+  border-color: #FCD34D;
+}
+
+.navStateBadge.completed {
+  background: #F0FDF4;
+  color: #16A34A;
+  border-color: #86EFAC;
+}
+
+.navStateBadge.failed {
+  background: #FEF2F2;
+  color: #DC2626;
+  border-color: #FCA5A5;
+}
+
+.activeNavBox {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: #F8FAFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.activeNavRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  color: #334155;
+}
+
+.activeNavRow strong {
+  color: #0F172A;
+  font-weight: 600;
+}
+
+.navStartSection {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.selectInput {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #CBD5E1;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #1E293B;
+  background: #FFFFFF;
+}
+
+.selectInput:focus {
+  outline: none;
+  border-color: #2563EB;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+}
+
+.warnText {
+  font-size: 12px;
+  color: #B45309;
+  background: #FFFBEB;
+  border: 1px solid #FDE68A;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.navActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.adminStartBtn {
+  flex: 1;
+  background: #16A34A;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+}
+
+.adminStartBtn:hover:not(:disabled) {
+  background: #15803D;
+}
+
+.adminStartBtn:disabled {
+  background: #94A3B8;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.adminCancelBtn {
+  width: 100%;
+  background: #DC2626;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+}
+
+.adminCancelBtn:hover:not(:disabled) {
+  background: #B91C1C;
+}
+
+.adminCancelBtn:disabled {
+  background: #94A3B8;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.destToolRow {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.toolBtn {
+  flex: 1;
+  background: #F1F5F9;
+  color: #334155;
+  border: 1px solid #CBD5E1;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.15s ease-in-out;
+}
+
+.toolBtn:hover:not(:disabled) {
+  background: #E2E8F0;
+  border-color: #94A3B8;
+  color: #1E293B;
+}
+
+.toolBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.activeToolBtn {
+  background: #FEF3C7;
+  color: #B45309;
+  border-color: #F59E0B;
+  font-weight: 600;
+}
+
+.copySuccessMsg {
+  background: #ECFDF5;
+  color: #065F46;
+  border: 1px solid #A7F3D0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.modalOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.6);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modalContent {
+  background: #FFFFFF;
+  border-radius: 10px;
+  width: 90%;
+  max-width: 520px;
+  padding: 20px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+}
+
+.modalHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.modalHeader h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #1E293B;
+}
+
+.closeBtn {
+  background: none;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  color: #64748B;
+  padding: 4px;
+}
+
+.modalHelp {
+  font-size: 13px;
+  color: #475569;
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.yamlTextarea {
+  width: 100%;
+  font-family: monospace;
+  font-size: 12px;
+  background: #0F172A;
+  color: #38BDF8;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 10px;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.modalActions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+/* Quản lý danh sách điểm đến */
+.destManageList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+  margin-top: 10px;
+}
+
+.destManageItem {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: #F8FAFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 6px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.destManageItem:hover {
+  background: #F1F5F9;
+  border-color: #CBD5E1;
+}
+
+.destManageInfo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.destManageName {
+  font-weight: 600;
+  color: #1E293B;
+}
+
+.destManageId {
+  background: #E0E7FF;
+  color: #3730A3;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: monospace;
+}
+
+.destManageCoords {
+  color: #64748B;
+  font-size: 12px;
+}
+
+.destManageActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.destEditBtn {
+  background: #FFFFFF;
+  border: 1px solid #CBD5E1;
+  color: #334155;
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.destEditBtn:hover {
+  background: #E2E8F0;
+}
+
+.destDeleteBtn {
+  background: #FEE2E2;
+  border: 1px solid #FECACA;
+  color: #DC2626;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.destDeleteBtn:hover {
+  background: #FCA5A5;
+  color: #991B1B;
+}
+
+.modalSubHelp {
+  font-size: 12px;
+  color: #64748B;
+  margin: 4px 0 12px 0;
+  line-height: 1.4;
+}
+
+.modalError {
+  background: #FEE2E2;
+  border: 1px solid #FCA5A5;
+  color: #DC2626;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.modalConfirmActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.cancelModalBtn {
+  background: #F1F5F9;
+  border: 1px solid #CBD5E1;
+  color: #475569;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.cancelModalBtn:hover:not(:disabled) {
+  background: #E2E8F0;
+}
+
+.cancelModalBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.confirmDeleteBtn {
+  background: #DC2626;
+  border: none;
+  color: #FFFFFF;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.confirmDeleteBtn:hover:not(:disabled) {
+  background: #B91C1C;
+}
+
+.confirmDeleteBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

@@ -1,156 +1,155 @@
 # CẨM NANG CÁC CÂU LỆNH CẦN DÙNG (CHEATSHEET)
 *Dự án: Airport Guide Robot UI (Giao diện Web Robot Dẫn đường Sân bay)*
-*Cập nhật lần cuối: 11/11/2026*
+*Môi trường mục tiêu: Ubuntu 22.04 LTS — ROS 2 Jazzy (Docker Compose & VS Code Dev Container)*
 
-Tài liệu này tổng hợp toàn bộ các câu lệnh bạn cần chạy trên **Windows** (khi phát triển/kiểm thử giao diện) và **Ubuntu** (khi kết nối ROS 2 / Docker / Gazebo / Robot thật). Bạn chỉ cần mở tệp này để tra cứu mỗi khi cần.
+Tài liệu này tổng hợp toàn bộ các câu lệnh cần thiết để vận hành và kiểm tra hệ thống trên **Ubuntu 22.04 (máy robot / mô phỏng Gazebo)** và **Windows (phát triển giao diện)**.
 
 ---
 
-## PHẦN 1: MÔI TRƯỜNG WINDOWS (PHÁT TRIỂN & KIỂM THỬ GIAO DIỆN)
+## PHẦN 1: MÔI TRƯỜNG UBUNTU 22.04 (DOCKER COMPOSE & ROS 2 JAZZY)
 
-> **Lưu ý:** Trên Windows không cần cài đặt ROS 2 hoặc Docker. Hệ thống tự động sử dụng chế độ `MockRobotAdapter` để giả lập robot.
+> [!IMPORTANT]
+> **Không cần cài `node`, `npm`, `pip` hay `python-venv` trên máy Ubuntu host.**
+> Toàn bộ giao diện (Frontend Nginx) và backend (FastAPI + `rclpy`) đã được đóng gói hoàn chỉnh bằng Docker Compose với `network_mode: host`.
+> VS Code Dev Container (`ws`) của robot hoạt động hoàn toàn độc lập và không bị ảnh hưởng.
 
-### 1. Cài đặt ban đầu (Chỉ chạy 1 lần)
-Mở PowerShell tại thư mục gốc của dự án `airport-guide-ui`:
+### 1. Khởi động và quản lý vòng đời hệ thống
 
-```powershell
-# Cài đặt thư viện Python cho Backend
-cd backend
-pip install -r requirements.txt
+Mở terminal trên Ubuntu tại thư mục `~/airport-guide-ui`:
 
-# Cài đặt thư viện Node.js cho Frontend
-cd ../frontend
-npm install
+```bash
+cd ~/airport-guide-ui
+
+# 1.1 Khởi động toàn bộ dịch vụ chạy nền
+docker compose up -d
+
+# 1.2 Kiểm tra trạng thái hai container
+docker compose ps
+
+# 1.3 Khởi động lại khi thay đổi cấu hình (ví dụ sửa config/robot_interface.yaml)
+docker compose restart backend
+
+# 1.4 Rebuild lại container khi cập nhật Dockerfile hoặc mã nguồn mới
+docker compose up -d --build
+
+# 1.5 Dừng toàn bộ hệ thống một cách an toàn
+docker compose down
 ```
 
-### 2. Khởi chạy hệ thống hàng ngày để sử dụng trên trình duyệt
+---
 
-**Bước 2.1: Chạy Backend (Terminal 1)**
+### 2. Xem nhật ký hoạt động (Logs)
+
+```bash
+# Xem log Backend liên tục (FastAPI + ROS Adapter)
+docker compose logs -f backend
+
+# Xem log Frontend liên tục (Nginx)
+docker compose logs -f frontend
+
+# Xem 100 dòng log gần nhất của backend khi cần gỡ lỗi
+docker compose logs --tail=100 backend
+
+# Xem log của cả hệ thống kết hợp timestamp
+docker compose logs -f -t
+```
+
+---
+
+### 3. Kiểm tra chẩn đoán 3 tầng kết nối (Health Check & DDS)
+
+> [!WARNING]
+> **Quy tắc phân biệt:** Backend báo `healthy` **CHƯA ĐỒNG NGHĨA** robot đã kết nối. Cần kiểm tra kỹ trường `"robot_connected"`.
+
+```bash
+# Bước 3.1: Kiểm tra API Sẵn sàng của Backend (Tầng Web Gateway)
+curl -s http://localhost:8000/api/health | jq .
+# Kết quả mong đợi:
+# - "status": "healthy"
+# - "ros_domain_id": 0
+# - "robot_connected": true (nếu AMCL/Gazebo đang phát pose) hoặc false (nếu chưa có pose)
+
+# Bước 3.2: Kiểm tra các ROS nodes đang phát hiện qua DDS (từ trong Backend Docker)
+docker compose exec backend bash -c "source /opt/ros/jazzy/setup.bash && ros2 node list"
+
+# Bước 3.3: Kiểm tra danh sách topics hiện có trên mạng DDS
+docker compose exec backend bash -c "source /opt/ros/jazzy/setup.bash && ros2 topic list"
+
+# Bước 3.4: Kiểm tra action server của Nav2
+docker compose exec backend bash -c "source /opt/ros/jazzy/setup.bash && ros2 action list"
+```
+
+---
+
+### 4. Kiểm tra dữ liệu thực tế từ Gazebo / Nav2
+
+Thực hiện từ bên trong container backend để xác nhận dữ liệu có thực sự đến được gateway:
+
+```bash
+# 4.1 Kiểm tra topic bản đồ tĩnh từ map_server (phải có dữ liệu)
+docker compose exec backend bash -c "source /opt/ros/jazzy/setup.bash && ros2 topic echo /map --once"
+
+# 4.2 Kiểm tra topic vị trí robot từ AMCL (kiểu PoseWithCovarianceStamped)
+docker compose exec backend bash -c "source /opt/ros/jazzy/setup.bash && ros2 topic echo /amcl_pose --once"
+
+# 4.3 Đo tần suất phát vị trí của AMCL (khi robot đứng yên hoặc di chuyển)
+docker compose exec backend bash -c "source /opt/ros/jazzy/setup.bash && ros2 topic hz /amcl_pose"
+
+# 4.4 Kiểm tra thông tin action điều hướng Nav2
+docker compose exec backend bash -c "source /opt/ros/jazzy/setup.bash && ros2 action info /navigate_to_pose"
+```
+
+---
+
+### 5. Truy cập giao diện người dùng
+
+- **Trực tiếp trên máy robot / Ubuntu:** `http://localhost:5173`
+- **Trên máy tính khác trong cùng mạng LAN:** `http://<IP_UBUNTU>:5173`
+- **Tài khoản quản trị viên (Admin):**
+  - Tài khoản: `admin`
+  - Mật khẩu: `admin123`
+- **Hành khách (Passenger):** Dùng trực tiếp trên trang chủ không cần đăng nhập.
+
+---
+
+## PHẦN 2: MÔI TRƯỜNG WINDOWS (PHÁT TRIỂN & KIỂM THỬ GIAO DIỆN MOCK)
+
+> Dùng khi lập trình giao diện hoặc chạy unit tests trên Windows mà không cần ROS 2.
+
 ```powershell
+# 1. Cài đặt thư viện (chỉ chạy 1 lần khi clone mới)
+cd backend
+python -m pip install -r requirements.txt
+cd ..\frontend
+npm install
+
+# 2. Khởi chạy Backend (Terminal 1)
 cd backend
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-*Dấu hiệu thành công:* Terminal báo `Uvicorn running on http://0.0.0.0:8000`.
 
-**Bước 2.2: Chạy Frontend (Terminal 2 - mở tab mới)**
-```powershell
+# 3. Khởi chạy Frontend (Terminal 2)
 cd frontend
 npm run dev
-```
-*Dấu hiệu thành công:* Terminal báo `Local: http://localhost:5173/`.
 
-**Bước 2.3: Mở trình duyệt web**
-- Truy cập: `http://localhost:5173`
-- **Hành khách:** Dùng ngay trên màn hình chính, không cần đăng nhập (chọn điểm đến, bấm "Bắt Đầu Dẫn Đường", bấm microphone để nói).
-- **Quản trị viên (Admin):** Nhấn nút "Đăng nhập Admin" góc trên bên phải:
-  - Tài khoản mặc định: `admin`
-  - Mật khẩu mặc định: `admin123`
-
-### 3. Các lệnh kiểm tra cấu hình & Unit Tests trên Windows
-
-**Kiểm tra bảng cấu hình ROS đang áp dụng (CLI):**
-```powershell
+# 4. Kiểm tra cấu hình ROS (CLI)
 cd backend
 python -m app.ros_config
-```
 
-**Chạy toàn bộ Unit Tests kiểm tra Backend:**
-```powershell
+# 5. Chạy toàn bộ Unit Tests
 cd backend
 python -m pytest tests -v
 ```
 
-**Kiểm tra biên dịch Frontend (TypeScript & Vite build):**
-```powershell
-cd frontend
-npm run build
-```
-
 ---
 
-## PHẦN 2: MÔI TRƯỜNG UBUNTU 22 (ROBOT THẬT & MÔ PHỎNG ROS 2 JAZZY)
+## PHẦN 3: TÙY BIẾN CẤU HÌNH GIAO TIẾP ROS
 
-> **CẢNH BÁO QUAN TRỌNG KHI CHUYỂN DỰ ÁN TỪ WINDOWS SANG UBUNTU:**
-> **TUYỆT ĐỐI KHÔNG** sao chép thư mục `node_modules` hoặc thư mục môi trường ảo Python (`.venv`) từ Windows sang Ubuntu. Hãy chỉ copy mã nguồn, sau đó chạy lệnh cài đặt lại dưới đây trên Ubuntu.
+Toàn bộ thông số giao tiếp được quản lý tập trung tại:
+`config/robot_interface.yaml`
 
-### 1. Chuẩn bị thư viện sạch trên Ubuntu
-
-```bash
-# Di chuyển vào thư mục dự án
-cd airport-guide-ui
-
-# 1. Cài đặt thư viện Frontend sạch theo lockfile:
-cd frontend
-npm ci
-npm run build
-
-# 2. Cài đặt thư viện Backend:
-cd ../backend
-pip install -r requirements.txt
-```
-
-### 2. Kiểm tra kết nối với ROS 2 Jazzy trên Ubuntu
-
-**Kiểm tra cấu hình giao tiếp ROS:**
-```bash
-cd backend
-python3 -m app.ros_config
-```
-
-**Khởi chạy Backend với Adapter ROS 2 thật (thay vì mock):**
-```bash
-cd backend
-# Đặt biến môi trường sử dụng adapter ROS và chạy uvicorn
-export ROBOT_ADAPTER_MODE=ros
-python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-### 3. Khởi chạy bằng Docker Compose (Khuyên dùng khi chạy trên máy Host có ROS Jazzy)
-
-Nếu bạn muốn chạy cả Frontend (qua Nginx) và Backend (trong container ROS Jazzy kết nối host network):
-
-```bash
-# Khởi động toàn bộ container
-docker compose up -d
-
-# Xem log hoạt động của backend
-docker compose logs -f backend
-
-# Dừng hệ thống
-docker compose down
-```
-Truy cập qua trình duyệt máy khác trong mạng LAN: `http://<IP_MÁY_UBUNTU>:80` hoặc cổng dev `http://<IP_MÁY_UBUNTU>:5173`.
-
----
-
-## PHẦN 3: CÁC LỆNH ROS 2 THƯỜNG DÙNG ĐỂ KIỂM TRA TOPIC/SERVICE TRÊN UBUNTU
-
-Chạy bên trong Docker hoặc terminal đã `source /opt/ros/jazzy/setup.bash`:
-
-```bash
-# 1. Xem danh sách topic đang chạy
-ros2 topic list
-
-# 2. Kiểm tra tần suất topic vị trí robot (yêu cầu khoảng 10Hz)
-ros2 topic hz /airport/pose
-
-# 3. Xem dữ liệu trạng thái robot
-ros2 topic echo /airport/state
-
-# 4. Kiểm tra service trigger giọng nói
-ros2 service call /airport/voice/start std_srvs/srv/Trigger "{}"
-
-# 5. Kiểm tra service chuyển chế độ thủ công
-ros2 service call /airport/control/set_manual std_srvs/srv/SetBool "{data: true}"
-
-# 6. Xem danh sách action đang cung cấp
-ros2 action list
-```
-
----
-
-## PHẦN 4: THAY ĐỔI CẤU HÌNH (DUY NHẤT 1 FILE)
-
-Mọi thay đổi về tên topic, service, action, profile `sim` (Gazebo) hoặc `real` (Robot thật):
-- **Tệp cần mở sửa:** `config/robot_interface.yaml`
-- **Cách áp dụng:** Sửa xong file -> Khởi động lại Backend (`uvicorn` hoặc `docker compose restart backend`).
+- **Đổi Domain ID:** Mục `connection.ros_domain_id` (mặc định đã đồng bộ `0`).
+- **Đổi Profile:** Sửa dòng `active_profile: "sim"` (mô phỏng Gazebo) hoặc `active_profile: "real"` (robot thật).
+- **Sau khi sửa file config:** Chỉ cần chạy lệnh:
+  ```bash
+  docker compose restart backend
+  ```

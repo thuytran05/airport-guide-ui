@@ -27,7 +27,15 @@ class WebSocketClient {
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const query = token ? `?token=${encodeURIComponent(token)}` : '';
+    let effectiveToken = token;
+    if (!effectiveToken && typeof window !== 'undefined') {
+      try {
+        effectiveToken = sessionStorage.getItem('airport_passenger_token');
+      } catch {
+        // ignore
+      }
+    }
+    const query = effectiveToken ? `?token=${encodeURIComponent(effectiveToken)}` : '';
     const wsUrl = `${protocol}//${host}/ws${query}`;
 
     try {

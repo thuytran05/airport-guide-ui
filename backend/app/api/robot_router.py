@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from ..auth.models import User, UserRole
 from ..auth.dependencies import get_current_user, require_role
@@ -27,7 +27,50 @@ class VelocityCommandRequest(BaseModel):
 async def get_robot_status(current_user: User = Depends(get_current_user)):
     """Lấy trạng thái tổng quan của robot (hành khách hoặc admin)"""
     adapter = get_robot_adapter()
-    return adapter.get_status()
+    st = adapter.get_status()
+    owner_id = getattr(adapter, "get_owner_id", lambda: "")()
+    is_admin = (current_user.role == UserRole.ADMIN)
+    st["has_active_trip"] = bool(owner_id)
+    st["is_owner"] = bool((owner_id and current_user and current_user.id == owner_id) or is_admin)
+    return st
+
+@router.get("/map")
+async def get_map_metadata(current_user: User = Depends(get_current_user)):
+    """
+    Lấy thông tin metadata và định danh phiên bản của bản đồ OccupancyGrid.
+    Public cho cả Hành khách và Admin.
+    """
+    adapter = get_robot_adapter()
+    meta = adapter.get_map_metadata()
+    if not meta:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Bản đồ chưa sẵn sàng hoặc chưa nhận được từ ROS."
+        )
+    return meta
+
+@router.get("/map/image")
+async def get_map_image(
+    v: str = Query(..., description="Phiên bản bản đồ tương ứng với metadata")
+):
+    """
+    Tải ảnh PNG bản đồ theo phiên bản chỉ định.
+    Nếu phiên bản không khớp hoặc đã hết hạn, trả lỗi 404 để client tải lại metadata.
+    """
+    adapter = get_robot_adapter()
+    png_bytes = adapter.get_map_image(v)
+    if png_bytes is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Không tìm thấy ảnh bản đồ phiên bản '{v}'. Vui lòng tải lại metadata từ /api/robot/map."
+        )
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable"
+        }
+    )
 
 @router.get("/destinations")
 async def get_destinations(current_user: User = Depends(get_current_user)):
@@ -43,6 +86,18 @@ async def upsert_destination(
     """Thêm hoặc cập nhật điểm đến (chỉ dành cho Admin đã đăng nhập)"""
     adapter = get_robot_adapter()
     res = adapter.upsert_destination(req.model_dump())
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+@router.delete("/destinations/{destination_id}")
+async def delete_destination(
+    destination_id: str,
+    current_user: User = Depends(require_role(UserRole.ADMIN))
+):
+    """Xóa điểm đến theo ID (chỉ dành cho Admin đã đăng nhập)"""
+    adapter = get_robot_adapter()
+    res = adapter.delete_destination(destination_id)
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res

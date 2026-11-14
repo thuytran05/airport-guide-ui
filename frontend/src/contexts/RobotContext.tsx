@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
-import { RobotStatus, Destination, AlertItem, PathPoint } from '../types';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef, ReactNode } from 'react';
+import { RobotStatus, Destination, AlertItem, PathPoint, MapData } from '../types';
 import { apiClient } from '../api/client';
 import { wsClient } from '../api/wsClient';
 import { useAuth } from './AuthContext';
@@ -10,6 +10,10 @@ interface RobotContextType {
   alerts: AlertItem[];
   path: PathPoint[] | null;
   isBackendConnected: boolean;
+  mapData: MapData | null;
+  isMapLoading: boolean;
+  mapError: string | null;
+  refreshMap: () => Promise<void>;
   refreshDestinations: () => Promise<void>;
   startNavigation: (destinationId: string) => Promise<{ success: boolean; message?: string }>;
   cancelNavigation: () => Promise<{ success: boolean; message?: string }>;
@@ -17,18 +21,27 @@ interface RobotContextType {
   setManualControl: (enable: boolean) => Promise<{ success: boolean; message?: string }>;
   sendManualVelocity: (linear_x: number, angular_z: number) => Promise<boolean>;
   upsertDestination: (dest: Destination) => Promise<{ success: boolean; message?: string }>;
+  deleteDestination: (id: string) => Promise<{ success: boolean; message?: string }>;
 }
 
 const DEFAULT_STATUS: RobotStatus = {
   pose: null,
+  frame_id: 'map',
+  stamp: null,
   batteryPercent: null,
   isConnected: false,
   isDataStale: true,
+  simClockStalled: false,
+  mapVersion: null,
   controlMode: 'AUTO',
   navigationState: 'IDLE',
   hasGoal: false,
   goalId: '',
   destinationId: '',
+  isOwner: false,
+  hasActiveTrip: false,
+  distanceRemaining: null,
+  estimatedTimeRemaining: null,
   voiceState: 'IDLE',
   voiceTranscript: null,
   voiceResponse: null,
@@ -46,6 +59,17 @@ export function RobotProvider({ children }: { children: ReactNode }) {
   const [path, setPath] = useState<PathPoint[] | null>(null);
   const [isBackendConnected, setIsBackendConnected] = useState<boolean>(false);
 
+  // Quản lý bản đồ OccupancyGrid
+  const [mapData, setMapData] = useState<MapData | null>(null);
+  const [isMapLoading, setIsMapLoading] = useState<boolean>(false);
+  const [mapError, setMapError] = useState<string | null>(null);
+
+  // Refs để kiểm soát tải bản đồ và điểm đến, tránh gọi HTTP lặp ở 5Hz
+  const activeMapVersionRef = useRef<string | null>(null);
+  const activeDestinationsVersionRef = useRef<number | null>(null);
+  const fetchSeqRef = useRef<number>(0);
+  const inFlightVersionRef = useRef<string | null>(null);
+
   // 1. Tải danh sách điểm đến từ backend
   const refreshDestinations = useCallback(async () => {
     try {
@@ -56,13 +80,84 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // 2. Kết nối WebSocket khi khởi động
+  // 2. Hàm tải bản đồ (Metadata + PNG thành một cặp nguyên tử)
+  const fetchMapData = useCallback(async (targetVersion?: string, retryCount = 0) => {
+    // Nếu targetVersion trùng với phiên bản đang hiển thị thành công, không gọi lại
+    if (targetVersion && targetVersion === activeMapVersionRef.current) {
+      return;
+    }
+
+    // Nếu đang trong quá trình tải đúng version này rồi, tránh trùng lặp
+    if (targetVersion && targetVersion === inFlightVersionRef.current) {
+      return;
+    }
+
+    const currentSeq = ++fetchSeqRef.current;
+    inFlightVersionRef.current = targetVersion || null;
+    setIsMapLoading(true);
+
+    try {
+      // Tải metadata từ backend qua proxy tương đối
+      const meta = await apiClient.get<MapData>('/api/robot/map');
+
+      // Nếu đã có bản đồ phiên bản này rồi và mapData đã sẵn sàng
+      if (
+        meta.map_version === activeMapVersionRef.current &&
+        currentSeq === fetchSeqRef.current
+      ) {
+        setIsMapLoading(false);
+        inFlightVersionRef.current = null;
+        return;
+      }
+
+      // Pre-load ảnh PNG tương ứng với phiên bản để bảo đảm ảnh đã sẵn sàng trước khi công bố lên UI
+      const imageUrl = meta.image_url.startsWith('/') ? meta.image_url : `/${meta.image_url}`;
+      await new Promise<void>((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('Không thể tải ảnh bản đồ từ máy chủ.'));
+        img.src = imageUrl;
+      });
+
+      // Nếu đã có request mới hơn bắt đầu, bỏ kết quả cũ
+      if (currentSeq !== fetchSeqRef.current) {
+        return;
+      }
+
+      activeMapVersionRef.current = meta.map_version;
+      inFlightVersionRef.current = null;
+
+      // Chỉ công bố cặp mới lên UI sau khi ảnh đã tải thành công
+      setMapData(meta);
+      setMapError(null);
+    } catch (err: any) {
+      if (currentSeq === fetchSeqRef.current) {
+        console.warn('Lỗi khi tải bản đồ OccupancyGrid:', err);
+        setMapError(err.message || 'Không thể tải bản đồ từ máy chủ.');
+        inFlightVersionRef.current = null;
+      }
+    } finally {
+      if (currentSeq === fetchSeqRef.current) {
+        setIsMapLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshMap = useCallback(async () => {
+    activeMapVersionRef.current = null;
+    await fetchMapData();
+  }, [fetchMapData]);
+
+  // 3. Kết nối WebSocket khi khởi động
   useEffect(() => {
     wsClient.connect(token);
 
     const unsubStatus = wsClient.onStatusChange((connected) => {
       setIsBackendConnected(connected);
-      if (!connected) {
+      if (connected) {
+        // Tải bản đồ khi WebSocket kết nối thành công hoặc kết nối lại
+        fetchMapData();
+      } else {
         setStatus((prev) => ({
           ...prev,
           isConnected: false,
@@ -78,24 +173,55 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         if (rob) {
           setStatus({
             pose: rob.pose,
+            frame_id: rob.frame_id || 'map',
+            stamp: rob.stamp || null,
             batteryPercent: rob.battery_percent,
             isConnected: rob.is_connected,
             isDataStale: rob.is_data_stale,
+            simClockStalled: rob.sim_clock_stalled || false,
+            mapVersion: rob.map_version || null,
             controlMode: rob.control_mode || 'AUTO',
             navigationState: rob.navigation_state || 'IDLE',
             hasGoal: rob.has_goal || false,
             goalId: rob.goal_id || '',
             destinationId: rob.destination_id || '',
+            isOwner: rob.is_owner ?? false,
+            hasActiveTrip: rob.has_active_trip ?? false,
+            distanceRemaining: rob.distance_remaining ?? null,
+            estimatedTimeRemaining: rob.estimated_time_remaining ?? null,
             voiceState: rob.voice_state || 'IDLE',
             voiceTranscript: rob.voice_transcript,
             voiceResponse: rob.voice_response,
             message: rob.message || '',
             lastUpdated: rob.last_updated || Date.now(),
           });
+
+          // Tải bản đồ mới khi phát hiện map_version thay đổi
+          if (rob.map_version && rob.map_version !== activeMapVersionRef.current) {
+            fetchMapData(rob.map_version);
+          }
+
+          // Cập nhật danh sách điểm đến khi phát hiện destinations_version thay đổi
+          if (
+            rob.destinations_version !== undefined &&
+            activeDestinationsVersionRef.current !== null &&
+            rob.destinations_version !== activeDestinationsVersionRef.current
+          ) {
+            refreshDestinations();
+          }
+          if (rob.destinations_version !== undefined) {
+            activeDestinationsVersionRef.current = rob.destinations_version;
+          }
         }
 
-        if (payload.path) {
-          setPath(payload.path);
+        if (payload.path !== undefined) {
+          if (payload.path === null || payload.path.length === 0) {
+            setPath(null);
+          } else {
+            setPath(payload.path);
+          }
+        } else if (rob && ['IDLE', 'SUCCEEDED', 'CANCELED', 'FAILED'].includes(rob.navigation_state)) {
+          setPath(null);
         }
 
         if (payload.admin_data && payload.admin_data.alerts) {
@@ -105,14 +231,15 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     });
 
     refreshDestinations();
+    fetchMapData();
 
     return () => {
       unsubStatus();
       unsubTelemetry();
     };
-  }, [token, refreshDestinations]);
+  }, [token, refreshDestinations, fetchMapData]);
 
-  // 3. Các hàm nghiệp vụ (REST calls)
+  // 4. Các hàm nghiệp vụ (REST calls)
   const startNavigation = async (destinationId: string) => {
     try {
       const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/navigate', {
@@ -172,6 +299,16 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  const deleteDestination = async (id: string) => {
+    try {
+      const res = await apiClient.delete<{ success: boolean; message?: string }>(`/api/robot/destinations/${encodeURIComponent(id)}`);
+      await refreshDestinations();
+      return res;
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  };
+
   return (
     <RobotContext.Provider
       value={{
@@ -180,6 +317,10 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         alerts,
         path,
         isBackendConnected,
+        mapData,
+        isMapLoading,
+        mapError,
+        refreshMap,
         refreshDestinations,
         startNavigation,
         cancelNavigation,
@@ -187,6 +328,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         setManualControl,
         sendManualVelocity,
         upsertDestination,
+        deleteDestination,
       }}
     >
       {children}

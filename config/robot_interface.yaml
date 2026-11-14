@@ -20,7 +20,7 @@ connection:
   gateway_http_url: "http://localhost:8000"
   gateway_ws_url: "ws://localhost:8000/ws"
   # ros_domain_id mặc định cho hệ thống (profile sim hoặc real có thể ghi đè)
-  ros_domain_id: 42
+  ros_domain_id: 0
 
 # ------------------------------------------------------------------------------
 # 2. CÁC HỆ QUY CHIẾU TỌA ĐỘ (COORDINATE FRAMES)
@@ -38,7 +38,7 @@ frames:
 topics:
   # Bản đồ chiếm dụng 2D dạng OccupancyGrid
   map:
-    name: "/airport/map"
+    name: "/map"
     type: "nav_msgs/msg/OccupancyGrid"
     direction: "subscribe"
     enabled: true
@@ -50,17 +50,19 @@ topics:
     description: "Bản đồ tĩnh sân bay để hiển thị trên web"
 
   # Vị trí và hướng của robot trong hệ tọa độ map
+  # Profile sim: subscribe trực tiếp /amcl_pose (PoseWithCovarianceStamped) từ Nav2 AMCL.
+  # Profile real: có thể ghi đè sang PoseStamped nếu robot thật dùng topic khác.
   robot_pose:
-    name: "/airport/pose"
-    type: "geometry_msgs/msg/PoseStamped"
+    name: "/amcl_pose"
+    type: "geometry_msgs/msg/PoseWithCovarianceStamped"
     direction: "subscribe"
     enabled: true
     required: true
     qos:
       reliability: "reliable"
-      durability: "volatile"
+      durability: "transient_local"
       depth: 5
-    description: "Tọa độ và góc xoay của robot trong hệ quy chiếu map (khoảng 10Hz)"
+    description: "Tọa độ và góc xoay của robot từ AMCL trong hệ quy chiếu map"
 
   # Trạng thái tổng quát của robot (chế độ điều khiển, trạng thái dẫn đường, goal_id)
   robot_state:
@@ -221,7 +223,7 @@ services:
 actions:
   # Action gửi mục tiêu điều hướng tới vị trí pose chỉ định
   navigate:
-    name: "/airport/navigate_to_pose"
+    name: "/navigate_to_pose"
     type: "nav2_msgs/action/NavigateToPose"
     direction: "action_client"
     enabled: true
@@ -235,7 +237,7 @@ actions:
 nodes:
   interface_node: "/airport/interface_node"
   voice_node: "/airport/voice_node"
-  web_gateway: "/airport/web_gateway"
+  web_gateway: "airport_web_gateway"
 
 # ------------------------------------------------------------------------------
 # 7. GIỚI HẠN VẬN TỐC VÀ TIMEOUT AN TOÀN ĐIỀU KHIỂN THỦ CÔNG
@@ -247,7 +249,8 @@ velocity_limits:
   cmd_timeout_sec: 0.5     # Robot tự động dừng nếu không nhận được lệnh sau khoảng này
 
 # Đường dẫn tệp lưu trữ danh sách điểm đến bền vững phía robot
-destinations_storage_path: "config/destinations.yaml"
+destinations_storage_path: "data/destinations.yaml"
+destinations_seed_path: "config/destinations.yaml"
 
 # ------------------------------------------------------------------------------
 # 8. CẤU HÌNH GHI ĐÈ THEO TỪNG PROFILE (PROFILES OVERRIDES)
@@ -257,7 +260,7 @@ profiles:
   # Profile dành cho mô phỏng Gazebo
   sim:
     connection:
-      ros_domain_id: 42    # Tách biệt Domain ID của môi trường mô phỏng
+      ros_domain_id: 0     # Đồng bộ Domain ID 0 với Dev Container và Gazebo/Nav2
     use_sim_time: true     # Đồng bộ thời gian với /clock của Gazebo
     topics:
       clock:
@@ -271,6 +274,17 @@ profiles:
           durability: "volatile"
           depth: 1
         description: "Xung nhịp mô phỏng thời gian từ Gazebo"
+      path:
+        name: "/plan"
+        type: "nav_msgs/msg/Path"
+        direction: "subscribe"
+        enabled: true
+        required: false
+        qos:
+          reliability: "reliable"
+          durability: "volatile"
+          depth: 1
+        description: "Đường đi quy hoạch toàn cục từ Nav2 planner trong mô phỏng Gazebo"
     # Ánh xạ nguồn nội bộ (nếu Nav2 hoặc Gazebo phát tên mặc định)
     internal_sources:
       gazebo_scan: "/scan"

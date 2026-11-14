@@ -1,5 +1,6 @@
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
-from ..auth.models import LoginRequest, Token, UserOut, User
+from ..auth.models import LoginRequest, Token, UserOut, User, PassengerSessionOut, UserRole
 from ..auth.security import create_access_token
 from ..auth.service import user_service
 from ..auth.dependencies import get_current_user
@@ -7,6 +8,28 @@ from ..ws.manager import ws_manager
 from ..config import settings
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+
+@router.post("/session", response_model=PassengerSessionOut)
+async def create_passenger_session():
+    """
+    Cấp token phiên JWT được ký mật mã cho Hành khách vãng lai (không cần mật khẩu).
+    Token dùng để xác thực quyền hủy chuyến do chính phiên này tạo ra.
+    """
+    passenger_id = f"passenger-{uuid.uuid4().hex[:12]}"
+    expires_in_seconds = 30 * 86400  # 30 ngày
+    session_token = create_access_token(
+        data={
+            "sub": passenger_id,
+            "role": UserRole.PASSENGER.value
+        },
+        expires_delta_seconds=expires_in_seconds
+    )
+    return PassengerSessionOut(
+        session_token=session_token,
+        user_id=passenger_id,
+        role=UserRole.PASSENGER,
+        expires_in=expires_in_seconds
+    )
 
 @router.post("/login", response_model=Token)
 async def login(request: LoginRequest):

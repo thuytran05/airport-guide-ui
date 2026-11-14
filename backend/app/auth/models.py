@@ -41,3 +41,9 @@ class TokenPayload(BaseModel):
     username: str
     role: UserRole
     exp: int
+
+class PassengerSessionOut(BaseModel):
+    session_token: str
+    user_id: str
+    role: UserRole = UserRole.PASSENGER
+    expires_in: int

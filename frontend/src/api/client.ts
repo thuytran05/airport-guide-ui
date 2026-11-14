@@ -5,6 +5,58 @@
 
 class ApiClient {
   private token: string | null = null;
+  private passengerToken: string | null = null;
+  private tokenPromise: Promise<string | null> | null = null;
+
+  constructor() {
+    try {
+      if (typeof window !== 'undefined') {
+        this.passengerToken = sessionStorage.getItem('airport_passenger_token');
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  async ensurePassengerToken(): Promise<string | null> {
+    if (this.passengerToken) return this.passengerToken;
+    if (typeof window === 'undefined') return null;
+
+    if (!this.tokenPromise) {
+      this.tokenPromise = (async () => {
+        try {
+          const res = await fetch('/api/auth/session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.session_token) {
+              this.passengerToken = data.session_token;
+              sessionStorage.setItem('airport_passenger_token', data.session_token);
+              return data.session_token;
+            }
+          }
+        } catch {
+          // ignore
+        }
+        return null;
+      })();
+    }
+    return this.tokenPromise;
+  }
+
+  getStoredPassengerToken(): string | null {
+    if (this.passengerToken) return this.passengerToken;
+    try {
+      if (typeof window !== 'undefined') {
+        return sessionStorage.getItem('airport_passenger_token');
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
 
   setToken(t: string) {
     this.token = t;
@@ -22,6 +74,11 @@ class ApiClient {
 
     if (this.token) {
       headers['Authorization'] = `Bearer ${this.token}`;
+    } else if (!endpoint.includes('/api/auth/session')) {
+      const pToken = await this.ensurePassengerToken();
+      if (pToken) {
+        headers['X-Passenger-Token'] = pToken;
+      }
     }
 
     const url = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;

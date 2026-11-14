@@ -17,7 +17,7 @@ def get_robot_adapter() -> BaseRobotAdapter:
     if mode == "ros":
         try:
             from .ros_adapter import RosRobotAdapter
-            _adapter_instance = RosRobotAdapter(node_name=settings.ROS_NODE_NAME)
+            _adapter_instance = RosRobotAdapter()
             logger.info("Đã khởi tạo RosRobotAdapter thành công với ROS 2 Jazzy.")
         except Exception as e:
             logger.error(f"Không thể khởi tạo RosRobotAdapter: {e}")

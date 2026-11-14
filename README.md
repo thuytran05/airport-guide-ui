@@ -1,88 +1,122 @@
 # ✈️ Airport Guide Robot UI & Backend (ROS 2 Jazzy)
 
 Ứng dụng web điều khiển robot dẫn đường sân bay với kiến trúc Full-stack:
-- **Frontend:** React 19 + TypeScript + Vite.
-- **Backend:** Python FastAPI (REST API + WebSocket Telemetry Hub).
-- **Robot Adapter:** `RosRobotAdapter` (sử dụng `rclpy` trong container Docker ROS 2 Jazzy) và `MockRobotAdapter` (mô phỏng).
-- **Môi trường phát triển:** Windows 10/11 (Node LTS, Python 3).
-- **Môi trường robot:** Ubuntu 22.04 LTS (Host), ROS 2 Jazzy (Docker).
+- **Frontend:** React 19 + TypeScript + Vite, đóng gói production bằng Docker Nginx Alpine.
+- **Backend:** Python FastAPI (REST API + WebSocket Telemetry Hub) kết hợp `rclpy` trong container Docker ROS 2 Jazzy.
+- **Robot Adapter:** `RosRobotAdapter` (kết nối trực tiếp ROS 2 Jazzy qua DDS) và `MockRobotAdapter` (chế độ mô phỏng khi không có ROS).
+- **Môi trường robot:** Ubuntu 22.04 LTS (Host), ROS 2 Jazzy + Gazebo/Nav2 chạy trong VS Code Dev Container (`ws`).
+- **Môi trường web UI:** Nằm độc lập tại `~/airport-guide-ui`, chạy bằng Docker Compose với `network_mode: host`.
 
 ---
 
-## 🚀 Hướng dẫn khởi chạy theo từng môi trường
+## 🚀 Hướng dẫn vận hành trên Ubuntu 22.04 (Docker Compose)
 
-### 1. Trên máy Windows (Chế độ Mock / Phát triển giao diện)
+> [!IMPORTANT]
+> **Không cần cài đặt `npm`, `node`, `pip` hay `python-venv` trực tiếp lên hệ điều hành Ubuntu host.** Toàn bộ phụ thuộc frontend và backend đã được đóng gói khép kín trong Docker containers.
+> Workspace `ws` và Dev Container ROS của robot được giữ nguyên vẹn, hai hệ thống giao tiếp với nhau qua ROS 2 DDS trên cùng máy host nhờ chế độ mạng `network_mode: host`.
 
-#### Khởi chạy Backend (FastAPI):
-Mở terminal PowerShell thứ nhất:
-```powershell
-cd backend
-python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-API docs sẽ sẵn sàng tại: `http://localhost:8000/docs`
-
-#### Khởi chạy Frontend (Vite):
-Mở terminal PowerShell thứ hai:
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-Giao diện mở tại: `http://localhost:5173/` (Vite dev proxy sẽ tự động chuyển tiếp `/api` và `/ws` sang `http://127.0.0.1:8000`).
-
----
-
-### 2. Trên máy Ubuntu 22 (Máy Robot — Chế độ Live ROS 2 Jazzy)
-
-Không cần cài ROS 2 Jazzy trực tiếp lên host Ubuntu 22; toàn bộ Backend và Frontend được điều phối qua Docker Compose cùng mạng với container robot:
-
+### 1. Khởi động hệ thống
+Mở terminal tại thư mục dự án:
 ```bash
-# 1. Clone hoặc giải nén mã nguồn vào máy robot
-cd airport-guide-ui
+cd ~/airport-guide-ui
 
-# 2. Khởi chạy toàn bộ hệ thống bằng Docker Compose
+# Khởi chạy toàn bộ hệ thống chạy ngầm
+docker compose up -d
+```
+
+### 2. Kiểm tra trạng thái hoạt động
+```bash
+# Xem trạng thái các container
+docker compose ps
+
+# Kiểm tra sức khỏe của Backend và cấu hình ROS
+curl -s http://localhost:8000/api/health | jq .
+```
+
+### 3. Xem nhật ký hoạt động (Logs)
+```bash
+# Xem log Backend (FastAPI + ROS adapter)
+docker compose logs -f backend
+
+# Xem log Frontend (Nginx reverse proxy)
+docker compose logs -f frontend
+
+# Xem 100 dòng log gần nhất của cả hệ thống
+docker compose logs --tail=100
+```
+
+### 4. Khởi động lại (Restart)
+```bash
+# Khởi động lại toàn bộ dịch vụ
+docker compose restart
+
+# Hoặc khởi động lại riêng backend khi đổi file config
+docker compose restart backend
+```
+
+### 5. Rebuild sau khi cập nhật mã nguồn hoặc Dockerfile
+```bash
+# Rebuild và khởi động lại toàn bộ
 docker compose up -d --build
 
-# 3. Xem nhật ký hoạt động
-docker compose logs -f backend
+# Hoặc rebuild riêng backend (ví dụ sau khi thêm dependency ROS)
+docker compose up -d --build backend
+```
+
+### 6. Dừng hệ thống
+```bash
+# Dừng các container một cách an toàn (giữ nguyên dữ liệu)
+docker compose down
 ```
 
 ---
 
-## 🌐 Hướng dẫn truy cập từ hai máy trong mạng LAN
+## 🌐 Hướng dẫn truy cập qua Web & Mạng LAN
 
-Nhờ cấu hình **Dev Proxy / Nginx Reverse Proxy**, toàn bộ endpoint API và WebSocket đều dùng đường dẫn tương đối (`/api`, `/ws`), tuyệt đối **không hard-code localhost**:
+Cả hai dịch vụ đều dùng `network_mode: host`:
+- **Frontend (Nginx Reverse Proxy):** Lắng nghe tại cổng `5173`.
+  - Nginx tự động chuyển tiếp các yêu cầu `/api/` và `/ws` sang Backend nội bộ `http://127.0.0.1:8000`.
+- **Backend (FastAPI):** Lắng nghe tại cổng `8000` (API Docs tại `http://localhost:8000/docs`).
 
-1. **Trên laptop gắn trực tiếp trên robot:**
-   - Mở trình duyệt: `http://localhost:5173/`
-2. **Trên máy tính của nhân viên / hành khách bên ngoài mạng LAN:**
-   - Xác định địa chỉ IP máy robot (ví dụ: `192.168.0.102` bằng lệnh `ip -4 addr`).
-   - Mở trình duyệt: `http://192.168.0.102:5173/`
-   - Cả hai máy đều nhận đồng bộ dữ liệu thời gian thực từ robot thông qua WebSocket.
+| Thiết bị truy cập | Địa chỉ URL | Ghi chú |
+|---|---|---|
+| **Trực tiếp trên máy robot / Ubuntu** | `http://localhost:5173/` | Màn hình chính dẫn đường |
+| **Máy tính / Tablet khác trong mạng LAN** | `http://<IP_MÁY_UBUNTU>:5173/` | Ví dụ: `http://192.168.0.102:5173/` |
+| **Kiểm tra API Backend trực tiếp** | `http://<IP_MÁY_UBUNTU>:8000/api/health` | Kiểm tra trạng thái DDS và kết nối |
+
+> *Mẹo xác định IP máy robot:* Chạy lệnh `ip -4 addr show` hoặc `hostname -I` trên Ubuntu.
 
 ---
 
-## 🔐 Tài khoản xác thực mặc định (Backend JWT Authentication)
+## 🔐 Phân quyền & Tài khoản xác thực mặc định
 
-Backend tự động băm mật khẩu bằng PBKDF2-SHA256 và ký JWT Token theo vai trò:
+Hệ thống phân cấp bảo mật 2 tầng dựa trên JSON Web Token (JWT):
 
-| Tài khoản | Mật khẩu mặc định | Vai trò | Quyền hạn |
+| Vai trò (Role) | Tài khoản | Mật khẩu mặc định | Quyền hạn sử dụng |
 |---|---|---|---|
-| `viewer` | `viewer123` | **Viewer** | Chọn điểm, xem bản đồ, quản lý chuyến của mình |
-| `operator` | `operator123` | **Operator** | Quản lý mọi chuyến, điều khiển thủ công, CRUD địa điểm |
-| `developer` | `developer123` | **Developer** | Xem cảm biến, nhật ký log lỗi, trạng thái Nav2 |
+| **Hành khách (Passenger)** | *Không cần đăng nhập* | *Không áp dụng* | Xem bản đồ, chọn điểm đến, bấm microphone tương tác, hủy chuyến của mình |
+| **Quản trị viên (Admin)** | `admin` | `admin123` | Theo dõi chẩn đoán lỗi, điều khiển vận tốc thủ công, thêm/sửa danh sách điểm đến |
 
-> *Lưu ý:* Khi `APP_ENV=production`, giao diện tự động khóa các nút chọn tài khoản demo, bắt buộc nhập đúng thông tin đăng nhập.
+> *Ghi chú bảo mật:* Mật khẩu admin có thể thay đổi bằng biến môi trường `DEFAULT_ADMIN_PASSWORD` trong file `.env`. Khóa ký JWT được quản lý qua `SECRET_KEY`.
 
 ---
 
-## 📊 Hiện trạng dữ liệu kết nối (Giai đoạn C)
+## 📊 Hiện trạng kết nối thực tế & Phân biệt các tầng trạng thái
 
-| Thành phần | Trạng thái | Ghi chú |
+> [!WARNING]
+> **Phân biệt rõ việc Backend khởi động thành công và việc thực sự kết nối với robot:**
+> - Khi container backend và frontend báo `Up` và `GET /api/health` trả về `healthy`, điều đó **CHỈ CHỨNG MINH** Web Gateway đã sẵn sàng hoạt động trên DDS bus.
+> - **Chỉ khi trường `"robot_connected": true`**, hệ thống mới thực sự nhận được dữ liệu vị trí robot từ ROS.
+
+### Bảng kết quả kiểm tra thực tế (Môi trường Dev Container `ws` + Gazebo/Nav2)
+
+| Thành phần | Trạng thái thực tế | Đánh giá kỹ thuật |
 |---|:---:|---|
-| **Xác thực JWT & Phân quyền** | **ĐÃ HOÀN TẤT (Thật 100%)** | Mật khẩu băm an toàn, server quyết định quyền trên REST & WS, hết hạn phiên ngắt WS. |
-| **WebSocket Telemetry** | **ĐÃ HOÀN TẤT (Thật 100%)** | Gửi tin 5Hz, tự động reconnect exponential backoff, lọc payload theo role. |
-| **Phép biến đổi tọa độ ROS ↔ Canvas** | **ĐÃ HOÀN TẤT (Thật 100%)** | Chuyển đổi chuẩn xác từ frame `map` (mét, Y hướng lên) sang Canvas (px, Y hướng xuống). |
-| **Dữ liệu Telemetry Robot (Pose, Pin)** | **Đang chạy qua Mock / Chờ output khảo sát** | `RosRobotAdapter` đã code sẵn subscriber `/amcl_pose`, `/battery_state`, `/map`. Khi chạy với ROS Jazzy sẽ tự kết nối. |
-| **Điều khiển chuyển động thực tế** | **Vô hiệu hóa an toàn** | Chưa gửi lệnh `cmd_vel` hay goal thật ở Giai đoạn C để đảm bảo an toàn tuyệt đối. |
+| **Môi trường DDS Domain** | `ROS_DOMAIN_ID=0` | Đã đồng bộ giữa Dev Container và Docker Compose backend. |
+| **Phát hiện ROS Nodes / Topics** | **ĐÃ PHÁT HIỆN** | Backend đã nhìn thấy các nodes và topics của Gazebo/Nav2 thông qua DDS. |
+| **Bản đồ tĩnh (`/map`)** | Đang có trên DDS | Node `map_server` phát topic `/map` (`nav_msgs/msg/OccupancyGrid`). Cần ánh xạ topic name trong cấu hình backend. |
+| **Vị trí robot (`/amcl_pose`)** | Đang có trên DDS | Node `amcl` phát topic `/amcl_pose` (`geometry_msgs/msg/PoseWithCovarianceStamped`). Cần chuyển đổi kiểu dữ liệu trong backend adapter. |
+| **Nhận dữ liệu vị trí vào Web** | **CHƯA XÁC NHẬN** | Backend chưa xác nhận nhận được pose do lệch kiểu (`PoseStamped` vs `PoseWithCovarianceStamped`) và tên topic (`/airport/pose` vs `/amcl_pose`). Giao diện hiển thị đúng nhãn *"Chưa có dữ liệu vị trí robot"*. |
+| **Điều hướng Nav2 (`/navigate_to_pose`)** | Action server đang chạy | Nav2 action server đang có sẵn `/navigate_to_pose`. Đã bổ sung `ros-jazzy-nav2-msgs` vào Dockerfile. |
+| **Package tùy chỉnh `airport_robot_interfaces`** | **CHƯA CÓ** | Chưa có trên host/container/ws. Backend đang dùng cơ chế fallback an toàn (bỏ qua subscribe `RobotState` để không bị crash). |
+| **Điều khiển chuyển động thực tế** | **VÔ HIỆU HÓA AN TOÀN** | Chưa gửi lệnh `cmd_vel` hay goal tự động khi chưa hoàn tất kiểm thử từng bước. |
