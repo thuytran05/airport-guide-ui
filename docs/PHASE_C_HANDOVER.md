@@ -1,8 +1,8 @@
-# Biên Bản Bàn Giao Triển Khai & Kiểm Thử Toàn Diện Giai Đoạn C (Part 1, Part 2, Part 3 & Part 4)
+# Biên Bản Bàn Giao Triển Khai & Kiểm Thử Toàn Diện Giai Đoạn C (Part 1, Part 2, Part 3, Part 4 & Part 5: Pause & Resume)
 **Dự án:** Airport Guide Robot UI (`airport-guide-ui`)  
 **Môi trường:** ROS 2 Jazzy (Docker, Domain ID 0, Sim Time = True)  
 **Thời gian cập nhật:** 14/11/2026  
-**Trạng thái nghiệm thu:** **18 / 18 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, **End-to-End Navigation SUCCEEDED**.
+**Trạng thái nghiệm thu:** **19 / 19 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, **Pause & Resume Navigation Architecture Completed & Verified**.
 
 ---
 
@@ -237,7 +237,78 @@ flowchart TD
 
 ---
 
-## 4. KẾT QUẢ KIỂM THỬ TỰ ĐỘNG (18 / 18 PASSED — 100%)
+## 3. PHẦN 3 — TÍNH NĂNG TẠM DỪNG / TIẾP TỤC DẪN ĐƯỜNG (PAUSE & RESUME NAVIGATION)
+
+### 3.1. Phân Tích & Lựa Chọn Cơ Chế Điều Khiển Trong Nav2 Jazzy
+- **Khảo sát cơ chế Nav2 Jazzy:**
+  - Action `nav2_msgs/action/NavigateToPose` không cung cấp service tạm dừng chuyên biệt mà không làm gián đoạn lifecycle behavior tree.
+  - **Cơ chế được lựa chọn:**
+    - Khi Admin bấm **"Tạm dừng"**, backend gọi `cancel_goal_async()` đối với goal handle của Nav2 hiện hành và chuyển trạng thái chuyến sang `PAUSING`.
+    - Khi Nav2 xác nhận hủy (kết quả `status == 5` - STATUS_CANCELED), backend chuyển trạng thái sang `PAUSED`.
+    - Ở trạng thái `PAUSED`, backend **bảo lưu toàn bộ phiên chuyến đi**: giữ nguyên `trip_id`, `owner_id`, `destination_id` và tọa độ đích `current_target_pose`, đồng thời xóa đường dẫn cũ (`path = None`).
+    - Khi Admin bấm **"Tiếp tục"**, backend kiểm tra AMCL, sim clock, và gửi một goal mới tới chính tọa độ đích đã lưu. Nav2 lập quỹ đạo mới từ vị trí hiện tại của robot tới đích.
+- **Tách biệt định danh chuyến đi (`trip_id`) và định danh mục tiêu (`req_id`):**
+  - Web sinh ra một `trip_id` duy nhất cho mỗi lượt hành trình của người dùng.
+  - Mỗi lần gửi goal tới Nav2 (khi bắt đầu hoặc khi tiếp tục) sẽ có một `req_id` và `goal_id` độc lập.
+  - `trip_id` được duy trì nhất quán qua nhiều vòng lặp Pause / Resume liên tiếp cho đến khi chuyến thực sự đến đích (`SUCCEEDED`) hoặc bị hủy dứt điểm (`CANCELED`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> PENDING : start_navigation
+    PENDING --> NAVIGATING : Nav2 Accepted
+    NAVIGATING --> PAUSING : pause_navigation
+    PAUSING --> PAUSED : Nav2 Canceled (Status 5)
+    PAUSING --> SUCCEEDED : Reached Goal (Status 4)
+    PAUSED --> PENDING : resume_navigation
+    PAUSED --> CANCELED : cancel_navigation (Direct)
+    NAVIGATING --> CANCELING : cancel_navigation
+    CANCELING --> CANCELED : Nav2 Canceled
+    NAVIGATING --> SUCCEEDED : Nav2 Succeeded (Status 4)
+    NAVIGATING --> FAILED : Nav2 Aborted (Status 6)
+    SUCCEEDED --> IDLE
+    CANCELED --> IDLE
+    FAILED --> IDLE
+```
+
+---
+
+### 3.2. Xử Lý Các Tình Huống Góc Chết & Đua Kết Quả (Edge Cases & Race Conditions)
+1. **Robot về đích đúng lúc bấm Tạm dừng:**
+   - Nếu Nav2 hoàn thành mục tiêu trước hoặc đúng lúc lệnh cancel tới nơi, Nav2 trả về `status == 4` (STATUS_SUCCEEDED).
+   - Backend nhận diện được `status == 4` và kết thúc chuyến ở trạng thái `SUCCEEDED`, không chuyển thành `PAUSED`, bảo đảm ghi nhận thành công chuẩn xác.
+2. **Nav2 từ chối lệnh hủy khi tạm dừng:**
+   - Nếu `cancel_response.return_code != 0`, backend lập tức khôi phục trạng thái từ `PAUSING` về lại `NAVIGATING` và thông báo tới Admin để robot tiếp tục hành trình an toàn.
+3. **Nav2 từ chối mục tiêu mới khi Tiếp tục (Resume Rejected):**
+   - Nếu Nav2 từ chối goal mới (ví dụ vật cản chặn kín lối đi xung quanh robot lúc dừng), hệ thống giữ nguyên trạng thái `PAUSED`, không chuyển thành `FAILED`, để Admin có thể thử lại hoặc xử lý thủ công.
+4. **Hủy chuyến khi đang tạm dừng (Cancel while PAUSED):**
+   - Admin (hoặc hành khách chủ chuyến) bấm "Hủy Chuyến Đi" khi đang ở trạng thái `PAUSED`.
+   - Vì robot đã dừng hẳn và không còn goal nào chạy trên Nav2, backend chuyển thẳng sang `CANCELED` ngay lập tức mà không cần gửi thêm lệnh cancel tới Nav2.
+5. **Ràng buộc an toàn khi ở trạng thái PAUSED:**
+   - **Chặn bắt đầu chuyến mới:** Không cho phép ai bắt đầu chuyến dẫn đường mới khi đang có chuyến tạm dừng.
+   - **Chặn sửa / xóa điểm đến:** Không thể cập nhật hoặc xóa điểm đến đang là đích của chuyến tạm dừng.
+   - **Chống click đúp / Debounce:** Vô hiệu hóa nút bấm trong quá trình gửi lệnh (`isSubmitting`, `PAUSING`).
+
+---
+
+### 3.3. Trải Nghiệm Giao Diện Người Dùng (Frontend UI)
+- **Bảng điều khiển Admin (`Dashboard.tsx`):**
+  - Khi đang di chuyển (`NAVIGATING` / `ACCEPTED`): Nút **[ ⏸ TẠM DỪNG ]** (màu hổ phách) và nút **[ ✖ HỦY CHUYẾN ĐI ]** (màu đỏ).
+  - Khi đang trong quá trình dừng (`PAUSING`): Nút chuyển thành `ĐANG TẠM DỪNG...` và bị vô hiệu hóa để chống gọi lặp.
+  - Khi đã tạm dừng (`PAUSED`): Nút tạm dừng tự động đổi thành **[ ▶ TIẾP TỤC DẪN ĐƯỜNG ]** (màu xanh dương).
+  - Badge trạng thái đổi màu tương ứng: Hổ phách nhạt cho `PAUSING` / `PAUSED`.
+- **Trang Hành Khách (`Home.tsx`):**
+  - Hiển thị nhãn trạng thái thân thiện: `"Chuyến đi đang tạm dừng"`.
+  - Không hiển thị nút Tạm dừng hay Tiếp tục (theo đúng nguyên tắc Viewer).
+  - Giữ nguyên nút **[ Hủy Chuyến Đi ]** cho chính chủ chuyến đi để hành khách có quyền hủy chuyến khi cần.
+- **Bản Đồ (`MapView.tsx`):**
+  - Marker vị trí AMCL và Pin điểm đến đích được duy trì nguyên vẹn trên cả hai nền "Bản đồ ROS" và "Sơ đồ hành khách".
+  - Đường đi màu lục (`path`) tự động xóa khi tạm dừng, và chỉ hiển thị đường đi mới khi Nav2 lập quỹ đạo thành công sau khi bấm Tiếp tục.
+  - Thao tác chuyển đổi tab bản đồ trong lúc tạm dừng không làm mất khung nhìn (pan/zoom).
+
+---
+
+## 4. KẾT QUẢ KIỂM THỬ TỰ ĐỘNG (19 / 19 PASSED — 100%)
 
 Chạy kiểm thử bên trong container `airport_guide_backend`:
 ```bash
@@ -256,7 +327,8 @@ docker exec airport_guide_backend bash -c "source /opt/ros/jazzy/setup.bash && e
 | `test_phase_c_navigation.py` | `test_api_passenger_sessions_and_permissions` | **PASSED** | Kiểm tra bảo mật JWT phiên hành khách, chống can thiệp |
 | `test_phase_c_navigation.py` | `test_telemetry_broadcaster_reconnection_and_cancellation` | **PASSED** | Kiểm tra tối ưu telemetry per-socket, reconnect và cancel |
 | `test_phase_c_navigation.py` | `test_destinations_persistence_concurrency_and_permissions` | **PASSED** | Kiểm tra lưu bền vững, atomic replace, ghi đồng thời đa luồng |
-| `test_phase_c_navigation.py` | `test_destinations_deletion_persistence_and_permissions` | **PASSED** | **Kiểm tra xóa bền vững, chặn xóa khi bận, lỗi ghi rollback, xóa điểm cuối cùng & quyền API** |
+| `test_phase_c_navigation.py` | `test_destinations_deletion_persistence_and_permissions` | **PASSED** | Kiểm tra xóa bền vững, chặn xóa khi bận, lỗi ghi rollback, xóa điểm cuối cùng & quyền API |
+| `test_phase_c_navigation.py` | `test_navigation_pause_resume_lifecycle_and_permissions` | **PASSED** | **Kiểm tra toàn diện vòng đời Pause/Resume, bảo lưu trip_id, Nav2 cancel/reject, hủy khi PAUSED & quyền Admin/Passenger** |
 | `test_phase_c_navigation.py` | `test_nav2_restart_and_action_status_cases` | **PASSED** | Kiểm tra 3 tình huống Nav2 restart & action status |
 | `test_phase_c_navigation.py` | `test_path_handling_and_lifecycle` | **PASSED** | Kiểm tra frame map, vòng đời path và xóa khi kết thúc |
 | `test_phase_c_navigation.py` | `test_path_endpoint_and_external_goal_filtering` | **PASSED** | Kiểm tra lọc path ngoại vi từ RViz & dung sai endpoint $\le 2.0\text{m}$ |
@@ -265,7 +337,7 @@ docker exec airport_guide_backend bash -c "source /opt/ros/jazzy/setup.bash && e
 | `test_ros_config.py` | `test_topic_name_change_propagation` | **PASSED** | Kiểm tra thay đổi topic config |
 | `test_ros_config.py` | `test_validation_missing_required` | **PASSED** | Kiểm tra xác thực các trường bắt buộc |
 
-**Tổng cộng:** **18 / 18 tests PASSED (100%)**
+**Tổng cộng:** **19 / 19 tests PASSED (100%)**
 
 ---
 
@@ -321,3 +393,50 @@ INFO:     127.0.0.1:0 - "POST /api/robot/navigate HTTP/1.1" 200 OK
 2. Tìm điểm muốn xóa, bấm nút **"Xóa"** (màu đỏ).
 3. Đọc lại tên điểm trong modal xác nhận. Bấm **"Xác Nhận Xóa"**.
 4. Điểm được xóa an toàn khỏi `data/destinations.yaml`, các tab Admin và Hành khách tự động cập nhật ngay tức thì mà không cần reload trang.
+
+---
+
+## 8. HƯỚNG DẪN NGHIỆM THU THỰC TẾ TRÊN GAZEBO (MANUAL TEST SCRIPTS)
+
+> [!IMPORTANT]
+> Toàn bộ logic đã được xác thực an toàn cô lập qua kiểm thử tự động 19/19 pytest. Người vận hành có thể tự thực hiện nghiệm thu trực quan trên mô phỏng Gazebo theo hai kịch bản độc lập dưới đây:
+
+### 8.1. Kịch Bản A: Start ➔ Pause ➔ Resume ➔ Goal Succeeded
+1. **Khởi tạo:**
+   - Mở giao diện Admin tại `http://localhost:5173/admin` (hoặc mở song song cửa sổ Hành khách `http://localhost:5173/`).
+   - Kiểm tra robot đang ở trạng thái `IDLE` (trên cả hai giao diện).
+2. **Bắt đầu dẫn đường (Start):**
+   - Trên Admin, chọn một điểm đến trong dropdown (ví dụ: `Cổng số 1` hoặc `Quầy thông tin`) và bấm **[ BẮT ĐẦU DẪN ĐƯỜNG ]**.
+   - Quan sát Gazebo: Robot bắt đầu lăn bánh theo đường dẫn màu lục hiển thị trên bản đồ.
+   - Trạng thái web chuyển sang `NAVIGATING`, hiển thị khoảng cách còn lại.
+3. **Tạm dừng dẫn đường (Pause):**
+   - Khi robot đang di chuyển (khoảng 3–5 giây sau khi bắt đầu), Admin bấm nút **[ ⏸ TẠM DỪNG ]**.
+   - Nút tạm thời chuyển sang disabled `ĐANG TẠM DỪNG...`.
+   - Quan sát Gazebo: Robot giảm tốc và dừng hẳn tại vị trí hiện tại.
+   - Trạng thái web chuyển sang `PAUSED`. Đường dẫn màu lục được xóa khỏi bản đồ.
+   - Nút tạm dừng tự động đổi thành nút **[ ▶ TIẾP TỤC DẪN ĐƯỜNG ]** màu xanh dương.
+   - Phía Hành khách: hiển thị nhãn `Chuyến đi đang tạm dừng`, nút "Hủy Chuyến Đi" vẫn sẵn sàng.
+4. **Tiếp tục dẫn đường (Resume):**
+   - Admin bấm **[ ▶ TIẾP TỤC DẪN ĐƯỜNG ]**.
+   - Quan sát Gazebo: Robot tính toán lại đường đi từ vị trí đang đỗ và tiếp tục lăn bánh về phía đích.
+   - Đường dẫn mới màu lục xuất hiện trên bản đồ nối từ vị trí hiện tại của robot tới đích.
+5. **Về đích thành công (Succeeded):**
+   - Chờ robot di chuyển tới đích.
+   - Quan sát: Robot dừng lại tại đích, trạng thái chuyển thành `SUCCEEDED`, thông báo thành công hiển thị trên cả Admin và Hành khách.
+
+---
+
+### 8.2. Kịch Bản B: Start ➔ Pause ➔ Cancel ➔ Bắt đầu chuyến mới
+1. **Khởi tạo & Bắt đầu:**
+   - Admin chọn một điểm đến và bấm **[ BẮT ĐẦU DẪN ĐƯỜNG ]**.
+   - Robot bắt đầu di chuyển trên Gazebo.
+2. **Tạm dừng:**
+   - Admin bấm **[ ⏸ TẠM DỪNG ]**.
+   - Robot dừng lại trên Gazebo, trạng thái chuyển thành `PAUSED`.
+3. **Hủy chuyến khi đang tạm dừng:**
+   - Admin (hoặc hành khách) bấm **[ ✖ HỦY CHUYẾN ĐI ]**.
+   - Chuyến dẫn đường lập tức chuyển sang `CANCELED` dứt điểm mà không có độ trễ.
+   - Robot tiếp tục đứng yên tại vị trí đang dừng.
+4. **Bắt đầu chuyến mới:**
+   - Chọn một điểm đến khác (ví dụ: `Cổng số 2`) và bấm **[ BẮT ĐẦU DẪN ĐƯỜNG ]**.
+   - Robot lập tức nhận mục tiêu mới và bắt đầu di chuyển tới điểm mới từ vị trí hiện tại mà không gặp bất kỳ xung đột goal nào.

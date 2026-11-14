@@ -129,6 +129,32 @@ async def cancel_navigation(current_user: User = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res
 
+@router.post("/pause")
+async def pause_navigation(
+    current_user: User = Depends(require_role(UserRole.ADMIN))
+):
+    """
+    Tạm dừng chuyến dẫn đường hiện tại (chỉ dành cho Admin đã đăng nhập).
+    """
+    adapter = get_robot_adapter()
+    res = adapter.pause_navigation()
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+@router.post("/resume")
+async def resume_navigation(
+    current_user: User = Depends(require_role(UserRole.ADMIN))
+):
+    """
+    Tiếp tục chuyến dẫn đường sau khi tạm dừng (chỉ dành cho Admin đã đăng nhập).
+    """
+    adapter = get_robot_adapter()
+    res = adapter.resume_navigation()
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
 @router.post("/voice/start")
 async def start_voice_session(current_user: User = Depends(get_current_user)):
     """

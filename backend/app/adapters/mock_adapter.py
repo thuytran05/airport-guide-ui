@@ -25,9 +25,10 @@ class MockRobotAdapter(BaseRobotAdapter):
         self._is_connected = True
         self._is_data_stale = False
         self._control_mode = "AUTO"  # AUTO | MANUAL | TRANSITION | FAULT
-        self._navigation_state = "IDLE"  # IDLE, ACCEPTED, NAVIGATING, CANCELING, SUCCEEDED, CANCELED, FAILED
+        self._navigation_state = "IDLE"  # IDLE, ACCEPTED, NAVIGATING, PAUSING, PAUSED, CANCELING, SUCCEEDED, CANCELED, FAILED
         self._has_goal = False
         self._goal_id = ""
+        self._trip_id = ""
         self._destination_id = ""
         self._owner_id = ""
         self._path_version: int = 0
@@ -167,6 +168,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                 "navigation_state": self._navigation_state,
                 "has_goal": self._has_goal,
                 "goal_id": self._goal_id,
+                "trip_id": getattr(self, "_trip_id", ""),
                 "destination_id": self._destination_id,
                 "distance_remaining": self._distance_remaining,
                 "voice_state": self._voice_state,
@@ -200,8 +202,8 @@ class MockRobotAdapter(BaseRobotAdapter):
                 return {"success": False, "message": "Destination ID không được để trống"}
             
             # Kiểm tra xem đang dẫn đường tới điểm này không
-            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "CANCELING") and self._destination_id == dest_id:
-                return {"success": False, "message": "Không thể cập nhật điểm đến đang có chuyến dẫn đường đang hoạt động"}
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
+                return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' khi đang có chuyến dẫn đường tới điểm này (trạng thái: {self._navigation_state})"}
 
             old_destinations = list(self._destinations)
             found = False
@@ -228,7 +230,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                 return {"success": False, "message": "Destination ID không được để trống"}
 
             # Chặn xóa điểm đang có chuyến dẫn đường chưa kết thúc
-            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "CANCELING") and self._destination_id == dest_id:
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                 return {"success": False, "message": f"Không thể xóa điểm đến '{dest_id}' vì đang có chuyến dẫn đường chưa kết thúc tới điểm này (trạng thái: {self._navigation_state})"}
 
             existing_idx = next((i for i, d in enumerate(self._destinations) if d.get("id") == dest_id), None)
@@ -251,8 +253,8 @@ class MockRobotAdapter(BaseRobotAdapter):
         with self._lock:
             if self._control_mode == "MANUAL":
                 return {"success": False, "message": "Robot đang ở chế độ điều khiển thủ công (MANUAL). Hãy chuyển sang AUTO trước."}
-            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "CANCELING"):
-                return {"success": False, "message": f"Robot đang bận thực hiện một nhiệm vụ khác (trạng thái: {self._navigation_state})."}
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
+                return {"success": False, "message": f"Robot đang có chuyến dẫn đường đang hoạt động hoặc tạm dừng (trạng thái: {self._navigation_state})."}
 
             dest = next((d for d in self._destinations if d.get("id") == destination_id), None)
             if not dest:
@@ -262,11 +264,50 @@ class MockRobotAdapter(BaseRobotAdapter):
             self._owner_id = owner_id
             self._destination_id = destination_id
             self._goal_id = uuid.uuid4().hex
+            self._trip_id = uuid.uuid4().hex
             self._goal_pose = {"x": pose.get("x", 0.0), "y": pose.get("y", 0.0)}
             self._has_goal = True
             self._navigation_state = "NAVIGATING"
             self._message = f"Đang dẫn đường tới: {dest.get('name')}"
-            return {"success": True, "goal_id": self._goal_id, "message": self._message}
+            return {"success": True, "goal_id": self._goal_id, "trip_id": self._trip_id, "message": self._message}
+
+    def pause_navigation(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._navigation_state == "PAUSED":
+                return {"success": True, "message": "Chuyến dẫn đường hiện đã ở trạng thái tạm dừng."}
+            if self._navigation_state == "PAUSING":
+                return {"success": True, "message": "Yêu cầu tạm dừng chuyến đi đã được tiếp nhận, đang dừng robot..."}
+            if self._navigation_state not in ("PENDING", "ACCEPTED", "NAVIGATING"):
+                return {"success": False, "message": f"Không có chuyến dẫn đường nào đang hoạt động để tạm dừng (trạng thái: {self._navigation_state})."}
+
+            dest = next((d for d in self._destinations if d.get("id") == self._destination_id), None)
+            dest_name = dest.get("name", "") if dest else self._destination_id
+            self._navigation_state = "PAUSED"
+            self._has_goal = False
+            self._path = []
+            self._path_version += 1
+            self._message = f"Chuyến dẫn đường tới '{dest_name}' đã tạm dừng. Sẵn sàng tiếp tục khi có lệnh."
+            return {"success": True, "message": "Đã tạm dừng chuyến dẫn đường thành công."}
+
+    def resume_navigation(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._navigation_state in ("NAVIGATING", "ACCEPTED", "PENDING"):
+                return {"success": False, "message": "Robot đang trong quá trình dẫn đường, không cần tiếp tục."}
+            if self._navigation_state == "PAUSING":
+                return {"success": False, "message": "Robot đang trong quá trình dừng tạm thời. Vui lòng chờ tạm dừng hoàn tất trước khi tiếp tục."}
+            if self._navigation_state != "PAUSED":
+                return {"success": False, "message": f"Không có chuyến dẫn đường nào đang tạm dừng để tiếp tục (trạng thái: {self._navigation_state})."}
+
+            dest = next((d for d in self._destinations if d.get("id") == self._destination_id), None)
+            if not dest:
+                return {"success": False, "message": f"Không tìm thấy thông tin điểm đến '{self._destination_id}' để tiếp tục."}
+
+            self._navigation_state = "NAVIGATING"
+            self._has_goal = True
+            self._goal_id = uuid.uuid4().hex
+            dest_name = dest.get("name", self._destination_id)
+            self._message = f"Đang tiếp tục dẫn đường tới: {dest_name}"
+            return {"success": True, "message": self._message}
 
     def cancel_navigation(self, owner_id: str, is_admin: bool = False) -> Dict[str, Any]:
         with self._lock:
@@ -274,7 +315,21 @@ class MockRobotAdapter(BaseRobotAdapter):
             if not is_admin and self._owner_id and owner_id != self._owner_id:
                 return {"success": False, "message": "Bạn không có quyền hủy chuyến dẫn đường của người dùng khác."}
 
-            if self._navigation_state not in ("PENDING", "ACCEPTED", "NAVIGATING"):
+            if self._navigation_state == "PAUSED":
+                dest = next((d for d in self._destinations if d.get("id") == self._destination_id), None)
+                dest_name = dest.get("name", "") if dest else self._destination_id
+                self._navigation_state = "CANCELED"
+                self._has_goal = False
+                self._path = []
+                self._path_version += 1
+                self._owner_id = ""
+                self._trip_id = ""
+                self._destination_id = ""
+                self._goal_pose = None
+                self._message = f"Chuyến dẫn đường tới '{dest_name}' đã được hủy."
+                return {"success": True, "message": f"Chuyến dẫn đường tới '{dest_name}' đã được hủy thành công."}
+
+            if self._navigation_state not in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING"):
                 return {"success": False, "message": f"Không có chuyến dẫn đường nào đang chạy để hủy (trạng thái: {self._navigation_state})."}
 
             if self._navigation_state == "CANCELING":
@@ -291,6 +346,9 @@ class MockRobotAdapter(BaseRobotAdapter):
                     self._path = []
                     self._path_version += 1
                     self._owner_id = ""
+                    self._trip_id = ""
+                    self._destination_id = ""
+                    self._goal_pose = None
                     self._message = "Chuyến dẫn đường đã bị hủy"
 
             threading.Thread(target=_finish_cancel, daemon=True).start()

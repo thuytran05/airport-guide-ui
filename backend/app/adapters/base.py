@@ -51,6 +51,16 @@ class BaseRobotAdapter(ABC):
         pass
 
     @abstractmethod
+    def pause_navigation(self) -> Dict[str, Any]:
+        """Tạm dừng nhiệm vụ dẫn đường hiện tại (Admin)"""
+        pass
+
+    @abstractmethod
+    def resume_navigation(self) -> Dict[str, Any]:
+        """Tiếp tục nhiệm vụ dẫn đường đang tạm dừng (Admin)"""
+        pass
+
+    @abstractmethod
     def get_owner_id(self) -> str:
         """Trả về ID người sở hữu chuyến đi hiện tại (rỗng nếu robot đang rảnh)"""
         pass

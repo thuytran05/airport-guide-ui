@@ -1269,3 +1269,297 @@ async def test_destinations_deletion_persistence_and_permissions():
             live_adapter._destinations_file = orig_file
             live_adapter._destinations = orig_dests
 
+
+# =========================================================================
+# 11. Navigation Pause & Resume Lifecycle and Permissions
+# =========================================================================
+
+@pytest.mark.anyio
+async def test_navigation_pause_resume_lifecycle_and_permissions(tmp_path):
+    """
+    Kiểm tra toàn diện cơ chế Tạm dừng / Tiếp tục dẫn đường:
+    1. Vòng đời Pause / Resume trên MockRobotAdapter:
+       - Tách biệt trip_id và goal_id, giữ trip_id, owner_id, destination_id khi PAUSED.
+       - Xóa path khi PAUSED, nhận path mới khi RESUMED.
+       - Chống gọi lặp (pause khi đã paused, resume khi đang navigating).
+       - Chặn bắt đầu chuyến mới và chặn sửa/xóa điểm đến khi đang PAUSED.
+       - Hủy dứt điểm khi đang PAUSED mà không cần gọi thêm cancel tới Nav2.
+    2. Vòng đời trên RosRobotAdapter:
+       - Pause gửi cancel_goal_async và chuyển sang PAUSING.
+       - Phản hồi từ chối hủy (return_code != 0) chuyển lại NAVIGATING.
+       - Nav result status 5 trong lúc PAUSING chuyển sang PAUSED.
+       - Nav result status 4 (đến đích đúng lúc bấm pause) giữ nguyên SUCCEEDED.
+       - Resume gửi goal mới với cùng tọa độ đích, giữ nguyên trip_id.
+       - Nav2 từ chối goal mới khi resume giữ nguyên PAUSED.
+    3. Phân quyền API:
+       - Anonymous / Passenger bị cấm (401/403) khi gọi /pause hoặc /resume.
+       - Admin có quyền gọi /pause và /resume (200 OK).
+       - Hành khách chủ chuyến có quyền gọi /cancel khi chuyến đang PAUSED.
+    """
+    # -------------------------------------------------------------
+    # Phân đoạn 1: MockRobotAdapter Vòng đời Pause / Resume / Cancel
+    # -------------------------------------------------------------
+    mock_adapter = MockRobotAdapter()
+    mock_adapter._destinations_file = tmp_path / "mock_dest.yaml"
+    mock_adapter._destinations = []
+    test_dest = {
+        "id": "gate_pr_test",
+        "name": "Cổng Test Pause Resume",
+        "map_id": "airport_floor_1",
+        "pose": {"position": {"x": 5.0, "y": 6.0, "z": 0.0}}
+    }
+    mock_adapter.upsert_destination(test_dest)
+
+    # 1.1 Bắt đầu dẫn đường
+    start_res = mock_adapter.start_navigation(destination_id="gate_pr_test", owner_id="user_owner_1")
+    assert start_res["success"] is True
+    initial_trip_id = start_res["trip_id"]
+    initial_goal_id = start_res["goal_id"]
+    assert initial_trip_id != ""
+    assert mock_adapter._navigation_state == "NAVIGATING"
+
+    # 1.2 Tạm dừng dẫn đường
+    pause_res = mock_adapter.pause_navigation()
+    assert pause_res["success"] is True
+    assert mock_adapter._navigation_state == "PAUSED"
+    assert mock_adapter._has_goal is False
+    assert mock_adapter.get_path() is None or len(mock_adapter.get_path()) == 0
+    # Bảo lưu thông tin phiên
+    assert mock_adapter._trip_id == initial_trip_id
+    assert mock_adapter._owner_id == "user_owner_1"
+    assert mock_adapter._destination_id == "gate_pr_test"
+
+    # 1.3 Gọi pause lại lần nữa -> Báo đã ở trạng thái tạm dừng
+    pause_again = mock_adapter.pause_navigation()
+    assert pause_again["success"] is True
+    assert "đã ở trạng thái tạm dừng" in pause_again["message"]
+
+    # 1.4 Chặn bắt đầu chuyến mới khi đang PAUSED
+    start_blocked = mock_adapter.start_navigation(destination_id="gate_pr_test", owner_id="user_owner_2")
+    assert start_blocked["success"] is False
+    assert "PAUSED" in start_blocked["message"]
+
+    # 1.5 Chặn sửa hoặc xóa điểm đang trong chuyến PAUSED
+    upsert_blocked = mock_adapter.upsert_destination(test_dest)
+    assert upsert_blocked["success"] is False
+    assert "PAUSED" in upsert_blocked["message"]
+
+    del_blocked = mock_adapter.delete_destination("gate_pr_test")
+    assert del_blocked["success"] is False
+    assert "PAUSED" in del_blocked["message"]
+
+    # 1.6 Tiếp tục dẫn đường (Resume)
+    resume_res = mock_adapter.resume_navigation()
+    assert resume_res["success"] is True
+    assert mock_adapter._navigation_state == "NAVIGATING"
+    assert mock_adapter._has_goal is True
+    # trip_id giữ nguyên, goal_id mới được cấp
+    assert mock_adapter._trip_id == initial_trip_id
+    assert mock_adapter._goal_id != initial_goal_id
+    assert mock_adapter._owner_id == "user_owner_1"
+
+    # 1.7 Gọi resume lần nữa khi đang di chuyển -> Báo không cần tiếp tục
+    resume_again = mock_adapter.resume_navigation()
+    assert resume_again["success"] is False
+    assert "không cần tiếp tục" in resume_again["message"]
+
+    # 1.8 Tạm dừng lại lần nữa để thử Cancel khi PAUSED
+    mock_adapter.pause_navigation()
+    assert mock_adapter._navigation_state == "PAUSED"
+
+    # Người dùng khác hủy -> Bị từ chối
+    cancel_forbidden = mock_adapter.cancel_navigation(owner_id="stranger_user", is_admin=False)
+    assert cancel_forbidden["success"] is False
+    assert "không có quyền" in cancel_forbidden["message"]
+
+    # Chính chủ hủy khi đang PAUSED -> Hủy dứt điểm ngay lập tức
+    cancel_owner = mock_adapter.cancel_navigation(owner_id="user_owner_1", is_admin=False)
+    assert cancel_owner["success"] is True
+    assert mock_adapter._navigation_state == "CANCELED"
+    assert mock_adapter._trip_id == ""
+    assert mock_adapter._owner_id == ""
+    assert mock_adapter._destination_id == ""
+
+    # Dọn dẹp mock adapter
+    mock_adapter.dispose()
+
+    # -------------------------------------------------------------
+    # Phân đoạn 2: RosRobotAdapter Xử lý Callbacks, Async & Góc chết
+    # -------------------------------------------------------------
+    ros_ad = RosRobotAdapter.__new__(RosRobotAdapter)
+    ros_ad._lock = threading.Lock()
+    class DummyCfg:
+        use_sim_time = False
+        frames = {"map": "map", "base_link": "base_link"}
+    ros_ad._cfg = DummyCfg()
+    ros_ad._navigation_state = "NAVIGATING"
+    ros_ad._has_goal = True
+    ros_ad._trip_id = "test_ros_trip_123"
+    ros_ad._active_request_id = "req_ros_goal_1"
+    ros_ad._destination_id = "dest_1"
+    ros_ad._owner_id = "admin"
+    ros_ad._destinations = [
+        {"id": "dest_1", "name": "Điểm Đích 1", "pose": {"position": {"x": 2.0, "y": 3.0}}}
+    ]
+    ros_ad._path = [{"x": 1.0, "y": 1.0}]
+    ros_ad._path_version = 1
+    ros_ad._cancel_requested_for = None
+    ros_ad._pause_requested_for = None
+    ros_ad._distance_remaining = 3.5
+    ros_ad._estimated_time_remaining = 7.0
+    ros_ad._number_of_recoveries = 0
+
+    class DummyGoalHandle:
+        def __init__(self):
+            self.cancel_called = False
+        def cancel_goal_async(self):
+            self.cancel_called = True
+            fut = asyncio.Future()
+            return fut
+
+    dummy_gh = DummyGoalHandle()
+    ros_ad._current_goal_handle = dummy_gh
+
+    # 2.1 Bấm tạm dừng khi đang NAVIGATING -> Chuyển PAUSING, gọi cancel_goal_async
+    p_res = ros_ad.pause_navigation()
+    assert p_res["success"] is True
+    assert ros_ad._navigation_state == "PAUSING"
+    assert dummy_gh.cancel_called is True
+    assert ros_ad._path is None
+
+    # 2.2 Callback Nav2 phản hồi từ chối cancel (return_code != 0) -> chuyển lại NAVIGATING
+    class DummyCancelResponse:
+        return_code = 1  # REJECTED
+    class DummyFuture:
+        def result(self):
+            return DummyCancelResponse()
+
+    ros_ad._on_cancel_response(DummyFuture(), "req_ros_goal_1")
+    assert ros_ad._navigation_state == "NAVIGATING"
+
+    # 2.3 Bấm tạm dừng lại và Nav2 hoàn tất hủy (GoalStatus 5) -> Chuyển PAUSED
+    ros_ad.pause_navigation()
+    assert ros_ad._navigation_state == "PAUSING"
+
+    class DummyResultHandleStatus5:
+        status = 5  # STATUS_CANCELED
+        result = None
+    class DummyResultFuture5:
+        def result(self):
+            return DummyResultHandleStatus5()
+
+    ros_ad._on_nav_result(DummyResultFuture5(), "req_ros_goal_1", "Điểm Đích 1")
+    assert ros_ad._navigation_state == "PAUSED"
+    assert ros_ad._has_goal is False
+    assert ros_ad._current_goal_handle is None
+    # Bảo lưu phiên
+    assert ros_ad._trip_id == "test_ros_trip_123"
+    assert ros_ad._owner_id == "admin"
+    assert ros_ad._destination_id == "dest_1"
+
+    # 2.4 Tình huống robot đến đích ngay khi bấm pause (race condition: status 4)
+    ros_ad._navigation_state = "PAUSING"
+    class DummyResultHandleStatus4:
+        status = 4  # STATUS_SUCCEEDED
+        result = None
+    class DummyResultFuture4:
+        def result(self):
+            return DummyResultHandleStatus4()
+
+    ros_ad._on_nav_result(DummyResultFuture4(), "req_ros_goal_1", "Điểm Đích 1")
+    assert ros_ad._navigation_state == "SUCCEEDED"
+    assert ros_ad._trip_id == ""
+
+    # 2.5 Kiểm tra Resume khi Nav2 từ chối Goal mới -> Vẫn giữ PAUSED
+    ros_ad._navigation_state = "PAUSED"
+    ros_ad._trip_id = "test_trip_resume"
+    ros_ad._active_request_id = "req_resume_1"
+    ros_ad._owner_id = "admin"
+    ros_ad._destination_id = "dest_1"
+
+    class DummyRejectedGoalHandle:
+        accepted = False
+    class DummyGoalFuture:
+        def result(self):
+            return DummyRejectedGoalHandle()
+
+    ros_ad._on_goal_response(DummyGoalFuture(), "req_resume_1", "Điểm Đích 1", is_resume=True)
+    assert ros_ad._navigation_state == "PAUSED"
+    assert "từ chối" in ros_ad._message
+
+    # 2.6 Kiểm tra Hủy khi đang PAUSED trên RosRobotAdapter
+    cancel_res_paused = ros_ad.cancel_navigation(owner_id="admin", is_admin=True)
+    assert cancel_res_paused["success"] is True
+    assert ros_ad._navigation_state == "CANCELED"
+    assert ros_ad._trip_id == ""
+
+    # -------------------------------------------------------------
+    # Phân đoạn 3: Phân quyền API (REST Endpoints)
+    # -------------------------------------------------------------
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 3.1 Anonymous gọi /pause và /resume -> Bị từ chối
+        res_anon_pause = await client.post("/api/robot/pause")
+        assert res_anon_pause.status_code in (401, 403)
+
+        res_anon_resume = await client.post("/api/robot/resume")
+        assert res_anon_resume.status_code in (401, 403)
+
+        # 3.2 Passenger (Viewer) gọi /pause và /resume -> 403 Forbidden
+        sess_p = await client.post("/api/auth/session")
+        token_p = sess_p.json()["session_token"]
+
+        res_p_pause = await client.post("/api/robot/pause", headers={"X-Passenger-Token": token_p})
+        assert res_p_pause.status_code == 403
+
+        res_p_resume = await client.post("/api/robot/resume", headers={"X-Passenger-Token": token_p})
+        assert res_p_resume.status_code == 403
+
+        # 3.3 Admin đăng nhập
+        admin_login = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        admin_tok = admin_login.json()["access_token"]
+        admin_headers = {"Authorization": f"Bearer {admin_tok}"}
+
+        # Tạo chuyến dẫn đường qua Mock Adapter
+        from app.adapters.factory import get_robot_adapter
+        app_adapter = get_robot_adapter()
+        orig_file = getattr(app_adapter, "_destinations_file", None)
+        orig_dests = list(getattr(app_adapter, "_destinations", []))
+        app_adapter._destinations_file = tmp_path / "api_dest.yaml"
+        app_adapter._destinations = []
+        app_adapter._control_mode = "AUTO"
+        app_adapter._navigation_state = "IDLE"
+        app_adapter._has_goal = False
+        app_adapter._owner_id = ""
+        try:
+            app_adapter.upsert_destination({
+                "id": "gate_api_test",
+                "name": "Cổng API Test",
+                "map_id": "airport_floor_1",
+                "pose": {"position": {"x": 5.0, "y": 5.0, "z": 0.0}}
+            })
+            start_res_api = app_adapter.start_navigation("gate_api_test", owner_id="admin")
+            assert start_res_api["success"] is True
+
+            # Admin gọi Pause -> 200 OK
+            res_adm_pause = await client.post("/api/robot/pause", headers=admin_headers)
+            assert res_adm_pause.status_code == 200
+            assert res_adm_pause.json()["success"] is True
+            assert app_adapter.get_status()["navigation_state"] == "PAUSED"
+
+            # Admin gọi Resume -> 200 OK
+            res_adm_resume = await client.post("/api/robot/resume", headers=admin_headers)
+            assert res_adm_resume.status_code == 200
+            assert res_adm_resume.json()["success"] is True
+            assert app_adapter.get_status()["navigation_state"] == "NAVIGATING"
+
+            # Admin pause lại rồi cancel
+            await client.post("/api/robot/pause", headers=admin_headers)
+            res_adm_cancel = await client.post("/api/robot/cancel", headers=admin_headers)
+            assert res_adm_cancel.status_code == 200
+            assert app_adapter.get_status()["navigation_state"] == "CANCELED"
+        finally:
+            if hasattr(app_adapter, "_destinations_file"):
+                app_adapter._destinations_file = orig_file
+                app_adapter._destinations = orig_dests
+
+

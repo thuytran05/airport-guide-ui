@@ -17,6 +17,8 @@ interface RobotContextType {
   refreshDestinations: () => Promise<void>;
   startNavigation: (destinationId: string) => Promise<{ success: boolean; message?: string }>;
   cancelNavigation: () => Promise<{ success: boolean; message?: string }>;
+  pauseNavigation: () => Promise<{ success: boolean; message?: string }>;
+  resumeNavigation: () => Promise<{ success: boolean; message?: string }>;
   startVoiceSession: () => Promise<{ success: boolean; message?: string }>;
   setManualControl: (enable: boolean) => Promise<{ success: boolean; message?: string }>;
   sendManualVelocity: (linear_x: number, angular_z: number) => Promise<boolean>;
@@ -37,6 +39,7 @@ const DEFAULT_STATUS: RobotStatus = {
   navigationState: 'IDLE',
   hasGoal: false,
   goalId: '',
+  tripId: '',
   destinationId: '',
   isOwner: false,
   hasActiveTrip: false,
@@ -184,6 +187,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
             navigationState: rob.navigation_state || 'IDLE',
             hasGoal: rob.has_goal || false,
             goalId: rob.goal_id || '',
+            tripId: rob.trip_id || '',
             destinationId: rob.destination_id || '',
             isOwner: rob.is_owner ?? false,
             hasActiveTrip: rob.has_active_trip ?? false,
@@ -220,7 +224,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
           } else {
             setPath(payload.path);
           }
-        } else if (rob && ['IDLE', 'SUCCEEDED', 'CANCELED', 'FAILED'].includes(rob.navigation_state)) {
+        } else if (rob && ['IDLE', 'SUCCEEDED', 'CANCELED', 'FAILED', 'PAUSED'].includes(rob.navigation_state)) {
           setPath(null);
         }
 
@@ -254,6 +258,24 @@ export function RobotProvider({ children }: { children: ReactNode }) {
   const cancelNavigation = async () => {
     try {
       const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/cancel');
+      return res;
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  };
+
+  const pauseNavigation = async () => {
+    try {
+      const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/pause');
+      return res;
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  };
+
+  const resumeNavigation = async () => {
+    try {
+      const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/resume');
       return res;
     } catch (err: any) {
       return { success: false, message: err.message };
@@ -324,6 +346,8 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         refreshDestinations,
         startNavigation,
         cancelNavigation,
+        pauseNavigation,
+        resumeNavigation,
         startVoiceSession,
         setManualControl,
         sendManualVelocity,

@@ -70,6 +70,7 @@ async def telemetry_broadcaster_loop():
                         "navigation_state": status["navigation_state"],
                         "has_goal": status["has_goal"],
                         "goal_id": status["goal_id"],
+                        "trip_id": status.get("trip_id", ""),
                         "destination_id": status["destination_id"],
                         "has_active_trip": bool(owner_id),
                         "is_owner": is_owner,

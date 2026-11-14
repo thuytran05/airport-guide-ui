@@ -17,6 +17,8 @@ export default function AdminDashboard() {
     deleteDestination,
     startNavigation,
     cancelNavigation,
+    pauseNavigation,
+    resumeNavigation,
   } = useRobot();
 
   const [isSwitchingMode, setIsSwitchingMode] = useState(false);
@@ -244,8 +246,12 @@ export default function AdminDashboard() {
     status.navigationState === 'NAVIGATING' ||
     status.navigationState === 'ACCEPTED' ||
     status.navigationState === 'PENDING' ||
+    status.navigationState === 'PAUSING' ||
+    status.navigationState === 'PAUSED' ||
     status.navigationState === 'CANCELING';
   const isCanceling = status.navigationState === 'CANCELING';
+  const isPausing = status.navigationState === 'PAUSING';
+  const isPaused = status.navigationState === 'PAUSED';
 
   const handleAdminStart = async () => {
     if (!selectedNavDestId) return;
@@ -257,6 +263,30 @@ export default function AdminDashboard() {
       setNavActionMsg(`❌ ${res.message || 'Không thể bắt đầu dẫn đường.'}`);
     } else {
       setNavActionMsg(`✅ ${res.message || 'Đã gửi lệnh dẫn đường tới Nav2.'}`);
+    }
+  };
+
+  const handleAdminPause = async () => {
+    setNavActionMsg(null);
+    setIsNavSubmitting(true);
+    const res = await pauseNavigation();
+    setIsNavSubmitting(false);
+    if (!res.success) {
+      setNavActionMsg(`❌ ${res.message || 'Không thể tạm dừng dẫn đường.'}`);
+    } else {
+      setNavActionMsg(`✅ ${res.message || 'Đã gửi lệnh tạm dừng tới robot.'}`);
+    }
+  };
+
+  const handleAdminResume = async () => {
+    setNavActionMsg(null);
+    setIsNavSubmitting(true);
+    const res = await resumeNavigation();
+    setIsNavSubmitting(false);
+    if (!res.success) {
+      setNavActionMsg(`❌ ${res.message || 'Không thể tiếp tục dẫn đường.'}`);
+    } else {
+      setNavActionMsg(`✅ ${res.message || 'Đã gửi lệnh tiếp tục dẫn đường.'}`);
     }
   };
 
@@ -460,11 +490,33 @@ export default function AdminDashboard() {
                   </div>
                 )}
                 <div className={styles.navActions}>
+                  {isPaused ? (
+                    <button
+                      type="button"
+                      className={styles.adminResumeBtn}
+                      onClick={handleAdminResume}
+                      disabled={isNavSubmitting || isManual || !status.isConnected}
+                      title="Tiếp tục dẫn đường tới điểm đến hiện tại"
+                    >
+                      {isNavSubmitting ? 'Đang gửi lệnh tiếp tục...' : 'TIẾP TỤC DẪN ĐƯỜNG'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className={styles.adminPauseBtn}
+                      onClick={handleAdminPause}
+                      disabled={isNavSubmitting || isCanceling || isPausing || status.navigationState === 'PENDING'}
+                      title="Tạm dừng robot tại vị trí hiện tại"
+                    >
+                      {isPausing ? 'ĐANG TẠM DỪNG...' : 'TẠM DỪNG'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     className={styles.adminCancelBtn}
                     onClick={handleAdminCancel}
-                    disabled={isNavSubmitting || isCanceling}
+                    disabled={isNavSubmitting || isCanceling || isPausing}
+                    title="Hủy hoàn toàn chuyến dẫn đường"
                   >
                     {isCanceling || isNavSubmitting ? 'Đang gửi lệnh hủy...' : 'HỦY CHUYẾN ĐI'}
                   </button>

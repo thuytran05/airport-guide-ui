@@ -149,6 +149,8 @@
 .navigating { color: #2563EB; }
 .accepted { color: #2563EB; }
 .pending { color: #D97706; }
+.pausing { color: #D97706; }
+.paused { color: #D97706; }
 .canceling { color: #DC2626; }
 .succeeded { color: #16A34A; }
 .failed { color: #DC2626; }

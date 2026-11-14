@@ -319,7 +319,9 @@
   border-color: #93C5FD;
 }
 
-.navStateBadge.canceling {
+.navStateBadge.canceling,
+.navStateBadge.pausing,
+.navStateBadge.paused {
   background: #FEF3C7;
   color: #D97706;
   border-color: #FCD34D;
@@ -421,7 +423,7 @@
 }
 
 .adminCancelBtn {
-  width: 100%;
+  flex: 1;
   background: #DC2626;
   color: #FFFFFF;
   border: none;
@@ -438,6 +440,52 @@
 }
 
 .adminCancelBtn:disabled {
+  background: #94A3B8;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.adminPauseBtn {
+  flex: 1;
+  background: #D97706;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+}
+
+.adminPauseBtn:hover:not(:disabled) {
+  background: #B45309;
+}
+
+.adminPauseBtn:disabled {
+  background: #94A3B8;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.adminResumeBtn {
+  flex: 1;
+  background: #2563EB;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+}
+
+.adminResumeBtn:hover:not(:disabled) {
+  background: #1D4ED8;
+}
+
+.adminResumeBtn:disabled {
   background: #94A3B8;
   cursor: not-allowed;
   opacity: 0.7;

@@ -108,6 +108,7 @@ class RosRobotAdapter(BaseRobotAdapter):
         self._navigation_state = "IDLE"
         self._has_goal = False
         self._goal_id = ""
+        self._trip_id = ""
         self._destination_id = ""
         self._voice_state = "IDLE"
         self._voice_transcript: Optional[str] = None
@@ -127,6 +128,7 @@ class RosRobotAdapter(BaseRobotAdapter):
         self._current_goal_dispatch_time: float = 0.0
         self._active_request_id: str = ""
         self._cancel_requested_for: Optional[str] = None
+        self._pause_requested_for: Optional[str] = None
         self._owner_id: str = ""
         self._distance_remaining: Optional[float] = None
         self._estimated_time_remaining: Optional[float] = None
@@ -650,6 +652,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 "navigation_state": self._navigation_state,
                 "has_goal": self._has_goal,
                 "goal_id": self._goal_id,
+                "trip_id": getattr(self, "_trip_id", ""),
                 "destination_id": self._destination_id,
                 "distance_remaining": self._distance_remaining,
                 "estimated_time_remaining": self._estimated_time_remaining,
@@ -871,9 +874,9 @@ class RosRobotAdapter(BaseRobotAdapter):
 
             dest_id = str(dest_id).strip()
 
-            # Kiểm tra xem có đang dẫn đường tới điểm này không
-            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "CANCELING") and self._destination_id == dest_id:
-                return {"success": False, "message": "Không thể cập nhật điểm đến đang có chuyến dẫn đường đang hoạt động"}
+            # Kiểm tra xem có đang dẫn đường tới điểm này không (kể cả khi tạm dừng hoặc đang hủy)
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
+                return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' khi đang có chuyến dẫn đường tới điểm này (trạng thái: {self._navigation_state})"}
 
             # Xác thực tọa độ
             val_res = self.validate_destination_coordinates(destination)
@@ -925,8 +928,8 @@ class RosRobotAdapter(BaseRobotAdapter):
             if not dest_id:
                 return {"success": False, "message": "ID điểm đến không được để trống"}
 
-            # Chặn xóa điểm đang dùng cho một chuyến chưa kết thúc, kể cả khi goal đang chờ Nav2 chấp nhận hoặc đang hủy
-            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "CANCELING") and self._destination_id == dest_id:
+            # Chặn xóa điểm đang dùng cho một chuyến chưa kết thúc (kể cả khi tạm dừng hoặc đang hủy)
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                 return {
                     "success": False,
                     "message": f"Không thể xóa điểm đến '{dest_id}' vì đang có chuyến dẫn đường chưa kết thúc tới điểm này (trạng thái: {self._navigation_state})"
@@ -975,10 +978,10 @@ class RosRobotAdapter(BaseRobotAdapter):
                 return {"success": False, "message": "Mô phỏng đang tạm dừng (sim clock stalled). Không thể gửi mục tiêu."}
 
             # 4. Kiểm tra xem robot có đang bận thực hiện chuyến nào không (Chống gửi trùng)
-            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "CANCELING"):
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
                 return {
                     "success": False,
-                    "message": f"Robot đang có chuyến dẫn đường đang hoạt động (trạng thái: {self._navigation_state})."
+                    "message": f"Robot đang có chuyến dẫn đường đang hoạt động hoặc tạm dừng (trạng thái: {self._navigation_state})."
                 }
 
             # 4b. Kiểm tra nếu Nav2 đang bận thực hiện mục tiêu ngoại vi (từ RViz hoặc do backend restart chưa xong)
@@ -1025,8 +1028,10 @@ class RosRobotAdapter(BaseRobotAdapter):
 
             # 9. Khởi tạo phiên request ID
             req_id = uuid.uuid4().hex
+            self._trip_id = uuid.uuid4().hex
             self._active_request_id = req_id
             self._cancel_requested_for = None
+            self._pause_requested_for = None
             self._owner_id = owner_id
             self._destination_id = destination_id
             self._current_target_pose = {"x": float(pos["x"]), "y": float(pos["y"])}
@@ -1047,7 +1052,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                     goal_msg,
                     feedback_callback=self._on_nav_feedback
                 )
-                send_future.add_done_callback(lambda f: self._on_goal_response(f, req_id, dest_name))
+                send_future.add_done_callback(lambda f: self._on_goal_response(f, req_id, dest_name, is_resume=False))
             except Exception as e:
                 logger.error(f"Lỗi khi gọi send_goal_async: {e}")
                 self._navigation_state = "FAILED"
@@ -1058,11 +1063,12 @@ class RosRobotAdapter(BaseRobotAdapter):
             return {
                 "success": True,
                 "request_id": req_id,
+                "trip_id": self._trip_id,
                 "destination_id": destination_id,
                 "message": f"Đã tiếp nhận yêu cầu dẫn đường tới {dest_name}. Đang chờ Nav2 chấp thuận..."
             }
 
-    def _on_goal_response(self, future, req_id: str, dest_name: str):
+    def _on_goal_response(self, future, req_id: str, dest_name: str, is_resume: bool = False):
         """Callback khi server Nav2 phản hồi chấp thuận hoặc từ chối Goal."""
         with self._lock:
             if req_id != self._active_request_id:
@@ -1079,17 +1085,28 @@ class RosRobotAdapter(BaseRobotAdapter):
                 goal_handle = future.result()
             except Exception as e:
                 logger.error(f"Lỗi khi nhận kết quả goal handle: {e}")
-                self._navigation_state = "FAILED"
-                self._has_goal = False
-                self._message = f"Lỗi phản hồi từ Nav2: {e}"
+                if is_resume:
+                    self._navigation_state = "PAUSED"
+                    self._has_goal = False
+                    self._message = f"Lỗi phản hồi từ Nav2 khi tiếp tục: {e}. Vẫn giữ trạng thái tạm dừng."
+                else:
+                    self._navigation_state = "FAILED"
+                    self._has_goal = False
+                    self._message = f"Lỗi phản hồi từ Nav2: {e}"
                 return
 
             if not goal_handle.accepted:
-                logger.warning(f"Nav2 từ chối goal {req_id} tới {dest_name}")
-                self._navigation_state = "FAILED"
-                self._has_goal = False
-                self._current_goal_handle = None
-                self._message = f"Mục tiêu tới '{dest_name}' bị Nav2 từ chối (không thể lập quỹ đạo an toàn)."
+                logger.warning(f"Nav2 từ chối goal {req_id} tới {dest_name} (is_resume={is_resume})")
+                if is_resume:
+                    self._navigation_state = "PAUSED"
+                    self._has_goal = False
+                    self._current_goal_handle = None
+                    self._message = f"Nav2 từ chối tiếp tục dẫn đường tới '{dest_name}'. Vẫn giữ trạng thái tạm dừng."
+                else:
+                    self._navigation_state = "FAILED"
+                    self._has_goal = False
+                    self._current_goal_handle = None
+                    self._message = f"Mục tiêu tới '{dest_name}' bị Nav2 từ chối (không thể lập quỹ đạo an toàn)."
                 return
 
             # Goal đã được Nav2 chấp nhận
@@ -1100,18 +1117,24 @@ class RosRobotAdapter(BaseRobotAdapter):
             except Exception:
                 self._goal_id = req_id
 
-            logger.info(f"Nav2 đã chấp nhận goal {self._goal_id} (req={req_id}) tới {dest_name}")
+            logger.info(f"Nav2 đã chấp nhận goal {self._goal_id} (req={req_id}, is_resume={is_resume}) tới {dest_name}")
 
-            # Kiểm tra xem người dùng có bấm Hủy trong khi đang ở trạng thái PENDING không
-            if self._cancel_requested_for == req_id:
+            # Kiểm tra xem người dùng có bấm Hủy hoặc Tạm dừng trong khi đang ở trạng thái PENDING không
+            if getattr(self, "_cancel_requested_for", None) == req_id:
                 logger.info(f"Goal {self._goal_id} có yêu cầu hủy trước đó. Gửi lệnh cancel_goal_async...")
                 self._navigation_state = "CANCELING"
                 self._message = "Đang dừng robot và hủy chuyến..."
                 cancel_future = goal_handle.cancel_goal_async()
                 cancel_future.add_done_callback(lambda f: self._on_cancel_response(f, req_id))
+            elif getattr(self, "_pause_requested_for", None) == req_id:
+                logger.info(f"Goal {self._goal_id} có yêu cầu tạm dừng trước đó. Gửi lệnh cancel_goal_async...")
+                self._navigation_state = "PAUSING"
+                self._message = "Đang dừng robot và tạm dừng chuyến đi..."
+                cancel_future = goal_handle.cancel_goal_async()
+                cancel_future.add_done_callback(lambda f: self._on_cancel_response(f, req_id))
             else:
                 self._navigation_state = "NAVIGATING"
-                self._message = f"Nav2 đang dẫn đường tới: {dest_name}."
+                self._message = f"Nav2 đang tiếp tục dẫn đường tới: {dest_name}." if is_resume else f"Nav2 đang dẫn đường tới: {dest_name}."
 
             # Đăng ký nhận kết quả hoàn thành (Result callback)
             result_future = goal_handle.get_result_async()
@@ -1146,7 +1169,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                     self._message = f"Đang dẫn đường tới {dest_name} (còn khoảng {self._distance_remaining:.1f} m)..."
 
     def _on_nav_result(self, future, req_id: str, dest_name: str):
-        """Callback khi Goal kết thúc (Thành công, Thất bại hoặc Đã hủy)."""
+        """Callback khi Goal kết thúc (Thành công, Thất bại hoặc Đã hủy/Tạm dừng)."""
         with self._lock:
             if req_id != self._active_request_id:
                 logger.warning(f"Bỏ qua kết quả của goal cũ {req_id}")
@@ -1164,29 +1187,226 @@ class RosRobotAdapter(BaseRobotAdapter):
                 self._message = f"Lỗi khi đọc kết quả từ Nav2: {e}"
                 return
 
+            trip_id = getattr(self, "_trip_id", "")
             # action_msgs/msg/GoalStatus: 4=STATUS_SUCCEEDED, 5=STATUS_CANCELED, 6=STATUS_ABORTED
             if status == 4:  # STATUS_SUCCEEDED
                 self._navigation_state = "SUCCEEDED"
                 self._message = f"Đã dẫn đường đến '{dest_name}' thành công!"
-                logger.info(f"Goal {req_id} SUCCEEDED!")
+                logger.info(f"Trip {trip_id} (Goal {req_id}) SUCCEEDED!")
+                self._has_goal = False
+                self._current_goal_handle = None
+                self._current_target_pose = None
+                self._distance_remaining = None
+                self._estimated_time_remaining = None
+                self._number_of_recoveries = 0
+                self._path = None
+                self._path_version = getattr(self, "_path_version", 0) + 1
+                self._owner_id = ""
+                self._trip_id = ""
+                self._destination_id = ""
+                self._pause_requested_for = None
+                self._cancel_requested_for = None
             elif status == 5:  # STATUS_CANCELED
-                self._navigation_state = "CANCELED"
-                self._message = f"Chuyến dẫn đường tới '{dest_name}' đã được hủy."
-                logger.info(f"Goal {req_id} CANCELED!")
+                if self._navigation_state == "PAUSING":
+                    # Tạm dừng thành công! Chuyển sang trạng thái PAUSED
+                    self._navigation_state = "PAUSED"
+                    self._message = f"Chuyến dẫn đường tới '{dest_name}' đã tạm dừng. Sẵn sàng tiếp tục khi có lệnh."
+                    logger.info(f"Trip {trip_id} (Goal {req_id}) PAUSED successfully!")
+                    self._has_goal = False
+                    self._current_goal_handle = None
+                    # Giữ nguyên self._owner_id, self._trip_id, self._destination_id, self._current_target_pose cho Resume
+                    self._distance_remaining = None
+                    self._estimated_time_remaining = None
+                    self._path = None
+                    self._path_version = getattr(self, "_path_version", 0) + 1
+                    self._pause_requested_for = None
+                else:
+                    self._navigation_state = "CANCELED"
+                    self._message = f"Chuyến dẫn đường tới '{dest_name}' đã được hủy."
+                    logger.info(f"Trip {trip_id} (Goal {req_id}) CANCELED!")
+                    self._has_goal = False
+                    self._current_goal_handle = None
+                    self._current_target_pose = None
+                    self._distance_remaining = None
+                    self._estimated_time_remaining = None
+                    self._number_of_recoveries = 0
+                    self._path = None
+                    self._path_version = getattr(self, "_path_version", 0) + 1
+                    self._owner_id = ""
+                    self._trip_id = ""
+                    self._destination_id = ""
+                    self._pause_requested_for = None
+                    self._cancel_requested_for = None
             else:  # STATUS_ABORTED hoặc lỗi khác
                 self._navigation_state = "FAILED"
                 err_msg = getattr(result_obj, "error_msg", "")
                 err_code = getattr(result_obj, "error_code", 0)
                 self._message = f"Dẫn đường thất bại (mã {err_code}): {err_msg or 'Nav2 không thể đến đích'}."
-                logger.warning(f"Goal {req_id} FAILED with status {status}, code {err_code}: {err_msg}")
+                logger.warning(f"Trip {trip_id} (Goal {req_id}) FAILED with status {status}, code {err_code}: {err_msg}")
+                self._has_goal = False
+                self._current_goal_handle = None
+                self._current_target_pose = None
+                self._distance_remaining = None
+                self._estimated_time_remaining = None
+                self._number_of_recoveries = 0
+                self._path = None
+                self._path_version = getattr(self, "_path_version", 0) + 1
+                self._owner_id = ""
+                self._trip_id = ""
+                self._destination_id = ""
+                self._pause_requested_for = None
+                self._cancel_requested_for = None
 
-            self._has_goal = False
-            self._current_goal_handle = None
-            self._current_target_pose = None
-            self._distance_remaining = None
+    def pause_navigation(self) -> Dict[str, Any]:
+        """Tạm dừng chuyến dẫn đường hiện tại (Admin only)."""
+        with self._lock:
+            # 1. Tránh lặp lệnh nếu đang trong quá trình dừng
+            if self._navigation_state == "PAUSING":
+                return {
+                    "success": True,
+                    "message": "Yêu cầu tạm dừng chuyến đi đã được tiếp nhận, đang dừng robot..."
+                }
+
+            if self._navigation_state == "PAUSED":
+                return {
+                    "success": True,
+                    "message": "Chuyến dẫn đường hiện đã ở trạng thái tạm dừng."
+                }
+
+            # 2. Kiểm tra trạng thái có thể tạm dừng
+            if self._navigation_state not in ("PENDING", "ACCEPTED", "NAVIGATING"):
+                return {
+                    "success": False,
+                    "message": f"Không có chuyến dẫn đường nào đang hoạt động để tạm dừng (trạng thái: {self._navigation_state})."
+                }
+
+            # 3. Nếu đang ở trạng thái PENDING (chưa có goal handle)
+            if self._navigation_state == "PENDING" and not self._current_goal_handle:
+                self._pause_requested_for = self._active_request_id
+                self._navigation_state = "PAUSING"
+                self._path = None
+                self._path_version = getattr(self, "_path_version", 0) + 1
+                self._message = "Đang gửi yêu cầu tạm dừng mục tiêu tới Nav2..."
+                return {
+                    "success": True,
+                    "message": "Đã tiếp nhận yêu cầu tạm dừng. Hệ thống sẽ tạm dừng ngay khi kết nối."
+                }
+
+            # 4. Đã có goal handle: gửi cancel_goal_async để dừng robot
+            if self._current_goal_handle:
+                self._navigation_state = "PAUSING"
+                self._path = None
+                self._path_version = getattr(self, "_path_version", 0) + 1
+                self._message = "Đang dừng robot và tạm dừng chuyến đi..."
+                req_id = self._active_request_id
+                try:
+                    cancel_future = self._current_goal_handle.cancel_goal_async()
+                    cancel_future.add_done_callback(lambda f: self._on_cancel_response(f, req_id))
+                except Exception as e:
+                    logger.error(f"Lỗi gọi cancel_goal_async khi tạm dừng: {e}")
+                    return {"success": False, "message": f"Không thể gửi lệnh tạm dừng tới Nav2: {e}"}
+
+                return {
+                    "success": True,
+                    "message": "Yêu cầu tạm dừng chuyến đi đã được tiếp nhận, đang dừng robot..."
+                }
+
+            return {"success": False, "message": "Không tìm thấy goal handle hợp lệ để tạm dừng."}
+
+    def resume_navigation(self) -> Dict[str, Any]:
+        """Tiếp tục chuyến dẫn đường sau khi tạm dừng (Admin only)."""
+        with self._lock:
+            # 1. Kiểm tra trạng thái hiện tại
+            if self._navigation_state in ("NAVIGATING", "ACCEPTED", "PENDING"):
+                return {
+                    "success": False,
+                    "message": "Robot đang trong quá trình dẫn đường, không cần tiếp tục."
+                }
+            if self._navigation_state == "PAUSING":
+                return {
+                    "success": False,
+                    "message": "Robot đang trong quá trình dừng tạm thời. Vui lòng chờ tạm dừng hoàn tất trước khi tiếp tục."
+                }
+            if self._navigation_state != "PAUSED":
+                return {
+                    "success": False,
+                    "message": f"Không có chuyến dẫn đường nào đang tạm dừng để tiếp tục (trạng thái: {self._navigation_state})."
+                }
+
+            # 2. Kiểm tra sim clock nếu use_sim_time
+            if self._cfg.use_sim_time and not self._sim_clock_received:
+                return {"success": False, "message": "Chưa nhận được sim clock từ Gazebo. Không thể tiếp tục."}
+            if self._cfg.use_sim_time and self._is_sim_clock_stalled():
+                return {"success": False, "message": "Mô phỏng đang tạm dừng (sim clock stalled). Không thể tiếp tục."}
+
+            # 3. Kiểm tra vị trí robot hiện tại từ AMCL
+            if not self._pose:
+                return {"success": False, "message": "Chưa có vị trí robot từ hệ thống định vị (AMCL). Không thể tiếp tục."}
+
+            # 4. Tìm điểm đến đã lưu trong chuyến đi
+            dest = next((d for d in self._destinations if d.get("id") == self._destination_id), None)
+            if not dest:
+                return {"success": False, "message": f"Không tìm thấy thông tin điểm đến '{self._destination_id}' để tiếp tục."}
+
+            # 5. Kiểm tra server action sẵn sàng
+            if not self._action_nav.server_is_ready():
+                if not self._action_nav.wait_for_server(timeout_sec=0.5):
+                    return {"success": False, "message": "Server action điều hướng /navigate_to_pose chưa sẵn sàng."}
+
+            # 6. Chuẩn bị Goal message Nav2 với cùng tọa độ đích
+            goal_msg = NavigateToPose.Goal()
+            frame_id = self._cfg.frames.get("map", "map")
+            goal_msg.pose.header.frame_id = frame_id
+            goal_msg.pose.header.stamp = self._node.get_clock().now().to_msg()
+
+            pos = dest["pose"]["position"]
+            orient = dest["pose"].get("orientation", {})
+            goal_msg.pose.pose.position.x = float(pos["x"])
+            goal_msg.pose.pose.position.y = float(pos["y"])
+            goal_msg.pose.pose.position.z = float(pos.get("z", 0.0))
+            goal_msg.pose.pose.orientation.x = float(orient.get("x", 0.0))
+            goal_msg.pose.pose.orientation.y = float(orient.get("y", 0.0))
+            goal_msg.pose.pose.orientation.z = float(orient.get("z", 0.0))
+            goal_msg.pose.pose.orientation.w = float(orient.get("w", 1.0))
+
+            # 7. Khởi tạo request id mới cho lượt Nav2 này nhưng GIỮ NGUYÊN trip_id, owner_id, destination_id
+            req_id = uuid.uuid4().hex
+            self._active_request_id = req_id
+            self._cancel_requested_for = None
+            self._pause_requested_for = None
+            self._current_target_pose = {"x": float(pos["x"]), "y": float(pos["y"])}
+            self._current_goal_dispatch_time = time.time()
+            self._navigation_state = "PENDING"
+            self._has_goal = True
             self._path = None
             self._path_version = getattr(self, "_path_version", 0) + 1
-            self._owner_id = ""
+            dest_name = dest.get("name", self._destination_id)
+            self._message = f"Đang gửi yêu cầu tiếp tục dẫn đường tới: {dest_name}..."
+            self._distance_remaining = None
+            self._estimated_time_remaining = None
+            self._number_of_recoveries = 0
+
+            # 8. Gửi bất đồng bộ với callback is_resume=True
+            try:
+                send_future = self._action_nav.send_goal_async(
+                    goal_msg,
+                    feedback_callback=self._on_nav_feedback
+                )
+                send_future.add_done_callback(lambda f: self._on_goal_response(f, req_id, dest_name, is_resume=True))
+            except Exception as e:
+                logger.error(f"Lỗi khi gọi send_goal_async để tiếp tục: {e}")
+                self._navigation_state = "PAUSED"
+                self._has_goal = False
+                self._message = f"Lỗi khi gửi mục tiêu tới Nav2: {e}. Vẫn giữ trạng thái tạm dừng."
+                return {"success": False, "message": self._message}
+
+            return {
+                "success": True,
+                "request_id": req_id,
+                "trip_id": self._trip_id,
+                "destination_id": self._destination_id,
+                "message": f"Đã tiếp nhận yêu cầu tiếp tục dẫn đường tới {dest_name}. Đang chờ Nav2 chấp thuận..."
+            }
 
     def cancel_navigation(self, owner_id: str, is_admin: bool = False) -> Dict[str, Any]:
         with self._lock:
@@ -1204,14 +1424,47 @@ class RosRobotAdapter(BaseRobotAdapter):
                     "message": "Yêu cầu hủy chuyến đã được tiếp nhận trước đó, đang chờ Nav2 dừng robot..."
                 }
 
-            # 3. Kiểm tra trạng thái hiện tại
+            # 3. Nếu đang ở trạng thái PAUSED: Hủy dứt điểm ngay lập tức mà không cần gửi lệnh hủy tới Nav2
+            if self._navigation_state == "PAUSED":
+                dest = next((d for d in self._destinations if d.get("id") == self._destination_id), None)
+                dest_name = dest.get("name", "") if dest else self._destination_id
+                self._navigation_state = "CANCELED"
+                self._message = f"Chuyến dẫn đường tới '{dest_name}' đã được hủy."
+                self._has_goal = False
+                self._current_goal_handle = None
+                self._current_target_pose = None
+                self._distance_remaining = None
+                self._estimated_time_remaining = None
+                self._number_of_recoveries = 0
+                self._path = None
+                self._path_version = getattr(self, "_path_version", 0) + 1
+                self._destination_id = ""
+                self._owner_id = ""
+                self._trip_id = ""
+                self._pause_requested_for = None
+                self._cancel_requested_for = None
+                return {
+                    "success": True,
+                    "message": f"Chuyến dẫn đường tới '{dest_name}' đã được hủy thành công."
+                }
+
+            # 4. Nếu đang ở trạng thái PAUSING: chuyển cờ sang CANCELING để khi Nav2 hủy xong sẽ kết thúc là CANCELED
+            if self._navigation_state == "PAUSING":
+                self._navigation_state = "CANCELING"
+                self._message = "Đang dừng robot và hủy chuyến..."
+                return {
+                    "success": True,
+                    "message": "Yêu cầu hủy chuyến đã được tiếp nhận, đang dừng robot..."
+                }
+
+            # 5. Kiểm tra trạng thái hiện tại
             if self._navigation_state not in ("PENDING", "ACCEPTED", "NAVIGATING"):
                 return {
                     "success": False,
                     "message": f"Không có chuyến dẫn đường nào đang chạy để hủy (trạng thái: {self._navigation_state})."
                 }
 
-            # 4. Nếu đang ở trạng thái PENDING (chưa có goal handle từ Nav2)
+            # 6. Nếu đang ở trạng thái PENDING (chưa có goal handle từ Nav2)
             if self._navigation_state == "PENDING" and not self._current_goal_handle:
                 self._cancel_requested_for = self._active_request_id
                 self._navigation_state = "CANCELING"
@@ -1224,7 +1477,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                     "message": "Đã tiếp nhận yêu cầu hủy. Hệ thống sẽ hủy mục tiêu ngay khi kết nối."
                 }
 
-            # 5. Đã có goal handle: gửi cancel_goal_async
+            # 7. Đã có goal handle: gửi cancel_goal_async
             if self._current_goal_handle:
                 self._navigation_state = "CANCELING"
                 self._current_target_pose = None
@@ -1269,13 +1522,19 @@ class RosRobotAdapter(BaseRobotAdapter):
                 return_code = getattr(cancel_response, "return_code", 0)
                 if return_code != 0:
                     logger.warning(f"Nav2 không thể hủy goal {req_id} (code={return_code}). Chờ kết quả cuối.")
-                    # Nếu bị từ chối hủy (return_code == 1) và đang ở trạng thái CANCELING, chuyển lại NAVIGATING
-                    if return_code == 1 and self._navigation_state == "CANCELING":
-                        self._navigation_state = "NAVIGATING"
+                    # Nếu bị từ chối hủy (return_code == 1):
+                    # Nếu đang CANCELING -> chuyển lại NAVIGATING
+                    # Nếu đang PAUSING -> chuyển lại NAVIGATING
+                    if return_code == 1:
                         dests = getattr(self, "_destinations", []) or []
                         dest = next((d for d in dests if d.get("id") == self._destination_id), None)
                         dest_name = dest.get("name", "") if dest else self._destination_id
-                        self._message = f"Yêu cầu hủy bị Nav2 từ chối. Robot tiếp tục dẫn đường tới {dest_name}."
+                        if self._navigation_state == "CANCELING":
+                            self._navigation_state = "NAVIGATING"
+                            self._message = f"Yêu cầu hủy bị Nav2 từ chối. Robot tiếp tục dẫn đường tới {dest_name}."
+                        elif self._navigation_state == "PAUSING":
+                            self._navigation_state = "NAVIGATING"
+                            self._message = f"Yêu cầu tạm dừng bị Nav2 từ chối. Robot tiếp tục dẫn đường tới {dest_name}."
             except Exception as e:
                 logger.error(f"Lỗi trong _on_cancel_response: {e}")
 

@@ -46,6 +46,8 @@ export type NavigationState =
   | 'PENDING'
   | 'ACCEPTED'
   | 'NAVIGATING'
+  | 'PAUSING'
+  | 'PAUSED'
   | 'CANCELING'
   | 'SUCCEEDED'
   | 'CANCELED'
@@ -70,6 +72,7 @@ export interface RobotStatus {
   navigationState: NavigationState;
   hasGoal: boolean;
   goalId: string;
+  tripId?: string;
   destinationId: string;
   isOwner?: boolean;
   hasActiveTrip?: boolean;

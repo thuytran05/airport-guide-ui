@@ -29,6 +29,8 @@ export default function PassengerHome() {
     status.navigationState === 'NAVIGATING' ||
     status.navigationState === 'ACCEPTED' ||
     status.navigationState === 'PENDING' ||
+    status.navigationState === 'PAUSING' ||
+    status.navigationState === 'PAUSED' ||
     status.navigationState === 'CANCELING';
   const isCanceling = status.navigationState === 'CANCELING';
 
@@ -53,6 +55,8 @@ export default function PassengerHome() {
     PENDING: 'Đang gửi yêu cầu...',
     ACCEPTED: 'Nav2 đã chấp nhận',
     NAVIGATING: 'Đang di chuyển dẫn đường',
+    PAUSING: 'Đang tạm dừng chuyến đi...',
+    PAUSED: 'Chuyến đi đang tạm dừng',
     CANCELING: 'Đang dừng và hủy chuyến...',
     SUCCEEDED: 'Đã đến đích thành công',
     CANCELED: 'Chuyến đi đã bị hủy',
