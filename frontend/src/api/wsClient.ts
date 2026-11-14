@@ -9,7 +9,9 @@ class WebSocketClient {
   private maxBackoffMs = 8000;
   private isExplicitlyClosed = false;
   private pingTimer: any = null;
+  private reconnectTimer: any = null;
   private currentToken: string | null = null;
+  private currentWsUrl: string | null = null;
 
   public isConnected = false;
 
@@ -17,12 +19,10 @@ class WebSocketClient {
     this.currentToken = token;
     this.isExplicitlyClosed = false;
 
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch (e) {
-        // ignore
-      }
+    // Hủy bỏ bất kỳ timer reconnect nào đang chờ
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -38,17 +38,46 @@ class WebSocketClient {
     const query = effectiveToken ? `?token=${encodeURIComponent(effectiveToken)}` : '';
     const wsUrl = `${protocol}//${host}/ws${query}`;
 
-    try {
-      this.ws = new WebSocket(wsUrl);
+    // Nếu socket hiện tại đã mở hoặc đang kết nối với cùng URL và token, giữ nguyên kết nối
+    if (
+      this.ws &&
+      this.currentWsUrl === wsUrl &&
+      (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
 
-      this.ws.onopen = () => {
+    // Dọn dẹp socket cũ triệt để: tháo gỡ toàn bộ callbacks để tránh event rác bắn vào client
+    if (this.ws) {
+      const oldWs = this.ws;
+      this.ws = null;
+      oldWs.onopen = null;
+      oldWs.onclose = null;
+      oldWs.onerror = null;
+      oldWs.onmessage = null;
+      try {
+        oldWs.close();
+      } catch {
+        // ignore
+      }
+    }
+
+    this.currentWsUrl = wsUrl;
+
+    try {
+      const socket = new WebSocket(wsUrl);
+      this.ws = socket;
+
+      socket.onopen = () => {
+        if (this.ws !== socket) return;
         this.isConnected = true;
         this.reconnectAttempts = 0;
         this.notifyStatus(true);
         this.startPing();
       };
 
-      this.ws.onmessage = (event) => {
+      socket.onmessage = (event) => {
+        if (this.ws !== socket) return;
         try {
           const data = JSON.parse(event.data);
           this.notifyTelemetry(data);
@@ -57,15 +86,22 @@ class WebSocketClient {
         }
       };
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        // Bỏ qua nếu đây là socket cũ đã bị thay thế
+        if (this.ws !== socket) return;
+
         this.isConnected = false;
         this.stopPing();
         this.notifyStatus(false);
 
         if (!this.isExplicitlyClosed) {
+          if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+          }
           const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts), this.maxBackoffMs);
           this.reconnectAttempts++;
-          setTimeout(() => {
+          this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
             if (!this.isExplicitlyClosed) {
               this.connect(this.currentToken);
             }
@@ -73,7 +109,8 @@ class WebSocketClient {
         }
       };
 
-      this.ws.onerror = () => {
+      socket.onerror = () => {
+        if (this.ws !== socket) return;
         this.isConnected = false;
         this.notifyStatus(false);
       };
@@ -94,11 +131,25 @@ class WebSocketClient {
 
   public disconnect(): void {
     this.isExplicitlyClosed = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.stopPing();
     if (this.ws) {
-      this.ws.close();
+      const oldWs = this.ws;
       this.ws = null;
+      oldWs.onopen = null;
+      oldWs.onclose = null;
+      oldWs.onerror = null;
+      oldWs.onmessage = null;
+      try {
+        oldWs.close();
+      } catch {
+        // ignore
+      }
     }
+    this.currentWsUrl = null;
     this.isConnected = false;
     this.notifyStatus(false);
   }

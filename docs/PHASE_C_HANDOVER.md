@@ -440,3 +440,50 @@ INFO:     127.0.0.1:0 - "POST /api/robot/navigate HTTP/1.1" 200 OK
 4. **Bắt đầu chuyến mới:**
    - Chọn một điểm đến khác (ví dụ: `Cổng số 2`) và bấm **[ BẮT ĐẦU DẪN ĐƯỜNG ]**.
    - Robot lập tức nhận mục tiêu mới và bắt đầu di chuyển tới điểm mới từ vị trí hiện tại mà không gặp bất kỳ xung đột goal nào.
+
+---
+
+## 9. BÁO CÁO SỬA LỖI VÀ KIỂM THỬ HỒI QUY (LƯỢT 14/11/2026 - PHẦN CUỐI GIAI ĐOẠN C)
+
+### 9.1. Sửa Lỗi Nút "Tiếp Tục Dẫn Đường" (500 Internal Server Error)
+- **Hiện tượng:** Admin bấm Pause ➔ robot dừng OK. Khi bấm "Tiếp tục dẫn đường", API `/api/robot/navigation/resume` trả mã 500.
+- **Truy vết lỗi từ nhật ký container (`airport_guide_backend`):**
+  ```
+  File "/app/app/api/robot_router.py", line 153, in resume_navigation
+      res = adapter.resume_navigation()
+  File "/app/app/adapters/ros_adapter.py", line 1337, in resume_navigation
+      if self._cfg.use_sim_time and not self._sim_clock_received:
+  AttributeError: 'RosRobotAdapter' object has no attribute '_sim_clock_received'
+  ```
+- **Nguyên nhân:** Thuộc tính `_sim_clock_received` không tồn tại trong `RosRobotAdapter`; hệ thống đang sử dụng cờ `self._clock_stalled` (như trong hàm `start_navigation`).
+- **Giải pháp:**
+  - Chuẩn hóa kiểm tra sim clock trong `resume_navigation`: `if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False)`.
+  - Bổ sung kiểm tra tính sẵn sàng của action client Nav2 (`_action_nav`) và cờ phân quyền `MANUAL`.
+  - Bảo toàn `trip_id`, `destination_id`, và tọa độ đích khi phục hồi goal mới.
+  - Bổ sung mock an toàn cho `NavigateToPose = None` khi chạy test cô lập không có thư viện ROS.
+
+### 9.2. Sửa Lỗi Huy Hiệu Kết Nối Nhấp Nháy (Flickering Badge Khi Login/Logout)
+- **Hiện tượng:** Chuyển đổi qua lại giữa vai trò Hành khách và Quản trị viên (Login Admin ➔ Logout ➔ Login Admin) mà không ấn F5 khiến huy hiệu kết nối ở header liên tục nhấp nháy giữa `OK` và `Mất kết nối`.
+- **Nguyên nhân:**
+  - Trong `frontend/src/api/wsClient.ts`: Khi `connect(token)` được gọi với token mới, socket cũ bị đóng (`this.ws.close()`) nhưng **không gỡ bỏ các event listener** (`onclose`, `onerror`, `onmessage`). Socket cũ bất đồng bộ kích hoạt sự kiện `onclose`, phát tín hiệu mất kết nối tới `RobotContext` và khởi động bộ đếm thời gian `reconnectTimer` ngoài tầm kiểm soát. Khi socket mới vừa kết nối thành công, timer của socket cũ lại chạy và đóng socket mới, tạo thành vòng lặp đóng/mở vô hạn.
+- **Giải pháp:**
+  - Quản lý `reconnectTimer` tập trung; tự động hủy timer cũ trước mỗi lần gọi `connect()` hoặc `disconnect()`.
+  - Gỡ bỏ toàn bộ event listeners của socket cũ (`oldWs.onopen = null; oldWs.onclose = null; oldWs.onerror = null; oldWs.onmessage = null;`) trước khi đóng.
+  - Thêm bộ lọc `if (this.ws !== socket) return;` trong mọi callback để ngăn chặn hoàn toàn tác động từ socket lỗi thời.
+  - Phân định rõ ràng trong `RobotContext`: ngắt kết nối WebSocket của Gateway chỉ đánh dấu `isDataStale: true` thay vì vô tình ghi đè sai lệch trạng thái kết nối phần cứng của robot.
+
+### 9.3. Sửa Lỗi Con Lăn Chuột Cuộn Toàn Trang Khi Zoom Bản Đồ
+- **Hiện tượng:** Đặt con trỏ chuột trong khu vực bản đồ MapView và lăn con lăn để zoom, bản đồ zoom nhưng toàn bộ trang web trình duyệt cũng bị cuộn lên/xuống theo.
+- **Nguyên nhân:** Trình duyệt hiện đại mặc định coi listener `onWheel` trong JSX là passive listener, dẫn đến lệnh `e.preventDefault()` trong React synthetic event bị bỏ qua.
+- **Giải pháp:**
+  - Chuyển sang gắn native event listener trực tiếp lên thẻ `div` chứa MapView bằng `addEventListener('wheel', onWheel, { passive: false })`.
+  - Gọi `e.preventDefault()` và `e.stopPropagation()` trực tiếp trong native handler để khóa hoàn toàn hành vi cuộn của trang web khi con trỏ chuột nằm trong bản đồ.
+  - Đảm bảo gỡ bỏ listener an toàn trong hàm cleanup của `useEffect` khi unmount.
+
+### 9.4. Kết Quả Kiểm Thử Toàn Diện
+1. **Kiểm thử tự động Backend (Pytest):**
+   - Chạy toàn bộ 19 test case trong container `airport_guide_backend`: **19/19 PASSED (100%)**.
+   - Bao gồm kiểm thử hồi quy Resume Navigation, Sim Clock stall, Nav2 Goal rejection, Destination Persistence, Concurrent Locks, Phân quyền Admin/Passenger.
+2. **Kiểm thử trực quan giao diện (Automated Browser QA):**
+   - **Thử nghiệm Bug 2:** Thực hiện liên tục 3 chu kỳ Login Admin ➔ Logout ➔ Login Admin mà không tải lại trang (0 lần F5). Huy hiệu kết nối `Gateway: OK` và `Robot: OK` duy trì liên tục, ổn định tuyệt đối, không có hiện tượng nhấp nháy, 0 lỗi network.
+   - **Thử nghiệm Bug 3:** Đặt con trỏ chuột trong MapView, lăn chuột phóng to và thu nhỏ bản đồ (scale biến thiên `0.96` ➔ `0.83` ➔ `0.96`). Vị trí header và thân trang web giữ nguyên tọa độ `y = 0`, không bị xê dịch dù chỉ 1 pixel.

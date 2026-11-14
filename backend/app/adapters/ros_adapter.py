@@ -60,6 +60,7 @@ try:
     HAS_NAV2_ACTION = True
 except ImportError:
     HAS_NAV2_ACTION = False
+    NavigateToPose = None
 
 
 def _build_qos(qos_dict: Optional[Dict[str, Any]]) -> "QoSProfile":
@@ -1317,6 +1318,15 @@ class RosRobotAdapter(BaseRobotAdapter):
         """Tiếp tục chuyến dẫn đường sau khi tạm dừng (Admin only)."""
         with self._lock:
             # 1. Kiểm tra trạng thái hiện tại
+            # 1. Kiểm tra action client và ROS packages
+            if not getattr(self, "_action_nav", None) or not HAS_NAV2_ACTION:
+                return {"success": False, "message": "Action client Nav2 chưa được khởi tạo."}
+
+            # 1b. Kiểm tra chế độ điều khiển
+            if getattr(self, "_control_mode", "AUTO") == "MANUAL":
+                return {"success": False, "message": "Robot đang ở chế độ điều khiển thủ công (MANUAL). Hãy chuyển sang AUTO trước khi tiếp tục."}
+
+            # 1c. Kiểm tra trạng thái hiện tại
             if self._navigation_state in ("NAVIGATING", "ACCEPTED", "PENDING"):
                 return {
                     "success": False,
@@ -1334,9 +1344,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 }
 
             # 2. Kiểm tra sim clock nếu use_sim_time
-            if self._cfg.use_sim_time and not self._sim_clock_received:
-                return {"success": False, "message": "Chưa nhận được sim clock từ Gazebo. Không thể tiếp tục."}
-            if self._cfg.use_sim_time and self._is_sim_clock_stalled():
+            if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False):
                 return {"success": False, "message": "Mô phỏng đang tạm dừng (sim clock stalled). Không thể tiếp tục."}
 
             # 3. Kiểm tra vị trí robot hiện tại từ AMCL
@@ -1403,7 +1411,7 @@ class RosRobotAdapter(BaseRobotAdapter):
             return {
                 "success": True,
                 "request_id": req_id,
-                "trip_id": self._trip_id,
+                "trip_id": getattr(self, "_trip_id", ""),
                 "destination_id": self._destination_id,
                 "message": f"Đã tiếp nhận yêu cầu tiếp tục dẫn đường tới {dest_name}. Đang chờ Nav2 chấp thuận..."
             }

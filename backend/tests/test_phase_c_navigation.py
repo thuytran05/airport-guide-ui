@@ -1470,22 +1470,97 @@ async def test_navigation_pause_resume_lifecycle_and_permissions(tmp_path):
     assert ros_ad._navigation_state == "SUCCEEDED"
     assert ros_ad._trip_id == ""
 
-    # 2.5 Kiểm tra Resume khi Nav2 từ chối Goal mới -> Vẫn giữ PAUSED
-    ros_ad._navigation_state = "PAUSED"
-    ros_ad._trip_id = "test_trip_resume"
-    ros_ad._active_request_id = "req_resume_1"
-    ros_ad._owner_id = "admin"
-    ros_ad._destination_id = "dest_1"
+    # 2.5 Kiểm tra Resume: regression test sim clock & goal construction
+    import app.adapters.ros_adapter as ros_mod
+    orig_has_action = getattr(ros_mod, "HAS_NAV2_ACTION", False)
+    orig_nav_pose = getattr(ros_mod, "NavigateToPose", None)
+    ros_mod.HAS_NAV2_ACTION = True
+    class DummyNavigateToPose:
+        class Goal:
+            def __init__(self):
+                class DummyHeader:
+                    frame_id = ""
+                    stamp = None
+                class DummyPoint:
+                    x = 0.0; y = 0.0; z = 0.0
+                class DummyQuat:
+                    x = 0.0; y = 0.0; z = 0.0; w = 1.0
+                class DummyPose:
+                    position = DummyPoint()
+                    orientation = DummyQuat()
+                class DummyPoseStamped:
+                    header = DummyHeader()
+                    pose = DummyPose()
+                self.pose = DummyPoseStamped()
+    ros_mod.NavigateToPose = DummyNavigateToPose
 
-    class DummyRejectedGoalHandle:
-        accepted = False
-    class DummyGoalFuture:
-        def result(self):
-            return DummyRejectedGoalHandle()
+    try:
+        ros_ad._cfg.use_sim_time = True
+        ros_ad._clock_stalled = False
+        ros_ad._navigation_state = "PAUSED"
+        ros_ad._trip_id = "test_trip_resume"
+        ros_ad._active_request_id = "req_resume_old"
+        ros_ad._owner_id = "admin"
+        ros_ad._destination_id = "dest_1"
+        ros_ad._pose = {"x": 1.0, "y": 1.0, "theta": 0.0}
 
-    ros_ad._on_goal_response(DummyGoalFuture(), "req_resume_1", "Điểm Đích 1", is_resume=True)
-    assert ros_ad._navigation_state == "PAUSED"
-    assert "từ chối" in ros_ad._message
+        class DummyActionNav:
+            def __init__(self):
+                self.last_goal = None
+            def server_is_ready(self):
+                return True
+            def wait_for_server(self, timeout_sec=0.5):
+                return True
+            def send_goal_async(self, goal, feedback_callback=None):
+                self.last_goal = goal
+                fut = asyncio.Future()
+                return fut
+
+        class DummyClock:
+            def now(self):
+                class DummyTime:
+                    def to_msg(self):
+                        return None
+                return DummyTime()
+
+        class DummyNode:
+            def get_clock(self):
+                return DummyClock()
+
+        ros_ad._action_nav = DummyActionNav()
+        ros_ad._node = DummyNode()
+
+        # 2.5a Clock stalled -> từ chối, giữ nguyên PAUSED
+        ros_ad._clock_stalled = True
+        res_stalled = ros_ad.resume_navigation()
+        assert res_stalled["success"] is False
+        assert "sim clock stalled" in res_stalled["message"]
+        assert ros_ad._navigation_state == "PAUSED"
+
+        # 2.5b Clock hoạt động -> tiếp tục thành công, chuyển PENDING, bảo lưu trip_id và tọa độ đích
+        ros_ad._clock_stalled = False
+        res_resume_ok = ros_ad.resume_navigation()
+        assert res_resume_ok["success"] is True
+        assert ros_ad._navigation_state == "PENDING"
+        assert ros_ad._action_nav.last_goal is not None
+        assert ros_ad._action_nav.last_goal.pose.pose.position.x == 2.0
+        assert ros_ad._action_nav.last_goal.pose.pose.position.y == 3.0
+        assert ros_ad._action_nav.last_goal.pose.header.frame_id == "map"
+        assert ros_ad._trip_id == "test_trip_resume"
+
+        # 2.5c Nav2 từ chối Goal mới khi resume -> Vẫn giữ PAUSED
+        class DummyRejectedGoalHandle:
+            accepted = False
+        class DummyGoalFuture:
+            def result(self):
+                return DummyRejectedGoalHandle()
+
+        ros_ad._on_goal_response(DummyGoalFuture(), ros_ad._active_request_id, "Điểm Đích 1", is_resume=True)
+        assert ros_ad._navigation_state == "PAUSED"
+        assert "từ chối" in ros_ad._message
+    finally:
+        ros_mod.HAS_NAV2_ACTION = orig_has_action
+        ros_mod.NavigateToPose = orig_nav_pose
 
     # 2.6 Kiểm tra Hủy khi đang PAUSED trên RosRobotAdapter
     cancel_res_paused = ros_ad.cancel_navigation(owner_id="admin", is_admin=True)

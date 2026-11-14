@@ -2,6 +2,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Set
 from fastapi import WebSocket
+from starlette.websockets import WebSocketState
 from ..auth.models import User, UserRole
 
 logger = logging.getLogger("ws_manager")
@@ -13,7 +14,8 @@ class ConnectionManager:
         self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket, user: User):
-        await websocket.accept()
+        if websocket.client_state != WebSocketState.CONNECTED:
+            await websocket.accept()
         async with self._lock:
             self.active_connections[websocket] = user
         logger.info(f"WebSocket client kết nối: {user.username} ({user.role.value}). Tổng kết nối: {len(self.active_connections)}")

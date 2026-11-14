@@ -163,9 +163,8 @@ export function RobotProvider({ children }: { children: ReactNode }) {
       } else {
         setStatus((prev) => ({
           ...prev,
-          isConnected: false,
           isDataStale: true,
-          message: 'Mất kết nối với máy chủ Backend',
+          message: 'Đang kết nối lại với máy chủ...',
         }));
       }
     });

@@ -254,11 +254,23 @@ export const MapView: React.FC<MapViewProps> = ({
     }
   };
 
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
-    setScale((s) => Math.min(4.0, Math.max(0.4, Number((s * zoomFactor).toFixed(2)))));
-  };
+  // Lắng nghe sự kiện wheel với { passive: false } trên vùng bản đồ để chặn triệt để cuộn trang
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const onWheel = (e: WheelEvent) => {
+      // Chặn cuộn trang khi con trỏ nằm trong khung bản đồ, kể cả ở ngưỡng zoom min/max
+      e.preventDefault();
+      const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
+      setScale((s) => Math.min(4.0, Math.max(0.4, Number((s * zoomFactor).toFixed(2)))));
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+    };
+  }, []);
 
   const resetView = () => {
     setScale(1);
@@ -440,7 +452,6 @@ export const MapView: React.FC<MapViewProps> = ({
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseUp}
-      onWheel={handleWheel}
       style={{
         cursor: isSelectingCoordinate && !isPassengerMode
           ? 'crosshair'
