@@ -1,3 +1,5 @@
+import { isTokenExpired } from './client';
+
 export type TelemetryCallback = (data: any) => void;
 export type ConnectionStatusCallback = (isConnected: boolean) => void;
 
@@ -28,9 +30,15 @@ class WebSocketClient {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
     let effectiveToken = token;
+    if (effectiveToken && isTokenExpired(effectiveToken)) {
+      effectiveToken = null;
+    }
     if (!effectiveToken && typeof window !== 'undefined') {
       try {
-        effectiveToken = sessionStorage.getItem('airport_passenger_token');
+        const stored = sessionStorage.getItem('airport_passenger_token');
+        if (stored && !isTokenExpired(stored)) {
+          effectiveToken = stored;
+        }
       } catch {
         // ignore
       }

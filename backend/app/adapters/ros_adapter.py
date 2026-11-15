@@ -23,6 +23,8 @@ try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
     from rclpy.action import ActionClient
+    from rclpy.executors import ExternalShutdownException, ShutdownException
+    from rclpy.signals import SignalHandlerOptions
     from action_msgs.msg import GoalStatus, GoalStatusArray
     from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped
     from sensor_msgs.msg import BatteryState
@@ -34,6 +36,11 @@ try:
     HAS_RCLPY = True
 except ImportError:
     HAS_RCLPY = False
+    class ExternalShutdownException(Exception): pass
+    class ShutdownException(Exception): pass
+    class SignalHandlerOptions:
+        NO = 0
+        ALL = 1
     class GoalStatus:
         STATUS_UNKNOWN = 0
         STATUS_ACCEPTED = 1
@@ -148,10 +155,18 @@ class RosRobotAdapter(BaseRobotAdapter):
         self._sim_restarted: bool = False                      # True nếu clock quay lùi
         self._pose_epoch: int = 0                              # tăng mỗi khi sim restart
         self._pose_received_epoch: int = -1                    # epoch lúc nhận pose cuối
+        self._disposed: bool = False
+        self._last_map_time: float = 0.0
+        self._first_pose_logged: bool = False
+        self._first_map_logged: bool = False
+        self._first_clock_logged: bool = False
 
         # Khởi tạo Node ROS 2 với tên từ cấu hình
         if not rclpy.ok():
-            rclpy.init()
+            try:
+                rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+            except Exception:
+                rclpy.init()
 
         node_name = self._cfg.merged_config.get("nodes", {}).get("web_gateway", "airport_web_gateway").lstrip("/")
         self._node = rclpy.create_node(node_name)
@@ -162,13 +177,41 @@ class RosRobotAdapter(BaseRobotAdapter):
 
         self._setup_subscribers_and_clients()
 
-        # Thread spin ROS
+        # Thread spin ROS với worker chống sập
         self._executor = rclpy.executors.SingleThreadedExecutor()
         self._executor.add_node(self._node)
-        self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._spin_thread = threading.Thread(target=self._spin_worker, daemon=True, name="ros_spin_thread")
         self._spin_thread.start()
 
         logger.info(f"RosRobotAdapter đã khởi tạo hoàn tất với node [{node_name}]")
+
+    def _spin_worker(self):
+        """Worker loop cho luồng spin ROS 2 có khả năng chống sập và bắt biệt lệ shutdown an toàn"""
+        while not getattr(self, "_disposed", False) and rclpy.ok():
+            try:
+                self._executor.spin()
+            except (ExternalShutdownException, ShutdownException):
+                break
+            except Exception as e:
+                if not getattr(self, "_disposed", False):
+                    logger.error(f"Lỗi không mong muốn trong luồng spin ROS 2: {e}", exc_info=True)
+                    time.sleep(0.5)
+
+    def ensure_spinning(self) -> bool:
+        """Kiểm tra và phục hồi luồng spin ROS nếu bị dừng bất thường"""
+        if getattr(self, "_disposed", False) or not rclpy.ok():
+            return False
+        with self._lock:
+            if not hasattr(self, "_spin_thread") or self._spin_thread is None or not self._spin_thread.is_alive():
+                logger.warning("Phát hiện luồng spin ROS đã dừng. Đang tự động khởi động lại luồng spin...")
+                try:
+                    self._spin_thread = threading.Thread(target=self._spin_worker, daemon=True, name="ros_spin_thread")
+                    self._spin_thread.start()
+                    return True
+                except Exception as e:
+                    logger.error(f"Không thể khởi động lại luồng spin: {e}")
+                    return False
+        return True
 
     def _setup_subscribers_and_clients(self):
         # 1. Pose Topic — chọn message class và callback theo type trong YAML
@@ -603,17 +646,23 @@ class RosRobotAdapter(BaseRobotAdapter):
                 if self._last_clock_sec is not None:
                     if (now_mono - self._last_clock_monotonic) > 3.0:
                         self._clock_stalled = True
+                    else:
+                        # Clock đang tiến triển bình thường
+                        if self._sim_restarted and (now_mono - self._last_clock_monotonic) < 1.0:
+                            if self._pose is not None:
+                                self._sim_restarted = False
+                else:
+                    self._clock_stalled = True
 
-                # Pose hợp lệ: đã nhận ít nhất 1 pose VÀ pose thuộc epoch hiện tại
+                # Pose hợp lệ: đã nhận ít nhất 1 pose
                 has_valid_pose = (
                     self._pose is not None
-                    and self._pose_received_epoch == self._pose_epoch
+                    and (not self._sim_restarted or self._pose_received_epoch == self._pose_epoch)
                 )
 
                 # is_connected cho sim:
-                # - True nếu có pose hợp lệ (robot đứng yên vẫn connected)
-                # - False nếu chưa nhận pose nào, hoặc sim restarted chưa có pose mới
-                is_conn = has_valid_pose
+                # - True nếu có pose hợp lệ và sim clock đang hoạt động
+                is_conn = has_valid_pose and not self._clock_stalled
 
                 # is_data_stale cho sim:
                 # - Clock stalled → dữ liệu không được cập nhật (sim không tiến)
@@ -629,7 +678,10 @@ class RosRobotAdapter(BaseRobotAdapter):
 
                 # Message mô tả trạng thái
                 if self._pose is None:
-                    status_message = "Đang chờ dữ liệu vị trí từ AMCL..."
+                    if self._last_clock_sec is None:
+                        status_message = "Đang chờ mô phỏng Gazebo/Nav2 khởi động..."
+                    else:
+                        status_message = "Đang chờ dữ liệu vị trí từ AMCL..."
                 elif self._clock_stalled:
                     status_message = "Mô phỏng không cập nhật (clock ngừng tiến)"
                 elif self._sim_restarted and not has_valid_pose:
@@ -667,6 +719,10 @@ class RosRobotAdapter(BaseRobotAdapter):
                 "stamp": self._pose_stamp,
                 "map_version": self._map_version,
                 "destinations_version": getattr(self, "_destinations_version", 0),
+                "spin_thread_alive": bool(hasattr(self, "_spin_thread") and self._spin_thread and self._spin_thread.is_alive()),
+                "last_clock_time": self._last_clock_monotonic,
+                "last_pose_time": self._last_pose_time,
+                "last_map_time": getattr(self, "_last_map_time", 0.0),
             }
 
             # Thông tin bổ sung cho sim profile
@@ -1633,7 +1689,10 @@ class RosRobotAdapter(BaseRobotAdapter):
             return self._map_png
 
     def dispose(self) -> None:
+        self._disposed = True
         try:
+            if hasattr(self, "_executor") and self._executor:
+                self._executor.shutdown()
             if hasattr(self, "_node") and self._node:
                 self._node.destroy_node()
             if rclpy.ok():

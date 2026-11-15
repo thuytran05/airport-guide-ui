@@ -12,6 +12,8 @@ async def test_health_check():
         data = res.json()
         assert data["status"] == "healthy"
         assert data["active_profile"] in ("sim", "real")
+        assert "spin_thread_alive" in data
+        assert "robot_connected" in data
 
 @pytest.mark.anyio
 async def test_passenger_and_admin_permissions():
@@ -87,3 +89,42 @@ def test_coordinate_transforms():
     ros_pose = canvas_to_ros_pose(400.0, 250.0, 0.0, meta)
     assert abs(ros_pose["x"] - 0.0) < 0.01
     assert abs(ros_pose["y"] - 0.0) < 0.01
+
+def test_sensitive_data_filter_redacts_tokens():
+    import logging
+    from app.main import SensitiveDataFilter
+    f = SensitiveDataFilter()
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg='GET /ws?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0 HTTP/1.1 101',
+        args=(),
+        exc_info=None
+    )
+    res = f.filter(record)
+    assert res is True
+    assert "token=***REDACTED***" in record.msg
+    assert "eyJ" not in record.msg
+
+@pytest.mark.anyio
+async def test_expired_token_handling_in_map_endpoint():
+    expired_token = create_access_token(
+        data={"sub": "usr-admin-01", "username": "admin", "role": "admin"},
+        expires_delta_seconds=-10
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Gửi token hết hạn -> 401
+        res = await client.get("/api/robot/map", headers={"Authorization": f"Bearer {expired_token}"})
+        assert res.status_code == 401
+
+        # Tạo session hành khách hợp lệ -> X-Passenger-Token
+        sess_res = await client.post("/api/auth/session")
+        assert sess_res.status_code == 200
+        p_token = sess_res.json()["session_token"]
+
+        # Với X-Passenger-Token hợp lệ, không bị lỗi 401 (trả về 200 hoặc 404 tùy adapter nạp map)
+        res2 = await client.get("/api/robot/map", headers={"X-Passenger-Token": p_token})
+        assert res2.status_code in (200, 404)
+

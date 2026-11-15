@@ -1,8 +1,8 @@
-# Biên Bản Bàn Giao Triển Khai & Kiểm Thử Toàn Diện Giai Đoạn C (Part 1, Part 2, Part 3, Part 4 & Part 5: Pause & Resume)
+# Biên Bản Bàn Giao Triển Khai & Kiểm Thử Toàn Diện Giai Đoạn C (Part 1, Part 2, Part 3, Part 4, Part 5: Pause & Resume & Part 6: Boot Lifecycle & Auth Recovery)
 **Dự án:** Airport Guide Robot UI (`airport-guide-ui`)  
 **Môi trường:** ROS 2 Jazzy (Docker, Domain ID 0, Sim Time = True)  
-**Thời gian cập nhật:** 14/11/2026  
-**Trạng thái nghiệm thu:** **19 / 19 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, **Pause & Resume Navigation Architecture Completed & Verified**.
+**Thời gian cập nhật:** 15/11/2026  
+**Trạng thái nghiệm thu:** **21 / 21 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, Pause & Resume Navigation Architecture Completed, **Startup Lifecycle & Expired Token Recovery Fully Verified**.
 
 ---
 
@@ -487,3 +487,73 @@ INFO:     127.0.0.1:0 - "POST /api/robot/navigate HTTP/1.1" 200 OK
 2. **Kiểm thử trực quan giao diện (Automated Browser QA):**
    - **Thử nghiệm Bug 2:** Thực hiện liên tục 3 chu kỳ Login Admin ➔ Logout ➔ Login Admin mà không tải lại trang (0 lần F5). Huy hiệu kết nối `Gateway: OK` và `Robot: OK` duy trì liên tục, ổn định tuyệt đối, không có hiện tượng nhấp nháy, 0 lỗi network.
    - **Thử nghiệm Bug 3:** Đặt con trỏ chuột trong MapView, lăn chuột phóng to và thu nhỏ bản đồ (scale biến thiên `0.96` ➔ `0.83` ➔ `0.96`). Vị trí header và thân trang web giữ nguyên tọa độ `y = 0`, không bị xê dịch dù chỉ 1 pixel.
+
+---
+
+## 10. BÁO CÁO KHẮC PHỤC LỖI KHỞI ĐỘNG HỆ THỐNG & TỰ PHỤC HỒI PHIÊN XÁC THỰC (LƯỢT 15/11/2026)
+
+### 10.1. Khắc Phục Bài Toán Thứ Tự Khởi Động (Backend Chạy Trước Gazebo/Nav2)
+- **Vấn đề đã xảy ra:** Khi hệ thống bật máy hoặc backend khởi động trước Gazebo/Nav2:
+  - `rclpy` đăng ký default signal handler gây xung đột với event loop tín hiệu shutdown của Uvicorn.
+  - Khi Gazebo tắt/bật lại, clock bị reset về 0 làm tăng `_pose_epoch`. Do AMCL chỉ phát `/amcl_pose` khi robot dịch chuyển, khi robot đứng yên, backend bị kẹt trong trạng thái epoch mismatch khiến `has_valid_pose` luôn bằng `False` và `robot_connected=false`.
+  - Luồng `spin` của ROS node gặp `ExternalShutdownException` thoát mà không được phục hồi tự động, dẫn tới `airport_web_gateway` biến mất khỏi bảng node của ROS 2.
+- **Giải pháp triển khai:**
+  1. Khởi tạo `rclpy.init(signal_handler_options=SignalHandlerOptions.NO)` để nhường hoàn toàn việc xử lý tín hiệu OS cho Uvicorn, loại bỏ xung đột ngắt ngoài ý muốn.
+  2. Bọc luồng `_spin_worker()` với bộ bắt ngoại lệ có kiểm soát cho `ExternalShutdownException` và `ShutdownException`.
+  3. Bổ sung cơ chế tự phục hồi luồng spin (`ensure_spinning()` watchdog) được gọi định kỳ từ vòng lặp Telemetry Broadcaster (5Hz). Nếu luồng spin bị gián đoạn ngoài ý muốn, hệ thống tự động khởi tạo lại executor và tạo luồng mới mà không cần can thiệp thủ công hay restart container.
+  4. Chuẩn hóa đồng bộ epoch AMCL trong `get_status()`: Khi `/clock` bắt đầu tăng tiến trở lại và đã có dữ liệu AMCL hợp lệ, hệ thống tự động đồng bộ epoch giúp `robot_connected=true` ngay cả khi robot đang đứng yên tại chỗ.
+  5. Bổ sung trường chẩn đoán chi tiết vào API `/api/health`: `spin_thread_alive: true`, `last_clock_time`, `last_pose_time`, `last_map_time`.
+
+### 10.2. Chống Lặp Lỗi 401 Unauthorized & Tự Động Phục Hồi Phiên Hành Khách
+- **Vấn đề đã xảy ra:**
+  - Người dùng từng đăng nhập Admin, sau đó token JWT lưu trong `localStorage` hết hạn.
+  - Khi mở lại trang web ở giao diện Hành khách (`/`), `AuthContext` nạp token hết hạn và gửi kèm header `Authorization: Bearer <expired_token>` cho mọi request `GET /api/robot/map`.
+  - Backend trả về HTTP 401. Vòng lặp telemetry 5Hz phát hiện `rob.map_version !== activeMapVersion` liên tục kích hoạt `fetchMapData()`, tạo thành cơn bão gửi request 401 vô hạn (5 lần/giây), giao diện báo lỗi đỏ và không hiển thị bản đồ.
+- **Giải pháp triển khai:**
+  1. **Hàm tiện ích `isTokenExpired(token)`:** Giải mã phần payload JWT và kiểm tra hạn sử dụng `exp` với vùng đệm an toàn 5 giây.
+  2. **Dọn dẹp token hết hạn ngay khi khởi tạo (`AuthContext`):** Tự động xóa `airport_robot_jwt` và `airport_robot_user` khỏi `localStorage` nếu token đã hết hạn, trả trạng thái về Hành khách vãng lai hợp lệ.
+  3. **Cơ chế phục hồi phiên đơn luồng (Single-flight `ensurePassengerToken`):**
+     - Mọi request đồng thời cùng chia sẻ một Promise yêu cầu phiên `POST /api/auth/session` duy nhất, không tạo nhiều request cấp session trùng lặp.
+  4. **Tự động bắt lỗi 401 và thử lại một lần duy nhất (`ApiClient.request`):**
+     - Nếu phát hiện token Admin hết hạn, tự động thu hồi và thông báo cho AuthContext.
+     - Trên giao diện Hành khách: tự động gọi `ensurePassengerToken(true)` lấy token phiên khách mới, gỡ bỏ `Authorization` lỗi và gửi lại request với `X-Passenger-Token`. Người dùng thấy bản đồ tải bình thường, hoàn toàn không gặp lỗi gián đoạn.
+     - Trên giao diện Admin: nhận diện phiên hết hạn và tự động chuyển hướng an toàn về `/login` với thông báo đăng nhập lại rõ ràng.
+  5. **Bộ đệm chống spam 5Hz (`RobotContext.fetchMapData`):** Bổ sung ref `lastFailedMapRef` — nếu một phiên bản bản đồ vừa gặp lỗi, áp dụng khoảng giãn cách (backoff) tối thiểu 5 giây trước khi cho phép thử lại, triệt tiêu hoàn toàn hiện tượng flood request 5Hz.
+
+### 10.3. Che Giấu Bí Mật (Token Redaction) Trong Toàn Bộ Nhật Ký
+- **Uvicorn Access, Error & Websockets Log (`backend/app/main.py`):**
+  - Cài đặt `SensitiveDataFilter(logging.Filter)` với biểu thức chính quy `token=[A-Za-z0-9_\.\-]+` thay thế thành `token=***REDACTED***`.
+  - Gắn filter tập trung cho mọi logger `uvicorn`, `uvicorn.access`, `uvicorn.error`, `uvicorn.asgi` và toàn bộ handlers của chúng ngay khi khởi động và trong `lifespan`.
+  - Che giấu hoàn toàn query parameter `token=...` trong các bản ghi `WebSocket /ws?token=***REDACTED*** [accepted]` và `GET /ws?token=***REDACTED***`.
+- **Nginx Access Log (`frontend/nginx.conf`):**
+  - Cấu hình chỉ thị `map $request_uri $redacted_request_uri`:
+    ```nginx
+    map $request_uri $redacted_request_uri {
+        ~*(.*token=)[^&]+(.*)  $1***REDACTED***$2;
+        default                $request_uri;
+    }
+    ```
+  - Áp dụng định dạng log tùy chỉnh `log_format redacted` cho `access_log /var/log/nginx/access.log redacted`, ngăn chặn hoàn toàn việc rò rỉ token JWT trong access log của web server.
+
+### 10.4. Kết Quả Kiểm Thử Toàn Diện
+1. **Kiểm thử tự động Backend (Pytest):**
+   - Chạy toàn bộ 21 test case trong container `airport_guide_backend`: **21 / 21 PASSED (100%)**.
+   - Bổ sung các bài thử mới:
+     - `test_sensitive_data_filter_redacts_tokens`: Xác thực regex che dấu token JWT trong nhật ký.
+     - `test_expired_token_handling_in_map_endpoint`: Xác thực endpoint `/api/robot/map` trả về 401 khi dùng token hết hạn và chấp nhận `X-Passenger-Token` từ phiên khách hợp lệ.
+     - `test_health_check`: Kiểm tra trường `spin_thread_alive` và trạng thái kết nối ROS.
+2. **Kiểm thử Build Frontend:**
+   - Biên dịch thành công 100% với Vite & TypeScript trong container Docker `airport_guide_frontend`.
+3. **Kiểm thử trực quan giao diện (Automated Browser QA):**
+   - **Giao diện Hành khách:** Bản đồ OccupancyGrid, marker robot định hướng, và 4 điểm đến hiển thị sắc nét, ổn định. Gateway: OK, Robot: OK.
+   - **Thử nghiệm khôi phục phiên hết hạn:** Nạp token admin hết hạn vào `localStorage` và reload trang `http://localhost:5173/`. Hệ thống tự động thu hồi token, cấp session hành khách mới, không xuất hiện bất kỳ cảnh báo 401 nào, bản đồ tải thành công ngay lập tức.
+   - **Thử nghiệm phân quyền trang Admin:** Điều hướng tới `/admin` khi phiên hết hạn tự động chuyển hướng về `/login`. Đăng nhập lại với `admin`/`admin123` hiển thị đầy đủ dashboard quản trị và bản đồ ROS.
+   - **Bằng chứng hình ảnh:**
+     - [Bản đồ và marker giao diện Hành khách](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/browser_evidence/fa2814f0-93a9-4ea7-b13b-f44a0e0cd99c/passenger_view_initial.png)
+     - [Tự động chuyển hướng về Login khi vào Admin](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/browser_evidence/fa2814f0-93a9-4ea7-b13b-f44a0e0cd99c/admin_redirect_login.png)
+     - [Admin Dashboard sau khi đăng nhập](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/browser_evidence/fa2814f0-93a9-4ea7-b13b-f44a0e0cd99c/admin_dashboard_authenticated.png)
+     - [Giao diện Hành khách tự phục hồi sau khi dọn dẹp token hết hạn](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/browser_evidence/fa2814f0-93a9-4ea7-b13b-f44a0e0cd99c/passenger_session_recovered.png)
+     - [Ảnh chụp kết thúc bước kiểm thử](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/browser_evidence/fa2814f0-93a9-4ea7-b13b-f44a0e0cd99c/final_step_75.png)
+4. **Cam kết an toàn:**
+   - Hoàn toàn ở chế độ Read-Only đối với hệ ROS và mô phỏng Gazebo. Không gửi goal, không phát lệnh vận tốc `cmd_vel`. Không commit hay push lên git repository.
+

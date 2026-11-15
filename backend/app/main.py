@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, status
@@ -14,15 +15,47 @@ from .api.auth_router import router as auth_router
 from .api.robot_router import router as robot_router
 from .ros_config import get_ros_config
 
+class SensitiveDataFilter(logging.Filter):
+    """Lọc và che dấu token JWT trong URL hoặc log messages của Uvicorn/Web Gateway"""
+    _TOKEN_REGEX = re.compile(r'token=[A-Za-z0-9_\.\-]+')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._TOKEN_REGEX.sub('token=***REDACTED***', record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: (self._TOKEN_REGEX.sub('token=***REDACTED***', v) if isinstance(v, str) else v)
+                    for k, v in record.args.items()
+                }
+            elif isinstance(record.args, (list, tuple)):
+                record.args = tuple(
+                    self._TOKEN_REGEX.sub('token=***REDACTED***', a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+        return True
+
 # Thiết lập logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
+
+def apply_sensitive_filter():
+    f = SensitiveDataFilter()
+    for log_name in ("", "uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+        lg = logging.getLogger(log_name)
+        lg.addFilter(f)
+        for h in lg.handlers:
+            h.addFilter(f)
+
+apply_sensitive_filter()
+
 logger = logging.getLogger("backend_main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    apply_sensitive_filter()
     ros_cfg = get_ros_config()
     logger.info(
         f"Khởi động Airport Guide Backend (Môi trường: {settings.APP_ENV}, "
@@ -80,6 +113,7 @@ async def health_check():
         "ros_domain_id": ros_cfg.ros_domain_id,
         "use_sim_time": ros_cfg.use_sim_time,
         "robot_connected": robot_status.get("is_connected", False),
+        "spin_thread_alive": robot_status.get("spin_thread_alive", True),
         "active_ws_clients": len(ws_manager.active_connections)
     }
 

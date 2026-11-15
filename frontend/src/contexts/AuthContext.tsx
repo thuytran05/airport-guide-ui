@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { User, UserRole } from '../types';
-import { apiClient } from '../api/client';
+import { apiClient, isTokenExpired } from '../api/client';
 
 interface AuthContextType {
   currentUser: User;
@@ -21,6 +21,17 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [currentUser, setCurrentUser] = useState<User>(() => {
+    const savedToken = localStorage.getItem('airport_robot_jwt');
+    if (!savedToken || isTokenExpired(savedToken)) {
+      try {
+        localStorage.removeItem('airport_robot_jwt');
+        localStorage.removeItem('airport_robot_user');
+      } catch {
+        // ignore
+      }
+      return DEFAULT_PASSENGER;
+    }
+
     const savedUser = localStorage.getItem('airport_robot_user');
     if (savedUser) {
       try {
@@ -34,8 +45,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   });
 
   const [token, setToken] = useState<string | null>(() => {
-    return localStorage.getItem('airport_robot_jwt');
+    const saved = localStorage.getItem('airport_robot_jwt');
+    if (saved && isTokenExpired(saved)) {
+      return null;
+    }
+    return saved;
   });
+
+  useEffect(() => {
+    const unsub = apiClient.onAuthError(() => {
+      try {
+        localStorage.removeItem('airport_robot_jwt');
+        localStorage.removeItem('airport_robot_user');
+      } catch {
+        // ignore
+      }
+      setToken(null);
+      setCurrentUser(DEFAULT_PASSENGER);
+    });
+    return unsub;
+  }, []);
 
   useEffect(() => {
     if (token) {
@@ -74,8 +103,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = () => {
     apiClient.clearToken();
-    localStorage.removeItem('airport_robot_jwt');
-    localStorage.removeItem('airport_robot_user');
+    try {
+      localStorage.removeItem('airport_robot_jwt');
+      localStorage.removeItem('airport_robot_user');
+    } catch {
+      // ignore
+    }
     setToken(null);
     setCurrentUser(DEFAULT_PASSENGER);
   };

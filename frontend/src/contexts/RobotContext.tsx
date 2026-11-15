@@ -72,6 +72,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
   const activeDestinationsVersionRef = useRef<number | null>(null);
   const fetchSeqRef = useRef<number>(0);
   const inFlightVersionRef = useRef<string | null>(null);
+  const lastFailedMapRef = useRef<{ version: string | null; time: number }>({ version: null, time: 0 });
 
   // 1. Tải danh sách điểm đến từ backend
   const refreshDestinations = useCallback(async () => {
@@ -92,6 +93,16 @@ export function RobotProvider({ children }: { children: ReactNode }) {
 
     // Nếu đang trong quá trình tải đúng version này rồi, tránh trùng lặp
     if (targetVersion && targetVersion === inFlightVersionRef.current) {
+      return;
+    }
+
+    // Throttle nếu phiên bản này vừa thất bại trong vòng 5 giây (tránh spam 5Hz khi lỗi token/mạng)
+    const now = Date.now();
+    if (
+      targetVersion &&
+      lastFailedMapRef.current.version === targetVersion &&
+      now - lastFailedMapRef.current.time < 5000
+    ) {
       return;
     }
 
@@ -129,6 +140,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
 
       activeMapVersionRef.current = meta.map_version;
       inFlightVersionRef.current = null;
+      lastFailedMapRef.current = { version: null, time: 0 };
 
       // Chỉ công bố cặp mới lên UI sau khi ảnh đã tải thành công
       setMapData(meta);
@@ -138,6 +150,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         console.warn('Lỗi khi tải bản đồ OccupancyGrid:', err);
         setMapError(err.message || 'Không thể tải bản đồ từ máy chủ.');
         inFlightVersionRef.current = null;
+        lastFailedMapRef.current = { version: targetVersion || null, time: Date.now() };
       }
     } finally {
       if (currentSeq === fetchSeqRef.current) {
@@ -148,11 +161,14 @@ export function RobotProvider({ children }: { children: ReactNode }) {
 
   const refreshMap = useCallback(async () => {
     activeMapVersionRef.current = null;
+    lastFailedMapRef.current = { version: null, time: 0 };
     await fetchMapData();
   }, [fetchMapData]);
 
   // 3. Kết nối WebSocket khi khởi động
   useEffect(() => {
+    activeMapVersionRef.current = null;
+    lastFailedMapRef.current = { version: null, time: 0 };
     wsClient.connect(token);
 
     const unsubStatus = wsClient.onStatusChange((connected) => {

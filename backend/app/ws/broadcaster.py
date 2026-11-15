@@ -29,6 +29,8 @@ async def telemetry_broadcaster_loop():
                 continue
 
             adapter = get_robot_adapter()
+            if hasattr(adapter, "ensure_spinning"):
+                adapter.ensure_spinning()
             now_ms = int(time.time() * 1000)
 
             # Thu thập trạng thái từ adapter
