@@ -15,7 +15,8 @@ export interface MapViewProps {
   customMapData?: MapData | null;
   backgroundMode?: MapBackgroundMode;
   isSelectingCoordinate?: boolean;
-  onCoordinateSelect?: (coords: { x: number; y: number }) => void;
+  onCoordinateSelect?: (coords: { x: number; y: number; yawDeg?: number }) => void;
+  onPickingGuide?: (msg: string) => void;
   previewPoint?: { x: number; y: number; yawDeg?: number } | null;
 }
 
@@ -96,6 +97,7 @@ export const MapView: React.FC<MapViewProps> = ({
   backgroundMode = 'ros',
   isSelectingCoordinate = false,
   onCoordinateSelect,
+  onPickingGuide,
   previewPoint = null,
 }) => {
   const {
@@ -116,6 +118,35 @@ export const MapView: React.FC<MapViewProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
   const currentPanRef = useRef({ x: 0, y: 0 });
+
+  // Trạng thái kéo-thả định hướng (RViz Drag-to-Orient)
+  const [orienting, setOrienting] = useState<{
+    startRos: { x: number; y: number };
+    startPx: number;
+    startPy: number;
+    currentPx: number;
+    currentPy: number;
+    screenDist: number;
+    headingDeg: number;
+    yawDeg: number;
+  } | null>(null);
+
+  // Hủy định hướng khi tắt chế độ chọn tọa độ hoặc nhấn Esc
+  useEffect(() => {
+    if (!isSelectingCoordinate) {
+      setOrienting(null);
+    }
+  }, [isSelectingCoordinate]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOrienting(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // Trạng thái kiểm tra sự tồn tại của file sơ đồ hành khách PNG
   const [passengerMapStatus, setPassengerMapStatus] = useState<'checking' | 'available' | 'missing'>('checking');
@@ -188,12 +219,116 @@ export const MapView: React.FC<MapViewProps> = ({
 
   const handleMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
+
+    // Chế độ chọn vị trí & hướng trên bản đồ ROS (Drag-to-Orient RViz style)
+    if (isSelectingCoordinate && backgroundMode === 'ros' && activeMap && svgRef.current) {
+      const svg = svgRef.current;
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const ctm = svg.getScreenCTM();
+      if (ctm) {
+        const inverseCTM = ctm.inverse();
+        const svgPoint = pt.matrixTransform(inverseCTM);
+        const meta = activeMap.metadata;
+        if (
+          svgPoint.x >= 0 &&
+          svgPoint.x <= meta.width &&
+          svgPoint.y >= 0 &&
+          svgPoint.y <= meta.height
+        ) {
+          const ros = projectMapPixelToRos(
+            svgPoint.x,
+            svgPoint.y,
+            meta.origin_x,
+            meta.origin_y,
+            meta.origin_yaw,
+            meta.resolution,
+            meta.height
+          );
+          dragStartRef.current = { x: e.clientX, y: e.clientY };
+          setOrienting({
+            startRos: { x: Number(ros.rosX.toFixed(2)), y: Number(ros.rosY.toFixed(2)) },
+            startPx: svgPoint.x,
+            startPy: svgPoint.y,
+            currentPx: svgPoint.x,
+            currentPy: svgPoint.y,
+            screenDist: 0,
+            headingDeg: 0,
+            yawDeg: 0,
+          });
+          return;
+        }
+      }
+    }
+
     setIsDragging(true);
     dragStartRef.current = { x: e.clientX, y: e.clientY };
     currentPanRef.current = { ...pan };
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
+    if (orienting && activeMap && svgRef.current) {
+      const svg = svgRef.current;
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const ctm = svg.getScreenCTM();
+      if (ctm) {
+        const inverseCTM = ctm.inverse();
+        const svgPoint = pt.matrixTransform(inverseCTM);
+        const meta = activeMap.metadata;
+        const screenDist = Math.hypot(e.clientX - dragStartRef.current.x, e.clientY - dragStartRef.current.y);
+
+        if (screenDist >= 15) {
+          const currRos = projectMapPixelToRos(
+            svgPoint.x,
+            svgPoint.y,
+            meta.origin_x,
+            meta.origin_y,
+            meta.origin_yaw,
+            meta.resolution,
+            meta.height
+          );
+          const dx = currRos.rosX - orienting.startRos.x;
+          const dy = currRos.rosY - orienting.startRos.y;
+          const yawRad = Math.atan2(dy, dx);
+          let yawDeg = Math.round((yawRad * 180) / Math.PI);
+          if (yawDeg > 180) yawDeg -= 360;
+          if (yawDeg <= -180) yawDeg += 360;
+
+          const pdx = svgPoint.x - orienting.startPx;
+          const pdy = svgPoint.y - orienting.startPy;
+          const headingDeg = (Math.atan2(pdy, pdx) * 180) / Math.PI;
+
+          setOrienting((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  currentPx: svgPoint.x,
+                  currentPy: svgPoint.y,
+                  screenDist,
+                  headingDeg,
+                  yawDeg,
+                }
+              : null
+          );
+        } else {
+          setOrienting((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  currentPx: svgPoint.x,
+                  currentPy: svgPoint.y,
+                  screenDist,
+                }
+              : null
+          );
+        }
+      }
+      return;
+    }
+
     if (!isDragging) return;
     setPan({
       x: currentPanRef.current.x + (e.clientX - dragStartRef.current.x),
@@ -202,54 +337,26 @@ export const MapView: React.FC<MapViewProps> = ({
   };
 
   const handleMouseUp = (e: React.MouseEvent) => {
-    if (isDragging) {
-      const dx = e.clientX - dragStartRef.current.x;
-      const dy = e.clientY - dragStartRef.current.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      setIsDragging(false);
-
-      // Nếu chỉ là một lần nhấp (dist <= 5px, không kéo pan) và đang ở chế độ chọn tọa độ trên bản đồ ROS
-      if (
-        dist <= 5 &&
-        isSelectingCoordinate &&
-        onCoordinateSelect &&
-        backgroundMode === 'ros' &&
-        activeMap &&
-        svgRef.current
-      ) {
-        const svg = svgRef.current;
-        const pt = svg.createSVGPoint();
-        pt.x = e.clientX;
-        pt.y = e.clientY;
-        const ctm = svg.getScreenCTM();
-        if (ctm) {
-          const inverseCTM = ctm.inverse();
-          const svgPoint = pt.matrixTransform(inverseCTM);
-          const meta = activeMap.metadata;
-          // Kiểm tra nhấp nằm trong khung ảnh hợp lệ
-          if (
-            svgPoint.x >= 0 &&
-            svgPoint.x <= meta.width &&
-            svgPoint.y >= 0 &&
-            svgPoint.y <= meta.height
-          ) {
-            const ros = projectMapPixelToRos(
-              svgPoint.x,
-              svgPoint.y,
-              meta.origin_x,
-              meta.origin_y,
-              meta.origin_yaw,
-              meta.resolution,
-              meta.height
-            );
-            onCoordinateSelect({
-              x: Number(ros.rosX.toFixed(2)),
-              y: Number(ros.rosY.toFixed(2)),
-            });
-          }
-        }
+    if (orienting) {
+      if (orienting.screenDist >= 15) {
+        onCoordinateSelect?.({
+          x: orienting.startRos.x,
+          y: orienting.startRos.y,
+          yawDeg: orienting.yawDeg,
+        });
+      } else {
+        // Kéo ngắn hoặc click một điểm: chỉ lấy tọa độ X, Y; không tự ý gán yaw 0
+        onCoordinateSelect?.({
+          x: orienting.startRos.x,
+          y: orienting.startRos.y,
+        });
+        onPickingGuide?.('Kéo chuột từ vị trí ghim để chọn hướng (Yaw), hoặc tự nhập góc trong ô Yaw');
       }
-    } else {
+      setOrienting(null);
+      return;
+    }
+
+    if (isDragging) {
       setIsDragging(false);
     }
   };
@@ -470,7 +577,13 @@ export const MapView: React.FC<MapViewProps> = ({
       {/* Banner chế độ chọn tọa độ */}
       {isSelectingCoordinate && !isPassengerMode && (
         <div className={styles.coordinatePickerBanner}>
-          <span>🎯 Nhấp vào một điểm trên Bản đồ ROS để lấy tọa độ X, Y</span>
+          <span>
+            {orienting && orienting.screenDist >= 15
+              ? `🎯 Đang chọn hướng: Yaw = ${orienting.yawDeg}° (Thả chuột để xác nhận)`
+              : orienting
+              ? '🎯 Giữ chuột và kéo để xoay hướng (Yaw) theo ý muốn'
+              : '📍 Nhấn và kéo chuột trên bản đồ để chọn vị trí & hướng (hoặc nhấp chỉ chọn vị trí)'}
+          </span>
         </div>
       )}
 
@@ -672,6 +785,82 @@ export const MapView: React.FC<MapViewProps> = ({
               stroke="#FFFFFF"
               strokeWidth={1}
             />
+          </g>
+        )}
+
+        {/* Mũi tên định hướng tương tác RViz khi kéo-thả (Drag-to-Orient) */}
+        {orienting && (
+          <g className={styles.orientingGroup}>
+            {/* Điểm ghim bắt đầu */}
+            <circle
+              cx={orienting.startPx}
+              cy={orienting.startPy}
+              r={6 * markerScreenScale}
+              fill="#2563EB"
+              stroke="#FFFFFF"
+              strokeWidth={1.5 * markerScreenScale}
+            />
+            {orienting.screenDist >= 15 ? (
+              <>
+                {/* Đường thân mũi tên từ điểm bắt đầu đến con trỏ */}
+                <line
+                  x1={orienting.startPx}
+                  y1={orienting.startPy}
+                  x2={orienting.currentPx}
+                  y2={orienting.currentPy}
+                  stroke="#2563EB"
+                  strokeWidth={3 * markerScreenScale}
+                  strokeLinecap="round"
+                />
+                {/* Đầu mũi tên tại vị trí con trỏ */}
+                <g
+                  transform={`translate(${orienting.currentPx}, ${orienting.currentPy}) rotate(${orienting.headingDeg}) scale(${markerScreenScale})`}
+                >
+                  <polygon
+                    points="0,0 -14,-7 -14,7"
+                    fill="#2563EB"
+                    stroke="#FFFFFF"
+                    strokeWidth={1.5}
+                  />
+                </g>
+                {/* Thẻ hiển thị góc Yaw */}
+                <g
+                  transform={`translate(${orienting.currentPx}, ${orienting.currentPy - 16 * markerScreenScale}) scale(${markerScreenScale})`}
+                >
+                  <rect
+                    x={-24}
+                    y={-14}
+                    width={48}
+                    height={16}
+                    rx={4}
+                    fill="rgba(15, 23, 42, 0.92)"
+                    stroke="#2563EB"
+                    strokeWidth={1}
+                  />
+                  <text
+                    x={0}
+                    y={-3}
+                    textAnchor="middle"
+                    fill="#FFFFFF"
+                    fontSize={10}
+                    fontWeight="bold"
+                  >
+                    {orienting.yawDeg}°
+                  </text>
+                </g>
+              </>
+            ) : (
+              /* Vòng tròn gợi ý kéo chuột */
+              <circle
+                cx={orienting.startPx}
+                cy={orienting.startPy}
+                r={16 * markerScreenScale}
+                fill="rgba(37, 99, 235, 0.15)"
+                stroke="#2563EB"
+                strokeWidth={1.5 * markerScreenScale}
+                strokeDasharray={`${4 * markerScreenScale} ${2 * markerScreenScale}`}
+              />
+            )}
           </g>
         )}
       </svg>

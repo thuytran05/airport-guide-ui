@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 class BaseRobotAdapter(ABC):
     @abstractmethod
@@ -84,6 +84,13 @@ class BaseRobotAdapter(ABC):
     def clear_voice_proposal(self) -> None:
         """Xóa đề xuất điểm đến giọng nói sau khi xác nhận, bỏ qua hoặc hết hạn"""
         pass
+
+    def can_manual_control(self, operator_id: str = "") -> Tuple[bool, Optional[str]]:
+        """
+        Kiểm tra xem phiên Admin có đủ điều kiện lái tay ngay lúc này không.
+        Trả về (can_drive, lock_reason).
+        """
+        return (True, None)
 
     @abstractmethod
     def set_manual_control(self, enable: bool, operator_id: str = "", force: bool = False) -> Dict[str, Any]:

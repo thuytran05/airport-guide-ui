@@ -44,12 +44,12 @@ export default function AdminDashboard() {
     }
   }, [destinations, selectedNavDestId]);
 
-  // Form thêm / sửa điểm đến
+  // Form thêm / sửa điểm đến (Khởi tạo chuỗi rỗng để không ép giá trị 0)
   const [destId, setDestId] = useState('');
   const [destName, setDestName] = useState('');
-  const [destX, setDestX] = useState('0.0');
-  const [destY, setDestY] = useState('0.0');
-  const [destYaw, setDestYaw] = useState('0');
+  const [destX, setDestX] = useState('');
+  const [destY, setDestY] = useState('');
+  const [destYaw, setDestYaw] = useState('');
   const [destMsg, setDestMsg] = useState<string | null>(null);
   const [isSavingDest, setIsSavingDest] = useState(false);
 
@@ -60,7 +60,7 @@ export default function AdminDashboard() {
   const [deleteActionError, setDeleteActionError] = useState<string | null>(null);
   const [deleteSuccessMsg, setDeleteSuccessMsg] = useState<string | null>(null);
 
-  // Chế độ chọn tọa độ trên bản đồ ROS và sao chép YAML
+  // Chế độ chọn vị trí & hướng trên bản đồ ROS và sao chép YAML
   const [isPickingCoord, setIsPickingCoord] = useState(false);
   const [copySuccessMsg, setCopySuccessMsg] = useState<string | null>(null);
   const [showCopyModal, setShowCopyModal] = useState(false);
@@ -74,11 +74,16 @@ export default function AdminDashboard() {
     mapData.metadata.resolution > 0
   );
 
-  const handleCoordinateSelect = useCallback((coords: { x: number; y: number }) => {
+  const handleCoordinateSelect = useCallback((coords: { x: number; y: number; yawDeg?: number }) => {
     setDestX(coords.x.toFixed(2));
     setDestY(coords.y.toFixed(2));
+    if (coords.yawDeg !== undefined) {
+      setDestYaw(Math.round(coords.yawDeg).toString());
+      setDestMsg(`📍 Đã lấy vị trí & hướng: X=${coords.x.toFixed(2)}m, Y=${coords.y.toFixed(2)}m, Yaw=${Math.round(coords.yawDeg)}°`);
+    } else {
+      setDestMsg(`📍 Đã lấy vị trí từ bản đồ: X=${coords.x.toFixed(2)}m, Y=${coords.y.toFixed(2)}m`);
+    }
     setIsPickingCoord(false);
-    setDestMsg(`📍 Đã lấy tọa độ từ bản đồ: X=${coords.x.toFixed(2)}m, Y=${coords.y.toFixed(2)}m`);
   }, []);
 
   const handleTogglePicking = () => {
@@ -91,7 +96,7 @@ export default function AdminDashboard() {
         setMapMode('ros');
       }
       setIsPickingCoord(true);
-      setDestMsg('ℹ️ Chế độ chọn tọa độ: Click một điểm trên Bản đồ ROS để lấy X/Y.');
+      setDestMsg('ℹ️ Chế độ chọn vị trí & hướng: Nhấn và kéo chuột trên bản đồ để chọn tọa độ và góc xoay.');
     } else {
       setIsPickingCoord(false);
       setDestMsg(null);
@@ -100,23 +105,24 @@ export default function AdminDashboard() {
 
   // Preview Pin xem trước trên bản đồ (Điểm nháp)
   const previewPoint = useMemo(() => {
+    if (destX.trim() === '' || destY.trim() === '') return null;
     const x = parseFloat(destX);
     const y = parseFloat(destY);
-    const yawDeg = parseFloat(destYaw);
     if (isNaN(x) || isNaN(y)) return null;
+    const yawDeg = destYaw.trim() !== '' ? parseFloat(destYaw) : undefined;
     return {
       x,
       y,
-      yawDeg: isNaN(yawDeg) ? 0 : yawDeg,
+      yawDeg: isNaN(yawDeg as number) ? undefined : yawDeg,
     };
   }, [destX, destY, destYaw]);
 
   const generateYamlSnippet = () => {
     const id = destId.trim() || 'destination_id';
     const name = destName.trim() || 'Tên điểm đến';
-    const x = parseFloat(destX) || 0.0;
-    const y = parseFloat(destY) || 0.0;
-    const yawDeg = parseFloat(destYaw) || 0.0;
+    const x = destX.trim() !== '' ? parseFloat(destX) : 0.0;
+    const y = destY.trim() !== '' ? parseFloat(destY) : 0.0;
+    const yawDeg = destYaw.trim() !== '' ? parseFloat(destYaw) : 0.0;
     const yawRad = (yawDeg * Math.PI) / 180.0;
     const qz = Number(Math.sin(yawRad / 2).toFixed(4));
     const qw = Number(Math.cos(yawRad / 2).toFixed(4));
@@ -175,11 +181,17 @@ export default function AdminDashboard() {
     currentUser &&
     status.manualOperatorId !== currentUser.id
   );
-  const canDrive = isManual && hasConsumer && !isOccupiedByOther;
+
+  // Phân quyền lái tay trực tiếp (Direct Press-and-Hold)
+  const canDrive = Boolean(
+    status.canManualControl ??
+    (!isNavTripActive && status.isConnected && !status.isDataStale && hasConsumer && !isOccupiedByOther)
+  );
+  const manualLockReason = status.manualLockReason || (!hasConsumer ? 'Đường lệnh ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận' : null);
 
   // Đánh giá trạng thái sẵn sàng dẫn đường & phân tích lý do nếu bị khóa
+  // Dùng status.readiness từ backend làm nguồn sự thật duy nhất
   const readinessCheck = useMemo(() => {
-    // 1. Kiểm tra kết nối mạng / WebSocket Gateway
     if (!isBackendConnected) {
       return {
         ready: false,
@@ -190,40 +202,18 @@ export default function AdminDashboard() {
       };
     }
 
-    // 2. Kiểm tra kết nối ROS 2
-    if (!status.isConnected) {
+    if (status.readiness && !status.readiness.ready) {
+      const primaryReason = status.readiness.reasons[0] || 'Robot chưa sẵn sàng dẫn đường';
+      const isSevere = !status.isConnected || status.isDataStale;
       return {
         ready: false,
-        severity: 'err' as const,
-        title: 'Mất kết nối ROS 2',
-        badge: 'ROS OFFLINE',
-        reason: 'Backend chưa nhận được dữ liệu từ hệ thống ROS hoặc robot đang offline (chưa có clock/pose).',
+        severity: isSevere ? ('err' as const) : ('warn' as const),
+        title: primaryReason,
+        badge: isSevere ? 'LỖI HỆ THỐNG' : 'CHƯA SẴN SÀNG',
+        reason: status.readiness.reasons.join(' • '),
       };
     }
 
-    // 3. Kiểm tra dữ liệu ROS bị gián đoạn (Stale)
-    if (status.isDataStale) {
-      return {
-        ready: false,
-        severity: 'warn' as const,
-        title: 'Dữ liệu ROS bị gián đoạn (Stale)',
-        badge: 'DỮ LIỆU CŨ',
-        reason: 'Dữ liệu định vị hoặc mô phỏng tạm dừng cập nhật (> 1.5s hoặc clock mô phỏng không tiến).',
-      };
-    }
-
-    // 4. Kiểm tra định vị AMCL
-    if (!status.pose) {
-      return {
-        ready: false,
-        severity: 'warn' as const,
-        title: 'Đang chờ định vị AMCL',
-        badge: 'CHỜ AMCL',
-        reason: 'Robot chưa xác định được vị trí trong frame map. Đang chờ dữ liệu /amcl_pose.',
-      };
-    }
-
-    // 5. Kiểm tra bản đồ OccupancyGrid
     if (!hasValidMap) {
       return {
         ready: false,
@@ -234,31 +224,6 @@ export default function AdminDashboard() {
       };
     }
 
-    // 6. Kiểm tra chế độ điều khiển
-    if (status.controlMode === 'MANUAL') {
-      return {
-        ready: false,
-        severity: 'warn' as const,
-        title: 'Robot đang ở chế độ MANUAL',
-        badge: 'THỦ CÔNG',
-        reason: 'Robot đang được điều khiển bằng tay. Vui lòng chuyển sang AUTO để kích hoạt dẫn đường Nav2.',
-      };
-    }
-
-    // 7. Kiểm tra chuyến đi đang chạy
-    if (isNavTripActive) {
-      return {
-        ready: false,
-        severity: 'warn' as const,
-        title: isPaused ? 'Chuyến đi đang tạm dừng' : 'Đang có chuyến dẫn đường',
-        badge: status.navigationState,
-        reason: isPaused
-          ? 'Chuyến dẫn đường hiện đang tạm dừng. Bấm "TIẾP TỤC DẪN ĐƯỜNG" hoặc "HỦY CHUYẾN ĐI".'
-          : `Robot đang thực hiện nhiệm vụ điều hướng (${status.navigationState}).`,
-      };
-    }
-
-    // 8. Kiểm tra danh sách điểm đến
     if (destinations.length === 0) {
       return {
         ready: false,
@@ -269,7 +234,6 @@ export default function AdminDashboard() {
       };
     }
 
-    // 9. Chưa chọn điểm đến trong dropdown
     if (!selectedNavDestId) {
       return {
         ready: true,
@@ -280,7 +244,6 @@ export default function AdminDashboard() {
       };
     }
 
-    // 10. Hoàn toàn sẵn sàng và đã chọn điểm đến
     return {
       ready: true,
       severity: 'ready' as const,
@@ -290,14 +253,10 @@ export default function AdminDashboard() {
     };
   }, [
     isBackendConnected,
+    status.readiness,
     status.isConnected,
     status.isDataStale,
-    status.pose,
     hasValidMap,
-    status.controlMode,
-    isNavTripActive,
-    isPaused,
-    status.navigationState,
     destinations.length,
     selectedNavDestId,
   ]);
@@ -311,9 +270,12 @@ export default function AdminDashboard() {
   const activeVelRef = useRef<{ lin: number; ang: number }>({ lin: 0, ang: 0 });
   const activeHoldIdRef = useRef<string | null>(null);
   const holdSeqRef = useRef<number>(0);
+  const stopDriveRef = useRef<() => void>(() => {});
 
   const [showSystemDetails, setShowSystemDetails] = useState(false);
   const [isRefreshingEvents, setIsRefreshingEvents] = useState(false);
+
+  const isDrivingNow = Boolean(status.controlMode === 'MANUAL' && (status.isManualController || activeHoldIdRef.current));
 
   const handleRefreshEvents = async () => {
     setIsRefreshingEvents(true);
@@ -321,17 +283,6 @@ export default function AdminDashboard() {
       await refreshEvents();
     } finally {
       setIsRefreshingEvents(false);
-    }
-  };
-
-  const handleToggleManual = async () => {
-    setIsSwitchingMode(true);
-    setControlMsg(null);
-    const targetMode = !isManual;
-    const res = await setManualControl(targetMode);
-    setIsSwitchingMode(false);
-    if (!res.success) {
-      setControlMsg(res.message || 'Không thể đổi chế độ điều khiển.');
     }
   };
 
@@ -343,11 +294,15 @@ export default function AdminDashboard() {
     const finishedHoldId = activeHoldIdRef.current;
     activeHoldIdRef.current = null;
     activeVelRef.current = { lin: 0, ang: 0 };
-    holdSeqRef.current += 1;
-    if (isManual) {
-      sendManualVelocity(0, 0, holdSeqRef.current, finishedHoldId || undefined);
+    if (finishedHoldId) {
+      holdSeqRef.current += 1;
+      sendManualVelocity(0, 0, holdSeqRef.current, finishedHoldId);
     }
-  }, [isManual, sendManualVelocity]);
+  }, [sendManualVelocity]);
+
+  useEffect(() => {
+    stopDriveRef.current = stopDrive;
+  }, [stopDrive]);
 
   const startDrive = (lin: number, ang: number) => {
     if (!canDrive) return;
@@ -360,17 +315,18 @@ export default function AdminDashboard() {
     holdSeqRef.current = 1;
     activeVelRef.current = { lin, ang };
 
-    // Gửi ngay lập tức tick đầu tiên
-    sendManualVelocity(lin, ang, holdSeqRef.current, holdId);
+    // Gửi ngay lập tức tick đầu tiên (Backend tự động chuyển tạm sang MANUAL)
+    sendManualVelocity(lin, ang, 1, holdId);
 
     // Gửi chu kỳ 10Hz (100ms) trong khi còn giữ nút
     driveTimerRef.current = setInterval(async () => {
+      if (activeHoldIdRef.current !== holdId) return;
       holdSeqRef.current += 1;
       const ok = await sendManualVelocity(
         activeVelRef.current.lin,
         activeVelRef.current.ang,
         holdSeqRef.current,
-        activeHoldIdRef.current || undefined
+        holdId
       );
       if (!ok) {
         stopDrive();
@@ -380,9 +336,9 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     // Watchdog an toàn: Dừng robot nếu tab trình duyệt mất focus, ẩn hoặc unmount
-    const handleStop = () => stopDrive();
+    const handleStop = () => stopDriveRef.current();
     const handleVisibilityChange = () => {
-      if (document.hidden) stopDrive();
+      if (document.hidden) stopDriveRef.current();
     };
 
     window.addEventListener('blur', handleStop);
@@ -392,20 +348,25 @@ export default function AdminDashboard() {
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
-      stopDrive();
+      stopDriveRef.current();
       window.removeEventListener('blur', handleStop);
       window.removeEventListener('pagehide', handleStop);
       window.removeEventListener('pointerup', handleStop);
       window.removeEventListener('pointercancel', handleStop);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [stopDrive]);
+  }, []);
 
   const handleSaveDestination = async (e: React.FormEvent) => {
     e.preventDefault();
     setDestMsg(null);
     if (!destId.trim() || !destName.trim()) {
       setDestMsg('Vui lòng nhập ID và Tên điểm đến.');
+      return;
+    }
+
+    if (destX.trim() === '' || destY.trim() === '') {
+      setDestMsg('Vui lòng nhập đầy đủ tọa độ X và Y (hoặc chọn vị trí trên bản đồ).');
       return;
     }
 
@@ -417,7 +378,7 @@ export default function AdminDashboard() {
     }
 
     setIsSavingDest(true);
-    const yawDeg = parseFloat(destYaw) || 0.0;
+    const yawDeg = destYaw.trim() !== '' ? parseFloat(destYaw) : 0.0;
     const yawRad = (yawDeg * Math.PI) / 180;
 
     const newDest: Destination = {
@@ -441,6 +402,9 @@ export default function AdminDashboard() {
       setDestMsg(`✅ ${res.message || 'Đã lưu điểm đến thành công.'}`);
       setDestId('');
       setDestName('');
+      setDestX('');
+      setDestY('');
+      setDestYaw('');
     } else {
       setDestMsg(`❌ ${res.message || 'Lỗi khi lưu điểm đến.'}`);
     }
@@ -753,40 +717,17 @@ export default function AdminDashboard() {
                   </button>
                 </div>
               </div>
-              <div className={styles.mapHeaderRight}>
-                <button
-                  type="button"
-                  className={`${styles.modeBtn} ${isManual ? styles.manualActive : ''}`}
-                  onClick={handleToggleManual}
-                  disabled={isSwitchingMode || (!isManual && (!status.isConnected || isNavTripActive))}
-                  title={
-                    !isManual && !status.isConnected
-                      ? 'Robot chưa kết nối'
-                      : !isManual && isNavTripActive
-                      ? `Đang có chuyến dẫn đường (${status.navigationState}), không thể chuyển sang MANUAL`
-                      : isManual
-                      ? 'Chuyển về chế độ tự động AUTO'
-                      : 'Kích hoạt chế độ thủ công MANUAL'
-                  }
-                >
-                  {isSwitchingMode
-                    ? 'Đang chuyển...'
-                    : isManual
-                    ? 'TẮT THỦ CÔNG (VỀ AUTO)'
-                    : 'BẬT THỦ CÔNG (MANUAL)'}
-                </button>
-              </div>
             </div>
 
             {controlMsg && <div className={styles.mapBannerError}>{controlMsg}</div>}
 
-            {isManual && isOccupiedByOther && (
+            {isOccupiedByOther && (
               <div className={styles.mapBannerWarn}>
-                🔒 Quyền điều khiển tay đang thuộc về Admin: <strong>{status.manualOperatorId}</strong>. Bạn chỉ có thể theo dõi hoặc bấm &ldquo;TẮT THỦ CÔNG&rdquo; để dừng an toàn.
+                🔒 Quyền điều khiển tay đang thuộc về Admin: <strong>{status.manualOperatorId}</strong>. Bạn chỉ có thể theo dõi hoặc bấm nút &ldquo;Dừng&rdquo; trên bàn điều khiển để dừng khẩn cấp an toàn.
               </div>
             )}
 
-            {isManual && !hasConsumer && (
+            {!hasConsumer && (
               <div className={styles.mapBannerWarn}>
                 ⚠️ Đường lệnh điều khiển tay tới Gazebo (<code>/airport/cmd_vel_manual</code>) chưa có consumer (0 subscriber). Các nút vận tốc được khóa an toàn để tránh bỏ qua bộ phân luồng và các lớp an toàn (collision_monitor / velocity_smoother).
               </div>
@@ -800,52 +741,56 @@ export default function AdminDashboard() {
                 path={path}
                 isSelectingCoordinate={isPickingCoord}
                 onCoordinateSelect={handleCoordinateSelect}
+                onPickingGuide={(msg) => setDestMsg(`ℹ️ ${msg}`)}
                 previewPoint={previewPoint}
               />
 
-              {/* D-pad 5 nút phủ góc dưới phải bản đồ */}
+              {/* D-pad 5 nút phủ góc dưới phải bản đồ (Nền trong suốt, nút 36px) */}
               <div
                 className={`${styles.dpadOverlay} ${!canDrive ? styles.dpadDisabled : ''}`}
                 title={
-                  !isManual
-                    ? 'Cần bật MANUAL trên thanh công cụ bản đồ để điều khiển'
-                    : !hasConsumer
-                    ? 'Đang khóa an toàn: /airport/cmd_vel_manual chưa có consumer trên Gazebo'
-                    : isOccupiedByOther
-                    ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                    : 'Bàn điều khiển tay 5 nút'
+                  !canDrive
+                    ? (manualLockReason || 'Không thể điều khiển tay lúc này')
+                    : 'Bàn điều khiển tay 5 nút (Nhấn giữ để di chuyển, nhả để dừng)'
                 }
               >
                 <div className={styles.dpadOverlayHeader}>
                   <span className={styles.dpadOverlayTitle}>Điều khiển tay</span>
                   <span
                     className={`${styles.dpadOverlayBadge} ${
-                      !isManual
-                        ? styles.badgeAuto
-                        : canDrive
+                      isDrivingNow
                         ? styles.badgeManualOk
+                        : canDrive
+                        ? styles.badgeReady
                         : styles.badgeManualLocked
                     }`}
                   >
-                    {!isManual ? 'AUTO' : canDrive ? 'MANUAL' : 'LOCKED'}
+                    {isDrivingNow ? 'ĐANG LÁI' : canDrive ? 'SẴN SÀNG' : 'KHÓA'}
                   </span>
                 </div>
                 <div className={styles.dpadRow}>
                   <button
                     type="button"
                     className={styles.dpadBtn}
-                    onPointerDown={() => startDrive(0.25, 0)}
-                    onPointerUp={stopDrive}
-                    onPointerLeave={stopDrive}
-                    onPointerCancel={stopDrive}
+                    onPointerDown={(e) => {
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      startDrive(0.25, 0);
+                    }}
+                    onPointerUp={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onPointerCancel={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onContextMenu={(e) => e.preventDefault()}
                     disabled={!canDrive}
-                    title={
-                      !hasConsumer
-                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                        : isOccupiedByOther
-                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                        : 'Tiến thẳng (0.25 m/s)'
-                    }
+                    title={!canDrive ? (manualLockReason || 'Không thể điều khiển tay') : 'Tiến thẳng (0.25 m/s)'}
                     aria-label="Tiến thẳng"
                   >
                     ▲
@@ -855,18 +800,25 @@ export default function AdminDashboard() {
                   <button
                     type="button"
                     className={styles.dpadBtn}
-                    onPointerDown={() => startDrive(0, 0.4)}
-                    onPointerUp={stopDrive}
-                    onPointerLeave={stopDrive}
-                    onPointerCancel={stopDrive}
+                    onPointerDown={(e) => {
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      startDrive(0, 0.4);
+                    }}
+                    onPointerUp={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onPointerCancel={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onContextMenu={(e) => e.preventDefault()}
                     disabled={!canDrive}
-                    title={
-                      !hasConsumer
-                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                        : isOccupiedByOther
-                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                        : 'Quay trái (0.4 rad/s)'
-                    }
+                    title={!canDrive ? (manualLockReason || 'Không thể điều khiển tay') : 'Quay trái (0.4 rad/s)'}
                     aria-label="Quay trái"
                   >
                     ◀
@@ -874,9 +826,11 @@ export default function AdminDashboard() {
                   <button
                     type="button"
                     className={`${styles.dpadBtn} ${styles.stopBtn}`}
-                    onClick={stopDrive}
-                    disabled={!isManual}
-                    title="Dừng di chuyển"
+                    onClick={() => {
+                      stopDrive();
+                      sendManualVelocity(0, 0, 0, undefined);
+                    }}
+                    title="Dừng robot ngay lập tức"
                     aria-label="Dừng di chuyển"
                   >
                     Dừng
@@ -884,18 +838,25 @@ export default function AdminDashboard() {
                   <button
                     type="button"
                     className={styles.dpadBtn}
-                    onPointerDown={() => startDrive(0, -0.4)}
-                    onPointerUp={stopDrive}
-                    onPointerLeave={stopDrive}
-                    onPointerCancel={stopDrive}
+                    onPointerDown={(e) => {
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      startDrive(0, -0.4);
+                    }}
+                    onPointerUp={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onPointerCancel={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onContextMenu={(e) => e.preventDefault()}
                     disabled={!canDrive}
-                    title={
-                      !hasConsumer
-                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                        : isOccupiedByOther
-                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                        : 'Quay phải (-0.4 rad/s)'
-                    }
+                    title={!canDrive ? (manualLockReason || 'Không thể điều khiển tay') : 'Quay phải (-0.4 rad/s)'}
                     aria-label="Quay phải"
                   >
                     ▶
@@ -905,18 +866,25 @@ export default function AdminDashboard() {
                   <button
                     type="button"
                     className={styles.dpadBtn}
-                    onPointerDown={() => startDrive(-0.2, 0)}
-                    onPointerUp={stopDrive}
-                    onPointerLeave={stopDrive}
-                    onPointerCancel={stopDrive}
+                    onPointerDown={(e) => {
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      startDrive(-0.2, 0);
+                    }}
+                    onPointerUp={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onPointerCancel={(e) => {
+                      try {
+                        e.currentTarget.releasePointerCapture(e.pointerId);
+                      } catch {}
+                      stopDrive();
+                    }}
+                    onContextMenu={(e) => e.preventDefault()}
                     disabled={!canDrive}
-                    title={
-                      !hasConsumer
-                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                        : isOccupiedByOther
-                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                        : 'Lùi lại (-0.2 m/s)'
-                    }
+                    title={!canDrive ? (manualLockReason || 'Không thể điều khiển tay') : 'Lùi lại (-0.2 m/s)'}
                     aria-label="Lùi lại"
                   >
                     ▼
@@ -1188,14 +1156,15 @@ export default function AdminDashboard() {
                   />
                 </div>
               </div>
-              <div className={styles.formRow}>
+              <div className={styles.coordGrid}>
                 <div className={styles.formGroup}>
                   <label>Tọa độ X (mét):</label>
                   <input
                     type="number"
-                    step="0.1"
+                    step="0.01"
                     value={destX}
                     onChange={(e) => setDestX(e.target.value)}
+                    placeholder="vd: 0.25"
                     required
                   />
                 </div>
@@ -1203,9 +1172,10 @@ export default function AdminDashboard() {
                   <label>Tọa độ Y (mét):</label>
                   <input
                     type="number"
-                    step="0.1"
+                    step="0.01"
                     value={destY}
                     onChange={(e) => setDestY(e.target.value)}
+                    placeholder="vd: 1.45"
                     required
                   />
                 </div>
@@ -1216,6 +1186,7 @@ export default function AdminDashboard() {
                     step="1"
                     value={destYaw}
                     onChange={(e) => setDestYaw(e.target.value)}
+                    placeholder="vd: 90"
                   />
                 </div>
               </div>
@@ -1227,7 +1198,7 @@ export default function AdminDashboard() {
                   disabled={!hasValidMap}
                   title={!hasValidMap ? 'Cần có metadata bản đồ ROS hợp lệ' : undefined}
                 >
-                  {isPickingCoord ? '✖ Hủy chọn tọa độ' : '📍 Chọn tọa độ trên bản đồ'}
+                  {isPickingCoord ? '✖ Hủy chọn vị trí & hướng' : '📍 Chọn vị trí & hướng'}
                 </button>
                 <button
                   type="button"
@@ -1246,7 +1217,7 @@ export default function AdminDashboard() {
                 disabled={isSavingDest || !hasValidMap}
                 title={!hasValidMap ? 'Cần có metadata bản đồ ROS hợp lệ' : undefined}
               >
-                {isSavingDest ? 'Đang lưu điểm đến...' : 'Lưu Điểm Đến (Lưu Bền Vững)'}
+                {isSavingDest ? 'Đang lưu...' : 'Lưu điểm đến'}
               </button>
             </form>
           </div>

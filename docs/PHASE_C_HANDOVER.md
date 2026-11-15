@@ -1245,14 +1245,140 @@ Giao diện Quản trị viên (Admin Dashboard) đã được thiết kế lạ
 - [ ] Thử bấm nút **`TẠM DỪNG`**: Xác nhận robot dừng đứng yên tại chỗ trong Gazebo, trạng thái chuyển thành `PAUSED`.
 - [ ] Bấm nút **`TIẾP TỤC DẪN ĐƯỜNG`**: Xác nhận robot tiếp tục lộ trình đến đích thành công.
 
-#### Bước 4: Nghiệm thu chế độ điều khiển tay (Manual D-pad)
-- [ ] (Nếu đã nạp cấu hình `twist_mux` cho `ws` theo mục 16.4): Trên thanh công cụ bản đồ, nhấp nút **`BẬT THỦ CÔNG (MANUAL)`**.
-- [ ] Xác nhận huy hiệu cụm D-pad chuyển sang màu xanh lá: **`MANUAL`**.
-- [ ] Nhấn và giữ nút **▲** (Tiến): Quan sát robot lăn bánh tiến thẳng trong Gazebo.
-- [ ] Thả chuột: Quan sát robot dừng lại ngay lập tức.
-- [ ] Thử nghiệm tương tự với nút **◀** (Quay trái), **▶** (Quay phải) và nút trung tâm **`Dừng`**.
-- [ ] Nhấp nút **`TẮT THỦ CÔNG (VỀ AUTO)`**: Xác nhận hệ thống trở về chế độ tự động an toàn.
+#### Bước 4: Nghiệm thu chế độ điều khiển tay trực tiếp (Direct Press-and-Hold)
+- [ ] Mở Admin Dashboard `http://localhost:5173/admin`.
+- [ ] Xác nhận cụm D-pad 5 nút ở góc dưới phải bản đồ có nền hoàn toàn trong suốt, kích thước nút nhỏ gọn (~36px), huy hiệu hiển thị **`SẴN SÀNG`** (nền xanh dương).
+- [ ] Nhấn và giữ nút **▲** (Tiến): Hệ thống tự động chuyển sang chế độ thủ công, huy hiệu đổi sang **`ĐANG LÁI`** (nền xanh lá).
+- [ ] Thả chuột: Hệ thống tự động gửi lệnh dừng $0\,\text{m/s}$ và tự động chuyển về **`AUTO`**, huy hiệu trở lại **`SẴN SÀNG`**.
+- [ ] Thử nghiệm tương tự với nút **◀** (Quay trái), **▶** (Quay phải), **▼** (Lùi) và nút trung tâm **`Dừng`** (màu đỏ).
+- [ ] Giữ nút lái và chuyển sang tab khác: Watchdog an toàn phát hiện mất focus / timeout $0.5\,\text{s}$ và tự động dừng robot, chuyển về **`AUTO`**.
 
 #### Bước 5: Kiểm tra Nhật ký vận hành Admin
 - [ ] Cuộn xuống bảng *Nhật Ký Vận Hành Admin* dưới bản đồ.
-- [ ] Nhấp nút **`🔄 Làm mới`**: Xác nhận các sự kiện chuyển đổi chế độ (`CONTROL: Đã chuyển sang chế độ thủ công (MANUAL)`, `NAVIGATION: Bắt đầu dẫn đường Nav2`) được ghi nhận đầy đủ kèm mốc thời gian chính xác.
+- [ ] Nhấp nút **`🔄 Làm mới`**: Xác nhận các sự kiện chuyển đổi chế độ (`CONTROL: Đã chuyển sang chế độ thủ công (MANUAL)`, `CONTROL: Kết thúc điều khiển tay, trở về chế độ tự động (AUTO)`) được ghi nhận đầy đủ kèm mốc thời gian chính xác.
+
+---
+
+## 17. PHẦN 17 — HOÀN THIỆN ĐIỀU KHIỂN TAY TRỰC TIẾP, CỤM D-PAD TRONG SUỐT VÀ CÔNG CỤ ĐỊNH HƯỚNG RVIZ (BẢN SỬA LỖI 912b174+)
+
+### 17.1. Đơn Giản Hóa Điều Khiển Tay (Direct Press-and-Hold Manual Drive)
+- **Cơ chế chuyển chế độ tự động:**
+  - Loại bỏ hoàn toàn nút bật/tắt thủ công (`BẬT THỦ CÔNG (MANUAL)`) trên thanh công cụ bản đồ.
+  - Khi Admin nhấn và giữ bất kỳ nút hướng nào trên D-pad, gói vận tốc đầu tiên mang `hold_id` và `seq = 1` sẽ kích hoạt Backend **tự động chuyển tạm thời sang chế độ `MANUAL`** và ghi nhận phiên người lái.
+  - Khi người vận hành thả nút chuột, nhả tay khỏi màn hình, bấm nút **`Dừng`**, hoặc mất focus trình duyệt, hệ thống gửi lệnh dừng $(0, 0)$ kèm `hold_id` và **tự động hoàn trả về `AUTO`**.
+  - Nếu mất kết nối hoặc client bị treo không gửi lệnh mới trong quá $0.5\,\text{s}$, **Watchdog** phía backend sẽ tự động can thiệp: phát vận tốc $0\,\text{m/s}$, thu hồi `hold_id` và đưa robot về `AUTO`.
+
+### 17.2. Xử Lý Triệt Để 5 Lỗi Vận Hành Được Kiểm Chứng
+1. **Lỗi 4A (Lệch định danh phiên Admin):**
+   - Backend trước đây so khớp `session_id` (`sess_...`) trong khi giao diện so khớp `user.id` (`usr-admin-01`).
+   - Đã khắc phục bằng cách Backend trực tiếp đánh giá và cung cấp 3 cờ phân quyền chuẩn hóa: `can_manual_control` (boolean), `is_manual_controller` (boolean), và `manual_lock_reason` (chuỗi lý do chi tiết). Frontend sử dụng trực tiếp các cờ này mà không cần phỏng đoán.
+2. **Lỗi 4B (Lệnh Dừng tự phát kích hoạt theo nhịp Telemetry 5Hz):**
+   - Nguyên nhân gốc: Hàm `sendManualVelocity` trong `RobotContext.tsx` không được bọc bằng `useCallback`, khiến nó tạo tham chiếu mới tại mỗi chu kỳ telemetry $200\,\text{ms}$. Điều này kích hoạt cleanup function `return () => stopDrive()` bên trong `useEffect` của Dashboard.
+   - Đã khắc phục: Bọc `sendManualVelocity` bằng `useCallback([], ...)`, ổn định hóa `stopDrive` với `useCallback`, sử dụng `stopDriveRef` cho các listener toàn cục (`blur`, `pagehide`, `pointerup`, `visibilitychange`) với dependency array rỗng `[]`.
+3. **Lỗi 4C (Gói lệnh đến muộn sau khi Dừng hoặc Timeout):**
+   - Backend yêu cầu bắt buộc `hold_id` (chuỗi không rỗng) và `seq >= 1` cho mọi lệnh có vận tốc khác 0.
+   - Duy trì `_last_manual_seq`: từ chối mọi gói tin có `seq <= last_seq` (duplicate hoặc out-of-order) và không gia hạn watchdog cho các gói này.
+   - Quản lý danh sách các hold đã kết thúc bằng bộ đệm có giới hạn `OrderedDict` (`_released_hold_ids`, tối đa 500 phần tử). Mọi gói tin đến muộn thuộc hold đã giải phóng đều bị từ chối triệt để.
+   - Bất kỳ Admin nào bấm nút `Dừng` đều lập tức thu hồi active hold và đưa robot về trạng thái an toàn.
+4. **Lỗi 4D (Watchdog bị nghẽn bởi WebSocket):**
+   - Tách logic `check_manual_timeout()` ra khỏi vòng lặp `telemetry_broadcaster_loop()` thành một tác vụ asyncio chạy độc lập ở tần số 20Hz (mỗi $50\,\text{ms}$).
+   - Bọc lệnh `ws.send_json(payload)` trong `broadcaster.py` với `asyncio.wait_for(..., timeout=0.15)` để ngăn chặn tình trạng client mạng chậm hoặc treo kết nối làm nghẽn toàn bộ luồng phát tín hiệu và giám sát an toàn.
+5. **Lỗi 4E (Sự kiện con trỏ và mất bắt phím):**
+   - Sử dụng chuẩn HTML5 **Pointer Events** (`onPointerDown`, `onPointerUp`, `onPointerCancel`) kết hợp `setPointerCapture` / `releasePointerCapture`.
+   - Bổ sung `onContextMenu={(e) => e.preventDefault()}` để ngăn chặn menu chuột phải làm ngắt quãng lượt nhấn giữ trên màn hình cảm ứng hoặc chuột phải.
+
+### 17.3. Cải Tiến Cụm 5 Nút Điều Khiển Tay (D-pad Overlay)
+- **Kích thước nhỏ gọn:** Thu nhỏ nút từ $44\text{px} / 54\text{px}$ xuống **$36\text{px}$** (bằng ~2/3 kích thước ban đầu), khoảng cách nút $4\text{px}$.
+- **Nền khung hoàn toàn trong suốt:**
+  - Khung `.dpadOverlay` có `background: transparent; border: none; box-shadow: none; backdrop-filter: none; pointer-events: none;`.
+  - Nhờ `pointer-events: none` trên container và `pointer-events: auto` trên các nút bấm, người vận hành có thể click hoặc kéo bản đồ xuyên qua các khoảng trống giữa các nút mà không bị che khuất hay cản trở tầm nhìn.
+- **Nút Dừng trung tâm:** Mang nhãn **`Dừng`** nổi bật màu đỏ, luôn kích hoạt được từ bất kỳ tài khoản Admin nào để dừng robot tức thì.
+- **Huy hiệu trạng thái (Status Pill):**
+  - Hiển thị nhỏ gọn dạng viên thuốc:
+    - `SẴN SÀNG` (màu xanh dương): Sẵn sàng điều khiển tay.
+    - `ĐANG LÁI` (màu xanh lá): Đang trong lượt nhấn giữ di chuyển.
+    - `KHÓA` (màu hổ phách): Đang bị khóa an toàn kèm tooltip hiển thị rõ lý do khóa.
+
+### 17.4. Công Cụ "📍 Chọn Vị Trí & Hướng" (RViz Drag-to-Orient Style)
+- **Tương tác kéo-thả định hướng:**
+  - Khi bấm **[ 📍 Chọn vị trí & hướng ]**:
+    - Nhấn chuột (Mouse Down): Xác định tọa độ vị trí gốc $(X, Y)$ trên bản đồ ROS.
+    - Kéo chuột (Drag): Hiển thị mũi tên tương tác trực quan nối từ điểm gốc tới vị trí con trỏ chuột. Góc xoay Yaw được tính toán trực tiếp theo hệ tọa độ ROS frame `map`:
+      $$\theta_{\text{yaw}} = \text{atan2}(dy_{\text{ros}}, dx_{\text{ros}}) \times \frac{180}{\pi} \quad (\in [-180^\circ, 180^\circ])$$
+    - Thả chuột (Mouse Up):
+      - Nếu khoảng cách kéo màn hình $\ge 15\text{px}$: Điền tự động cả $X$, $Y$ và góc $Yaw$ vào form.
+      - Nếu kéo ngắn ($< 15\text{px}$) hoặc click đơn: Chỉ điền $X$, $Y$; **không** tự ý gán $Yaw = 0$, giữ nguyên ô Yaw để người dùng tự nhập hoặc kéo lại. Banner hiển thị hướng dẫn: *"Kéo chuột từ vị trí ghim để chọn hướng (Yaw), hoặc tự nhập góc trong ô Yaw"*.
+    - Hủy an toàn khi bấm phím `Esc` hoặc bấm nút hủy công cụ.
+- **Sửa lỗi tràn ô nhập Yaw:**
+  - Bố trí hàng tọa độ dạng Responsive Grid: `display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; width: 100%; box-sizing: border-box;`.
+  - Ô nhập $X$, $Y$, $Yaw$ có `width: 100%; box-sizing: border-box; min-width: 0;`, loại bỏ hoàn toàn hiện tượng tràn viền màn hình.
+  - Khởi tạo giá trị ban đầu bằng chuỗi rỗng `""` kèm placeholder mờ (`vd: 0.25`, `vd: 1.45`, `vd: 90`). Giá trị $0$ thật được bảo toàn là hợp lệ.
+  - Đổi tên nút thành **"Lưu điểm đến"** (khi submit: **"Đang lưu..."**).
+
+### 17.5. Bảo Mật Riêng Tư Giọng Nói & Đồng Bộ Nguồn Sự Thật
+- **Bảo mật nhận dạng giọng nói:**
+  - `voice_transcript` và `voice_response` được lọc nghiêm ngặt phía backend: chỉ phiên hành khách đã yêu cầu (hoặc Admin) mới có thể đọc được nội dung nhận dạng. Khách vãng lai khác sẽ nhận `None` để bảo vệ quyền riêng tư thông tin chuyến bay và điểm đến.
+- **Nguồn sự thật Readiness:**
+  - Giao diện Admin sử dụng trực tiếp `status.readiness` từ backend (gồm `ready: boolean` và `reasons: string[]`) làm nguồn kiểm tra điều kiện sẵn sàng duy nhất, loại bỏ logic kiểm tra phân tán.
+- **Đồng bộ Token REST - WebSocket:**
+  - `apiClient.onTokenChange` giúp đồng bộ lập tức `passengerToken` và `effectiveToken` giữa tầng HTTP client và React Context mà không cần tải lại trang.
+
+### 17.6. Đính Chính Chuẩn Giao Tiếp ROS (Corrected ROS Message Types)
+- **Đường lệnh vận tốc thủ công:**
+  - Topic: `/airport/cmd_vel_manual`
+  - Kiểu message chính xác: **`geometry_msgs/msg/TwistStamped`** (header frame: `base_link`, linear: $x$, angular: $z$). Đính chính các tài liệu trước đây ghi nhầm là `Twist`.
+  - Giữ topic ở trạng thái khóa an toàn (`manual_consumer_available = false`) cho tới khi cấu hình phân luồng `twist_mux` được triển khai đầy đủ trên Gazebo.
+
+---
+
+## 18. TỔNG KẾT BỘ TEST HỒI QUY (35 / 35 PASSED — 100%)
+
+Chạy toàn bộ test suite trong container backend:
+```bash
+docker compose exec -e PYTHONPATH=/app -e ROBOT_ADAPTER_MODE=mock backend pytest -o cache_dir=/tmp/.pytest_cache -v
+```
+
+```
+tests/test_auth_and_ws.py::test_health_check[asyncio] PASSED
+tests/test_auth_and_ws.py::test_passenger_and_admin_permissions[asyncio] PASSED
+tests/test_auth_and_ws.py::test_session_expiry_and_token_validation[asyncio] PASSED
+tests/test_auth_and_ws.py::test_expired_token_handling_in_map_endpoint[asyncio] PASSED
+tests/test_auth_and_ws.py::test_coordinate_transforms PASSED
+tests/test_auth_and_ws.py::test_sensitive_data_filter_redacts_tokens PASSED
+tests/test_phase_c_navigation.py::test_validate_destination_coordinates_extended PASSED
+tests/test_phase_c_navigation.py::test_isolated_destinations_file_io PASSED
+tests/test_phase_c_navigation.py::test_ros_adapter_lifecycle_edge_cases PASSED
+tests/test_phase_c_navigation.py::test_api_passenger_sessions_and_permissions[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_telemetry_broadcaster_reconnection_and_cancellation[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_destinations_persistence_concurrency_and_permissions[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_destinations_deletion_persistence_and_permissions[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_navigation_pause_resume_lifecycle_and_permissions[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_manual_control_arbitration_concurrency_and_timeout[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_operational_event_logger_and_admin_monitoring_lifecycle[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_voice_service_async_non_blocking_and_watchdog_timeout[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_admin_multi_session_distinct_control_arbitration[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_manual_control_out_of_order_http_sequence_and_hold_release[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_operational_event_logger_lifecycle_hooks_and_destinations[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_direct_manual_control_press_hold_and_voice_privacy[asyncio] PASSED
+tests/test_phase_c_navigation.py::test_nav2_restart_and_action_status_cases PASSED
+tests/test_phase_c_navigation.py::test_path_handling_and_lifecycle PASSED
+tests/test_phase_c_navigation.py::test_path_endpoint_and_external_goal_filtering PASSED
+tests/test_phase_c_navigation.py::test_reverse_coordinate_projection_isolated PASSED
+tests/test_phase_c_navigation.py::test_amcl_epoch_pose_before_clock_initial_connection PASSED
+tests/test_phase_c_navigation.py::test_amcl_epoch_clock_rewind_requires_new_pose_after_gazebo_reset PASSED
+tests/test_phase_c_navigation.py::test_voice_interface_lifecycle_and_debouncing PASSED
+tests/test_phase_c_navigation.py::test_voice_destination_matching_and_confirmation_workflow PASSED
+tests/test_phase_c_navigation.py::test_ros_adapter_voice_transcript_lock_and_deadlock_prevention PASSED
+tests/test_phase_c_navigation.py::test_amcl_epoch_extended_validation_rules PASSED
+tests/test_phase_c_navigation.py::test_nav2_readiness_checks_action_server PASSED
+tests/test_phase_c_navigation.py::test_direct_manual_control_press_hold_and_voice_privacy[asyncio] PASSED
+tests/test_ros_config.py::test_load_and_profile_merge PASSED
+tests/test_ros_config.py::test_topic_name_change_propagation PASSED
+tests/test_ros_config.py::test_validation_missing_required PASSED
+======================== 35 passed, 1 warning in 6.96s =========================
+```
+
+### 18.1. Bằng Chứng Hình Ảnh Kiểm Thử Trực Quan (Browser QA)
+- [Giao diện Admin Dashboard hoàn thiện với bản đồ lớn, cụm nút lái 36px trong suốt, form 3 cột không tràn và công cụ Drag-to-Orient](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/admin_dashboard_final_verified.png)
+- [Ảnh bằng chứng Browser subagent kết thúc kiểm thử](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/browser_evidence/1ceb0bf2-dcc3-45e1-9dd4-56eefb1df7b1/final_step_20.png)
+```

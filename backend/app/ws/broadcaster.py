@@ -9,6 +9,26 @@ from .manager import ws_manager
 
 logger = logging.getLogger("telemetry_broadcaster")
 
+async def manual_watchdog_loop():
+    """
+    Vòng lặp watchdog kiểm tra timeout điều khiển tay độc lập (20Hz = 50ms).
+    Tách biệt hoàn toàn khỏi việc phát telemetry qua WebSocket để bảo đảm rằng
+    ngay cả khi client gửi bị trễ/treo hoặc broadcaster bị chậm, watchdog vẫn
+    ngắt vận tốc robot đúng hạn định 0.5s.
+    """
+    logger.info("Khởi động vòng lặp Watchdog điều khiển tay độc lập (20Hz)...")
+    while True:
+        try:
+            await asyncio.sleep(0.05)
+            adapter = get_robot_adapter()
+            if hasattr(adapter, "check_manual_timeout"):
+                adapter.check_manual_timeout()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Lỗi trong vòng lặp watchdog điều khiển tay: {e}")
+            await asyncio.sleep(0.1)
+
 async def telemetry_broadcaster_loop():
     """
     Vòng lặp gửi dữ liệu telemetry thời gian thực qua WebSocket (5Hz = 200ms).
@@ -29,8 +49,6 @@ async def telemetry_broadcaster_loop():
             adapter = get_robot_adapter()
             if hasattr(adapter, "ensure_spinning"):
                 adapter.ensure_spinning()
-            if hasattr(adapter, "check_manual_timeout"):
-                adapter.check_manual_timeout()
 
             # Thu thập trạng thái từ adapter để theo dõi kết nối ngay cả khi 0 client
             status = adapter.get_status()
@@ -85,8 +103,9 @@ async def telemetry_broadcaster_loop():
                             "created_at": active_proposal["created_at"],
                         }
 
+                # Lọc riêng tư giọng nói: chỉ requester hoặc Admin mới thấy transcript/response
                 voice_req_id = status.get("voice_requester_id") or (active_proposal.get("requester_id") if active_proposal else "")
-                can_see_voice = True
+                can_see_voice = False
                 if voice_req_id:
                     can_see_voice = bool(
                         user and (
@@ -97,6 +116,43 @@ async def telemetry_broadcaster_loop():
                     )
                 user_transcript = status["voice_transcript"] if can_see_voice else None
                 user_response = status["voice_response"] if can_see_voice else None
+
+                # Đánh giá phân quyền điều khiển tay theo client cụ thể
+                current_manual_op = status.get("manual_operator_id")
+                is_manual_controller = bool(
+                    current_manual_op and user and (
+                        getattr(user, "session_id", None) == current_manual_op or
+                        user.id == current_manual_op
+                    )
+                )
+
+                can_manual_control = False
+                manual_lock_reason = None
+
+                if user.role != UserRole.ADMIN:
+                    can_manual_control = False
+                    manual_lock_reason = "Yêu cầu quyền Admin"
+                elif status.get("navigation_state") in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") or status.get("has_goal"):
+                    can_manual_control = False
+                    manual_lock_reason = f"Đang có chuyến dẫn đường ({status.get('navigation_state')})"
+                elif status.get("external_goal_active", False):
+                    can_manual_control = False
+                    manual_lock_reason = "Nav2 đang có mục tiêu điều hướng từ nguồn ngoài (RViz)"
+                elif not status.get("is_connected", False):
+                    can_manual_control = False
+                    manual_lock_reason = "Robot chưa kết nối"
+                elif status.get("is_data_stale", False):
+                    can_manual_control = False
+                    manual_lock_reason = "Dữ liệu định vị bị trễ (stale)"
+                elif not status.get("manual_consumer_available", False):
+                    can_manual_control = False
+                    manual_lock_reason = "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận"
+                elif current_manual_op and not is_manual_controller:
+                    can_manual_control = False
+                    manual_lock_reason = f"Quyền điều khiển đang thuộc về phiên Admin khác ({current_manual_op})"
+                else:
+                    can_manual_control = True
+                    manual_lock_reason = None
 
                 payload: Dict[str, Any] = {
                     "type": "telemetry",
@@ -131,6 +187,9 @@ async def telemetry_broadcaster_loop():
                         "destinations_version": status.get("destinations_version", 0),
                         "manual_consumer_available": status.get("manual_consumer_available", False),
                         "manual_operator_id": status.get("manual_operator_id"),
+                        "can_manual_control": can_manual_control,
+                        "is_manual_controller": is_manual_controller,
+                        "manual_lock_reason": manual_lock_reason,
                         "readiness": status.get("readiness"),
                     }
                 }
@@ -156,7 +215,7 @@ async def telemetry_broadcaster_loop():
                     payload["admin_data"] = admin_payload
 
                 try:
-                    await ws.send_json(payload)
+                    await asyncio.wait_for(ws.send_json(payload), timeout=0.15)
                 except Exception:
                     pass
 

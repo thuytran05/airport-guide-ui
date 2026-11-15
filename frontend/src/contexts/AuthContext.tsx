@@ -81,7 +81,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const effectiveToken = token || passengerToken;
 
   useEffect(() => {
-    const unsub = apiClient.onAuthError(() => {
+    const unsubError = apiClient.onAuthError(() => {
       try {
         localStorage.removeItem('airport_robot_jwt');
         localStorage.removeItem('airport_robot_user');
@@ -91,7 +91,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setToken(null);
       setCurrentUser(DEFAULT_PASSENGER);
     });
-    return unsub;
+
+    const unsubToken = apiClient.onTokenChange((_adminTok, passTok) => {
+      setPassengerToken(passTok);
+    });
+
+    return () => {
+      unsubError();
+      unsubToken();
+    };
   }, []);
 
   useEffect(() => {

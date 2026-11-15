@@ -4,8 +4,9 @@ import uuid
 import os
 import threading
 import logging
+import collections
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import yaml
 
 from .base import BaseRobotAdapter
@@ -34,6 +35,9 @@ class MockRobotAdapter(BaseRobotAdapter):
         self._current_manual_twist = (0.0, 0.0)
         self._last_manual_cmd_time: float = 0.0
         self._manual_consumer_available: bool = True
+        self._active_hold_id: Optional[str] = None
+        self._last_manual_seq: int = 0
+        self._released_hold_ids: collections.OrderedDict = collections.OrderedDict()
         self._navigation_state = "IDLE"  # IDLE, ACCEPTED, NAVIGATING, PAUSING, PAUSED, CANCELING, SUCCEEDED, CANCELED, FAILED
         self._has_goal = False
         self._goal_id = ""
@@ -211,6 +215,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                 "voice_state": self._voice_state,
                 "voice_transcript": self._voice_transcript,
                 "voice_response": self._voice_response,
+                "voice_requester_id": getattr(self, "_voice_requester_id", ""),
                 "voice_available": getattr(self, "_voice_available", True),
                 "message": self._message,
                 "destinations_version": self._destinations_version,
@@ -294,8 +299,8 @@ class MockRobotAdapter(BaseRobotAdapter):
 
     def start_navigation(self, destination_id: str, owner_id: str) -> Dict[str, Any]:
         with self._lock:
-            if self._control_mode == "MANUAL":
-                return {"success": False, "message": "Robot đang ở chế độ điều khiển thủ công (MANUAL). Hãy chuyển sang AUTO trước."}
+            if getattr(self, "_control_mode", "AUTO") == "MANUAL" or getattr(self, "_active_hold_id", None) is not None:
+                return {"success": False, "message": "Không thể bắt đầu dẫn đường: Robot đang trong chế độ điều khiển thủ công (MANUAL) hoặc lượt điều khiển tay."}
             if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
                 return {"success": False, "message": f"Robot đang có chuyến dẫn đường đang hoạt động hoặc tạm dừng (trạng thái: {self._navigation_state})."}
 
@@ -337,8 +342,8 @@ class MockRobotAdapter(BaseRobotAdapter):
 
     def resume_navigation(self) -> Dict[str, Any]:
         with self._lock:
-            if getattr(self, "_control_mode", "AUTO") == "MANUAL":
-                return {"success": False, "message": "Robot đang ở chế độ điều khiển thủ công (MANUAL). Hãy chuyển sang AUTO trước khi tiếp tục."}
+            if getattr(self, "_control_mode", "AUTO") == "MANUAL" or getattr(self, "_active_hold_id", None) is not None:
+                return {"success": False, "message": "Không thể tiếp tục dẫn đường: Robot đang trong chế độ điều khiển thủ công (MANUAL) hoặc lượt điều khiển tay."}
             if self._navigation_state in ("NAVIGATING", "ACCEPTED", "PENDING"):
                 return {"success": False, "message": "Robot đang trong quá trình dẫn đường, không cần tiếp tục."}
             if self._navigation_state == "PAUSING":
@@ -387,10 +392,19 @@ class MockRobotAdapter(BaseRobotAdapter):
 
             self._navigation_state = "CANCELING"
             self._message = "Đang dừng robot và hủy chuyến..."
+            cancel_id = str(uuid.uuid4())
+            self._active_cancel_id = cancel_id
+            target_goal_id = self._goal_id
 
             def _finish_cancel():
                 time.sleep(0.2)
                 with self._lock:
+                    if getattr(self, "_active_cancel_id", None) != cancel_id:
+                        return
+                    if getattr(self, "_goal_id", "") != target_goal_id and target_goal_id != "":
+                        return
+                    if self._navigation_state != "CANCELING":
+                        return
                     self._navigation_state = "CANCELED"
                     self._has_goal = False
                     self._path = []
@@ -431,6 +445,9 @@ class MockRobotAdapter(BaseRobotAdapter):
     def clear_voice_proposal(self) -> None:
         with self._lock:
             self._voice_proposal = None
+            self._voice_transcript = None
+            self._voice_response = None
+            self._voice_requester_id = ""
 
     def start_voice_session(self, requester_id: str = "") -> Dict[str, Any]:
         with self._lock:
@@ -552,36 +569,63 @@ class MockRobotAdapter(BaseRobotAdapter):
     def _publish_zero_velocity(self) -> None:
         self._current_manual_twist = (0.0, 0.0)
 
+    def _can_manual_control_locked(self, operator_id: str = "", require_consumer: bool = True) -> Tuple[bool, Optional[str]]:
+        if not getattr(self, "_is_connected", True):
+            return (False, "Robot chưa kết nối.")
+        if not self.has_valid_pose():
+            return (False, "Chưa có vị trí định vị hợp lệ.")
+        if getattr(self, "_clock_stalled", False):
+            return (False, "Mô phỏng đang tạm dừng (clock stalled).")
+        nav_state = getattr(self, "_navigation_state", "IDLE")
+        if nav_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") or getattr(self, "_has_goal", False):
+            return (False, f"Đang có chuyến dẫn đường ({nav_state}).")
+        if getattr(self, "_nav2_has_active_goal", False):
+            return (False, "Nav2 đang có mục tiêu điều hướng đang chạy từ nguồn ngoài.")
+        current_op = getattr(self, "_manual_operator_id", None)
+        if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id:
+            return (False, f"Quyền điều khiển thủ công đang thuộc về Admin khác ({current_op}).")
+        if require_consumer and not self.is_manual_consumer_available():
+            return (False, "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận.")
+        return (True, None)
+
+    def can_manual_control(self, operator_id: str = "") -> Tuple[bool, Optional[str]]:
+        with self._lock:
+            return self._can_manual_control_locked(operator_id, require_consumer=True)
+
     def check_manual_timeout(self) -> None:
         with self._lock:
             if getattr(self, "_control_mode", "AUTO") != "MANUAL":
                 return
-            current_twist = getattr(self, "_current_manual_twist", (0.0, 0.0))
-            if current_twist != (0.0, 0.0):
-                timeout_sec = 0.5
-                if hasattr(self, "_ros_config") and hasattr(self._ros_config, "velocity_limits"):
-                    timeout_sec = self._ros_config.velocity_limits.get("cmd_timeout_sec", 0.5)
-                now = time.monotonic()
-                last_time = getattr(self, "_last_manual_cmd_time", 0.0)
-                if (now - last_time) >= timeout_sec:
-                    op_id = getattr(self, "_manual_operator_id", None) or "Admin"
-                    logger.warning(
-                        f"Watchdog timeout ({timeout_sec}s): Không nhận được lệnh điều khiển tay từ {op_id}. Dừng robot an toàn."
-                    )
-                    self._publish_zero_velocity()
-                    self._current_manual_twist = (0.0, 0.0)
+            timeout_sec = 0.5
+            if hasattr(self, "_ros_config") and hasattr(self._ros_config, "velocity_limits"):
+                timeout_sec = self._ros_config.velocity_limits.get("cmd_timeout_sec", 0.5)
+            now = time.monotonic()
+            last_time = getattr(self, "_last_manual_cmd_time", 0.0)
+            if (now - last_time) >= timeout_sec:
+                op_id = getattr(self, "_manual_operator_id", None) or "Admin"
+                logger.warning(
+                    f"Watchdog timeout ({timeout_sec}s): Không nhận được lệnh điều khiển tay từ {op_id}. Dừng robot an toàn."
+                )
+                if getattr(self, "_active_hold_id", None):
+                    self._released_hold_ids[self._active_hold_id] = now
+                    while len(self._released_hold_ids) > 500:
+                        self._released_hold_ids.popitem(last=False)
+                    self._active_hold_id = None
+                self._publish_zero_velocity()
+                self._control_mode = "AUTO"
+                self._manual_operator_id = None
+                self._last_manual_seq = 0
+                self._current_manual_twist = (0.0, 0.0)
+                self._message = "Chế độ tự động (AUTO) sẵn sàng"
+                event_logger.add_event("WARN", "CONTROL", f"Watchdog timeout ({timeout_sec}s): Tự động dừng xe và chuyển về AUTO.")
+                event_logger.track_control_mode("AUTO")
 
     def set_manual_control(self, enable: bool, operator_id: str = "", force: bool = False) -> Dict[str, Any]:
         with self._lock:
             if enable:
-                if not getattr(self, "_is_connected", True):
-                    return {"success": False, "message": "Không thể chuyển sang MANUAL: Robot chưa kết nối."}
-                nav_state = getattr(self, "_navigation_state", "IDLE")
-                if nav_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") or getattr(self, "_has_goal", False):
-                    return {
-                        "success": False,
-                        "message": f"Không thể chuyển sang MANUAL: Đang có chuyến dẫn đường ({nav_state}). Hãy hoàn thành hoặc hủy chuyến trước."
-                    }
+                can_drive, reason = self._can_manual_control_locked(operator_id, require_consumer=False)
+                if not can_drive and not force:
+                    return {"success": False, "message": f"Không thể chuyển sang MANUAL: {reason}"}
                 current_op = getattr(self, "_manual_operator_id", None)
                 if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id and not force:
                     return {
@@ -598,9 +642,13 @@ class MockRobotAdapter(BaseRobotAdapter):
                 event_logger.track_control_mode("MANUAL")
                 return {"success": True, "message": "Đã chuyển sang MANUAL"}
             else:
+                if getattr(self, "_active_hold_id", None):
+                    self._released_hold_ids[self._active_hold_id] = time.monotonic()
+                    while len(self._released_hold_ids) > 500:
+                        self._released_hold_ids.popitem(last=False)
+                    self._active_hold_id = None
                 self._control_mode = "AUTO"
                 self._manual_operator_id = None
-                self._active_hold_id = None
                 self._last_manual_seq = 0
                 self._publish_zero_velocity()
                 self._current_manual_twist = (0.0, 0.0)
@@ -619,48 +667,74 @@ class MockRobotAdapter(BaseRobotAdapter):
     ) -> Dict[str, Any]:
         with self._lock:
             if not hasattr(self, "_released_hold_ids"):
-                self._released_hold_ids = set()
+                self._released_hold_ids = collections.OrderedDict()
 
+            now = time.monotonic()
             is_stop_cmd = (abs(linear_x) < 1e-4 and abs(angular_z) < 1e-4)
+
             if is_stop_cmd:
                 self._publish_zero_velocity()
                 self._current_manual_twist = (0.0, 0.0)
-                self._last_manual_cmd_time = time.monotonic()
+                self._last_manual_cmd_time = now
+                if getattr(self, "_active_hold_id", None):
+                    self._released_hold_ids[self._active_hold_id] = now
+                    self._active_hold_id = None
                 if hold_id:
-                    self._released_hold_ids.add(hold_id)
-                self._active_hold_id = None
+                    self._released_hold_ids[hold_id] = now
+                while len(self._released_hold_ids) > 500:
+                    self._released_hold_ids.popitem(last=False)
                 if seq > getattr(self, "_last_manual_seq", 0):
                     self._last_manual_seq = seq
+                was_manual = (getattr(self, "_control_mode", "AUTO") == "MANUAL")
+                self._control_mode = "AUTO"
+                self._manual_operator_id = None
+                self._message = "Chế độ tự động (AUTO) sẵn sàng"
+                if was_manual:
+                    event_logger.track_control_mode("AUTO")
                 return {"success": True, "message": "Đã gửi lệnh dừng robot an toàn."}
 
-            if getattr(self, "_control_mode", "AUTO") != "MANUAL":
-                return {"success": False, "message": "Robot không ở chế độ điều khiển thủ công (MANUAL)."}
+            # 1. Kiểm tra điều kiện lái tay và quyền Admin TRƯỚC TIÊN
+            can_drive, reason = self._can_manual_control_locked(operator_id)
+            if not can_drive:
+                return {"success": False, "message": reason or "Không đủ điều kiện điều khiển tay."}
 
-            current_op = getattr(self, "_manual_operator_id", None)
-            if current_op and operator_id and current_op != operator_id:
-                return {"success": False, "message": f"Quyền điều khiển đang thuộc về Admin khác ({current_op})."}
-
+            # 2. Kiểm tra dữ liệu đầu vào hữu hạn
             if not (math.isfinite(linear_x) and math.isfinite(angular_z)):
                 return {"success": False, "message": "Giá trị vận tốc không hợp lệ (NaN hoặc Inf)."}
 
-            if not self.is_manual_consumer_available():
-                return {
-                    "success": False,
-                    "message": "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận."
-                }
-
-            # Xử lý thứ tự yêu cầu HTTP / Sequence check & Hold release check
+            # 3. Phân biệt có hold_id (direct press-and-hold) và không có hold_id (single-shot / legacy test)
             if hold_id:
+                if seq is None or seq < 1:
+                    return {"success": False, "message": "Yêu cầu seq hợp lệ (seq >= 1) cho lượt giữ nút."}
                 if hold_id in self._released_hold_ids:
-                    return {"success": True, "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."}
-                if getattr(self, "_active_hold_id", None) != hold_id:
-                    self._active_hold_id = hold_id
+                    return {"success": True, "ignored": True, "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."}
+                if getattr(self, "_active_hold_id", None) == hold_id:
+                    last_seq = getattr(self, "_last_manual_seq", 0)
+                    if seq <= last_seq:
+                        return {"success": True, "ignored": True, "message": f"Bỏ qua lệnh vận tốc đến trễ hoặc lặp seq (seq {seq} <= {last_seq})."}
                     self._last_manual_seq = seq
                 else:
-                    last_seq = getattr(self, "_last_manual_seq", 0)
-                    if seq > 0 and seq < last_seq:
-                        return {"success": True, "message": "Bỏ qua lệnh vận tốc đến trễ (out of sequence)."}
+                    if getattr(self, "_active_hold_id", None) is not None:
+                        current_op = getattr(self, "_manual_operator_id", None)
+                        if current_op and operator_id and current_op != operator_id:
+                            return {"success": False, "message": f"Quyền điều khiển đang thuộc về phiên khác ({current_op})."}
+                        self._released_hold_ids[self._active_hold_id] = now
+                        while len(self._released_hold_ids) > 500:
+                            self._released_hold_ids.popitem(last=False)
+                    self._active_hold_id = hold_id
                     self._last_manual_seq = seq
+            elif seq and seq > 0:
+                return {"success": False, "message": "Yêu cầu hold_id hợp lệ cho gói lệnh tuần tự."}
+            else:
+                self._last_manual_seq = getattr(self, "_last_manual_seq", 0) + 1
+
+            # Tự động lấy quyền MANUAL tạm thời cho lượt giữ này
+            was_auto = (getattr(self, "_control_mode", "AUTO") != "MANUAL")
+            self._control_mode = "MANUAL"
+            self._manual_operator_id = operator_id
+            self._message = f"Chế độ điều khiển thủ công (MANUAL) được kích hoạt bởi {operator_id or 'Admin'}."
+            if was_auto:
+                event_logger.track_control_mode("MANUAL")
 
             limits = self._ros_config.velocity_limits if hasattr(self, "_ros_config") and hasattr(self._ros_config, "velocity_limits") else {}
             lin_max = limits.get("linear_max", 0.3)

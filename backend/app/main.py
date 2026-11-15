@@ -10,7 +10,7 @@ from .config import settings
 from .adapters.factory import get_robot_adapter
 from .auth.dependencies import authenticate_ws_token
 from .ws.manager import ws_manager
-from .ws.broadcaster import telemetry_broadcaster_loop
+from .ws.broadcaster import telemetry_broadcaster_loop, manual_watchdog_loop
 from .api.auth_router import router as auth_router
 from .api.robot_router import router as robot_router
 from .ros_config import get_ros_config
@@ -64,16 +64,18 @@ async def lifespan(app: FastAPI):
     # 1. Khởi tạo Robot Adapter singleton
     adapter = get_robot_adapter()
 
-    # 2. Khởi chạy Telemetry Broadcaster Task chạy nền
+    # 2. Khởi chạy Telemetry Broadcaster Task và Manual Watchdog Task chạy nền
     broadcaster_task = asyncio.create_task(telemetry_broadcaster_loop())
+    watchdog_task = asyncio.create_task(manual_watchdog_loop())
 
     yield
 
     # Shutdown
     logger.info("Đang tắt Airport Guide Backend...")
     broadcaster_task.cancel()
+    watchdog_task.cancel()
     try:
-        await broadcaster_task
+        await asyncio.gather(broadcaster_task, watchdog_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
     adapter.dispose()

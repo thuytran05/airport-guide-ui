@@ -42,6 +42,66 @@ async def get_robot_status(
     is_admin = (current_user.role == UserRole.ADMIN)
     st["has_active_trip"] = bool(owner_id)
     st["is_owner"] = bool((owner_id and current_user and current_user.id == owner_id) or is_admin)
+
+    # Lọc riêng tư giọng nói
+    active_proposal = adapter.get_voice_proposal() if hasattr(adapter, "get_voice_proposal") else None
+    voice_req_id = st.get("voice_requester_id") or (active_proposal.get("requester_id") if active_proposal else "")
+    can_see_voice = False
+    if voice_req_id:
+        can_see_voice = bool(
+            current_user and (
+                current_user.role == UserRole.ADMIN or
+                current_user.id == voice_req_id or
+                getattr(current_user, "session_id", None) == voice_req_id
+            )
+        )
+    elif not st.get("voice_transcript"):
+        can_see_voice = True
+
+    if not can_see_voice:
+        st["voice_transcript"] = None
+        st["voice_response"] = None
+
+    # Phân quyền điều khiển tay theo client
+    current_manual_op = st.get("manual_operator_id")
+    is_manual_controller = bool(
+        current_manual_op and current_user and (
+            getattr(current_user, "session_id", None) == current_manual_op or
+            current_user.id == current_manual_op
+        )
+    )
+
+    can_manual_control = False
+    manual_lock_reason = None
+
+    if current_user.role != UserRole.ADMIN:
+        can_manual_control = False
+        manual_lock_reason = "Yêu cầu quyền Admin"
+    elif st.get("navigation_state") in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") or st.get("has_goal"):
+        can_manual_control = False
+        manual_lock_reason = f"Đang có chuyến dẫn đường ({st.get('navigation_state')})"
+    elif st.get("external_goal_active", False):
+        can_manual_control = False
+        manual_lock_reason = "Nav2 đang có mục tiêu điều hướng từ nguồn ngoài (RViz)"
+    elif not st.get("is_connected", False):
+        can_manual_control = False
+        manual_lock_reason = "Robot chưa kết nối"
+    elif st.get("is_data_stale", False):
+        can_manual_control = False
+        manual_lock_reason = "Dữ liệu định vị bị trễ (stale)"
+    elif not st.get("manual_consumer_available", False):
+        can_manual_control = False
+        manual_lock_reason = "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận"
+    elif current_manual_op and not is_manual_controller:
+        can_manual_control = False
+        manual_lock_reason = f"Quyền điều khiển đang thuộc về phiên Admin khác ({current_manual_op})"
+    else:
+        can_manual_control = True
+        manual_lock_reason = None
+
+    st["can_manual_control"] = can_manual_control
+    st["is_manual_controller"] = is_manual_controller
+    st["manual_lock_reason"] = manual_lock_reason
     return st
 
 @router.get("/map")

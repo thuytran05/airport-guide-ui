@@ -1605,6 +1605,7 @@ async def test_navigation_pause_resume_lifecycle_and_permissions(tmp_path):
         app_adapter._navigation_state = "IDLE"
         app_adapter._has_goal = False
         app_adapter._owner_id = ""
+        app_adapter._active_hold_id = None
         try:
             app_adapter.upsert_destination({
                 "id": "gate_api_test",
@@ -3106,6 +3107,178 @@ async def test_operational_event_logger_lifecycle_hooks_and_destinations(tmp_pat
         assert "events" in data
         assert len(data["events"]) > 0
         assert data["events"][0]["category"] in ("DESTINATION", "SYSTEM", "CONNECTION", "CONTROL", "NAVIGATION")
+
+    app.dependency_overrides.pop(get_robot_adapter, None)
+
+
+@pytest.mark.anyio
+async def test_direct_manual_control_press_hold_and_voice_privacy(tmp_path):
+    """
+    Kiểm tra cơ chế lái trực tiếp nhấn-giữ (Direct Press-and-Hold), chống gói trễ,
+    watchdog timeout, và cô lập quyền riêng tư giọng nói.
+    """
+    from app.adapters.mock_adapter import MockRobotAdapter
+    from app.adapters.factory import get_robot_adapter
+    from app.auth.models import User, UserRole
+
+    adapter = MockRobotAdapter()
+    adapter._destinations_file = tmp_path / "dest_direct.yaml"
+    adapter._destinations = []
+    adapter._is_connected = True
+    adapter._is_data_stale = False
+    adapter._manual_consumer_available = True
+    adapter._control_mode = "AUTO"
+    adapter._navigation_state = "IDLE"
+    adapter._has_goal = False
+
+    # 1. Bắt đầu giữ nút: Gói vận tốc đầu tiên tự động chuyển sang MANUAL
+    res_drive1 = adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=1, hold_id="hold_alpha_1"
+    )
+    assert res_drive1["success"] is True
+    assert adapter._control_mode == "MANUAL"
+    assert adapter._manual_operator_id == "sess_adm_1"
+    assert adapter._active_hold_id == "hold_alpha_1"
+    assert adapter._last_manual_seq == 1
+
+    # 2. Gói tiếp theo tăng seq hợp lệ
+    res_drive2 = adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=2, hold_id="hold_alpha_1"
+    )
+    assert res_drive2["success"] is True
+    assert adapter._last_manual_seq == 2
+
+    # 3. Gói duplicate hoặc receding (seq <= last_seq) bị bỏ qua an toàn và không gia hạn watchdog
+    t_before = adapter._last_manual_cmd_time
+    res_dup = adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=2, hold_id="hold_alpha_1"
+    )
+    assert res_dup.get("ignored") is True or res_dup["success"] is False
+    assert adapter._last_manual_cmd_time == t_before
+
+    res_recede = adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=1, hold_id="hold_alpha_1"
+    )
+    assert res_recede.get("ignored") is True or res_recede["success"] is False
+    assert adapter._last_manual_cmd_time == t_before
+
+    # 4. Gói thiếu hold_id hoặc seq < 1 bị từ chối
+    res_no_hold = adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=3, hold_id=""
+    )
+    assert res_no_hold["success"] is False
+
+    # 5. Dừng xe từ phiên đang giữ nút: Về AUTO an toàn và lưu hold_id vào released cache
+    res_stop = adapter.send_manual_velocity(
+        linear_x=0.0, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=3, hold_id="hold_alpha_1"
+    )
+    assert res_stop["success"] is True
+    assert adapter._control_mode == "AUTO"
+    assert adapter._active_hold_id is None
+    assert "hold_alpha_1" in adapter._released_hold_ids
+
+    # 6. Gói đến muộn mang hold_id đã giải phóng bị từ chối triệt để
+    res_late = adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=4, hold_id="hold_alpha_1"
+    )
+    assert res_late.get("ignored") is True or res_late["success"] is False
+    assert "kết thúc" in res_late["message"]
+
+    # 7. Watchdog timeout: Khi không có lệnh mới sau 0.5s, tự động dừng và về AUTO
+    adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_2",
+        seq=1, hold_id="hold_beta_2"
+    )
+    assert adapter._control_mode == "MANUAL"
+    assert adapter._active_hold_id == "hold_beta_2"
+
+    # Giả lập thời gian trôi qua 0.6s
+    adapter._last_manual_cmd_time -= 0.6
+    adapter.check_manual_timeout()
+    assert adapter._control_mode == "AUTO"
+    assert adapter._active_hold_id is None
+    assert "hold_beta_2" in adapter._released_hold_ids
+
+    # 8. Bất kỳ Admin nào cũng có thể gửi lệnh Dừng để giải phóng hold đang giữ
+    adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_3",
+        seq=1, hold_id="hold_gamma_3"
+    )
+    assert adapter._control_mode == "MANUAL"
+    # Admin khác gửi Stop (0, 0)
+    res_admin_stop = adapter.send_manual_velocity(
+        linear_x=0.0, angular_z=0.0,
+        operator_id="sess_adm_different"
+    )
+    assert res_admin_stop["success"] is True
+    assert adapter._control_mode == "AUTO"
+    assert adapter._active_hold_id is None
+    assert "hold_gamma_3" in adapter._released_hold_ids
+
+    # 9. Bounded OrderedDict: Giới hạn tối đa 500 holds
+    for i in range(550):
+        adapter._released_hold_ids[f"dummy_hold_{i}"] = time.monotonic()
+        while len(adapter._released_hold_ids) > 500:
+            adapter._released_hold_ids.popitem(last=False)
+    assert len(adapter._released_hold_ids) == 500
+
+    # 10. Chặn lái tay khi đang NAVIGATING hoặc PAUSED
+    adapter._navigation_state = "PAUSED"
+    res_drive_paused = adapter.send_manual_velocity(
+        linear_x=0.25, angular_z=0.0,
+        operator_id="sess_adm_1",
+        seq=1, hold_id="hold_new"
+    )
+    assert res_drive_paused["success"] is False
+    assert "PAUSED" in res_drive_paused["message"]
+    adapter._navigation_state = "IDLE"
+
+    # 11. Cô lập quyền riêng tư giọng nói qua REST API /status
+    adapter._voice_state = "PROCESSING"
+    adapter._voice_transcript = "Hãy dẫn tôi đến Quầy vé A"
+    adapter._voice_response = "Đang tìm kiếm Quầy vé A"
+    adapter._voice_requester_id = "passenger_sess_123"
+
+    app.dependency_overrides[get_robot_adapter] = lambda: adapter
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Thử với Admin
+        login_res = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        adm_tok = login_res.json()["access_token"]
+        r_admin = await client.get("/api/robot/status", headers={"Authorization": f"Bearer {adm_tok}"})
+        assert r_admin.status_code == 200
+        admin_data = r_admin.json()
+        assert admin_data["voice_transcript"] == "Hãy dẫn tôi đến Quầy vé A"
+        assert admin_data["voice_response"] == "Đang tìm kiếm Quầy vé A"
+        assert admin_data["can_manual_control"] is True
+        assert admin_data["is_manual_controller"] is False
+        assert admin_data["manual_lock_reason"] is None
+
+        # Khách nặc danh khác (không phải requester và không phải Admin)
+        r_guest = await client.get("/api/robot/status")
+        assert r_guest.status_code == 200
+        guest_data = r_guest.json()
+        assert guest_data["voice_transcript"] is None
+        assert guest_data["voice_response"] is None
+        assert guest_data["can_manual_control"] is False
+        assert guest_data["manual_lock_reason"] == "Yêu cầu quyền Admin"
 
     app.dependency_overrides.pop(get_robot_adapter, None)
 

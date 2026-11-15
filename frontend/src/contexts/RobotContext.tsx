@@ -255,6 +255,9 @@ export function RobotProvider({ children }: { children: ReactNode }) {
             message: rob.message || '',
             manualConsumerAvailable: rob.manual_consumer_available ?? false,
             manualOperatorId: rob.manual_operator_id ?? null,
+            canManualControl: rob.can_manual_control ?? false,
+            isManualController: rob.is_manual_controller ?? false,
+            manualLockReason: rob.manual_lock_reason ?? null,
             readiness: rob.readiness ?? null,
             lastUpdated: rob.last_updated || Date.now(),
           });
@@ -409,7 +412,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const sendManualVelocity = async (
+  const sendManualVelocity = useCallback(async (
     linear_x: number,
     angular_z: number,
     seq?: number,
@@ -426,7 +429,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     } catch {
       return false;
     }
-  };
+  }, []);
 
   const upsertDestination = async (dest: Destination) => {
     try {

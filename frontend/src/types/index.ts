@@ -96,6 +96,9 @@ export interface RobotStatus {
   destinationsVersion?: number;
   manualConsumerAvailable?: boolean;
   manualOperatorId?: string | null;
+  canManualControl?: boolean;
+  isManualController?: boolean;
+  manualLockReason?: string | null;
   readiness?: {
     ready: boolean;
     reasons: string[];

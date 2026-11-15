@@ -33,6 +33,7 @@ class ApiClient {
   private passengerToken: string | null = null;
   private tokenPromise: Promise<string | null> | null = null;
   private authErrorListeners: Set<() => void> = new Set();
+  private tokenChangeListeners: Set<(adminToken: string | null, passengerToken: string | null) => void> = new Set();
 
   constructor() {
     try {
@@ -44,6 +45,21 @@ class ApiClient {
       }
     } catch {
       // ignore storage errors
+    }
+  }
+
+  onTokenChange(cb: (adminToken: string | null, passengerToken: string | null) => void): () => void {
+    this.tokenChangeListeners.add(cb);
+    return () => this.tokenChangeListeners.delete(cb);
+  }
+
+  private notifyTokenChange(): void {
+    for (const cb of this.tokenChangeListeners) {
+      try {
+        cb(this.token, this.passengerToken);
+      } catch (e) {
+        console.error('Lỗi khi thực thi TokenChange callback:', e);
+      }
     }
   }
 
@@ -75,6 +91,7 @@ class ApiClient {
       } catch {
         // ignore
       }
+      this.notifyTokenChange();
     }
 
     if (!this.tokenPromise) {
@@ -93,6 +110,7 @@ class ApiClient {
               } catch {
                 // ignore
               }
+              this.notifyTokenChange();
               return data.session_token;
             }
           }
@@ -116,6 +134,7 @@ class ApiClient {
         const stored = sessionStorage.getItem('airport_passenger_token');
         if (stored && !isTokenExpired(stored)) {
           this.passengerToken = stored;
+          this.notifyTokenChange();
           return stored;
         }
       }
@@ -127,10 +146,12 @@ class ApiClient {
 
   setToken(t: string) {
     this.token = t;
+    this.notifyTokenChange();
   }
 
   clearToken() {
     this.token = null;
+    this.notifyTokenChange();
   }
 
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
