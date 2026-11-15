@@ -86,12 +86,19 @@ class BaseRobotAdapter(ABC):
         pass
 
     @abstractmethod
-    def set_manual_control(self, enable: bool, operator_id: str = "") -> Dict[str, Any]:
+    def set_manual_control(self, enable: bool, operator_id: str = "", force: bool = False) -> Dict[str, Any]:
         """Gọi service SetBool /airport/control/set_manual"""
         pass
 
     @abstractmethod
-    def send_manual_velocity(self, linear_x: float, angular_z: float, operator_id: str = "") -> Dict[str, Any]:
+    def send_manual_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        operator_id: str = "",
+        seq: int = 0,
+        hold_id: str = ""
+    ) -> Dict[str, Any]:
         """Gửi lệnh vận tốc TwistStamped vào /airport/cmd_vel_manual"""
         pass
 
@@ -123,6 +130,14 @@ class BaseRobotAdapter(ABC):
     def get_map_image(self, version: str) -> Optional[bytes]:
         """Lấy dữ liệu bytes PNG của đúng phiên bản bản đồ được yêu cầu"""
         pass
+
+    def has_valid_pose(self) -> bool:
+        """Kiểm tra xem robot đã có tọa độ định vị AMCL hợp lệ trong frame map hay chưa"""
+        return True
+
+    def get_readiness(self) -> Dict[str, Any]:
+        """Trả về điều kiện và tính sẵn sàng dẫn đường của robot"""
+        return {"ready": True, "reasons": [], "reason": "Hệ thống sẵn sàng"}
 
     def get_operational_events(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Lấy danh sách nhật ký sự kiện vận hành gần nhất (dành riêng cho Admin)"""

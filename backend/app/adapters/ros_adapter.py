@@ -417,34 +417,58 @@ class RosRobotAdapter(BaseRobotAdapter):
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
         """Callback cho PoseWithCovarianceStamped từ AMCL (/amcl_pose).
         Đọc msg.pose.pose (2-level nesting) thay vì msg.pose (1-level).
+        Kiểm tra frame 'map', giá trị số hữu hạn, quaternion chuẩn hóa và epoch clock.
         """
+        frame_id = msg.header.frame_id
+        if frame_id != "map":
+            logger.warning(
+                f"Từ chối pose nhận được trong frame '{frame_id}' (yêu cầu bắt buộc là 'map')."
+            )
+            return
+
+        pose = msg.pose.pose
+        px = float(pose.position.x)
+        py = float(pose.position.y)
+        q = pose.orientation
+        qx, qy, qz, qw = float(q.x), float(q.y), float(q.z), float(q.w)
+
+        if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(qx) and math.isfinite(qy) and math.isfinite(qz) and math.isfinite(qw)):
+            logger.warning("Từ chối pose chứa giá trị không hợp lệ (NaN hoặc Inf).")
+            return
+
+        q_norm_sq = qx * qx + qy * qy + qz * qz + qw * qw
+        if abs(q_norm_sq - 1.0) > 0.1 or q_norm_sq < 1e-6:
+            logger.warning(f"Từ chối pose chứa quaternion không chuẩn hóa (norm={q_norm_sq:.3f}).")
+            return
+
         with self._lock:
-            pose = msg.pose.pose
-            q = pose.orientation
-            theta = quaternion_to_yaw(q.x, q.y, q.z, q.w)
+            pose_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            if self._cfg.use_sim_time and self._last_clock_sec is not None:
+                # Nếu pose timestamp thuộc phiên trước (clock đã quay lùi mà pose cũ đến muộn)
+                if pose_sec > self._last_clock_sec + 3.0:
+                    logger.warning(
+                        f"Từ chối pose đến muộn với timestamp {pose_sec:.1f}s vượt quá sim clock hiện tại ({self._last_clock_sec:.1f}s)."
+                    )
+                    return
+
+            theta = quaternion_to_yaw(qx, qy, qz, qw)
             self._pose = {
-                "x": float(pose.position.x),
-                "y": float(pose.position.y),
+                "x": px,
+                "y": py,
                 "theta": float(theta)
             }
-            frame_id = msg.header.frame_id
             self._pose_frame_id = frame_id
             self._pose_stamp = {
                 "sec": msg.header.stamp.sec,
                 "nanosec": msg.header.stamp.nanosec
             }
             self._last_pose_time = time.time()
+            self._last_pose_time_mono = time.monotonic()
             self._pose_received_epoch = self._pose_epoch
             self._sim_restarted = False
             self._is_connected = True
             if self._message == "Đang kết nối tới các topic ROS...":
                 self._message = "Hệ thống sẵn sàng đón khách"
-
-            if frame_id != "map":
-                logger.warning(
-                    f"Pose nhận được trong frame '{frame_id}' thay vì 'map'. "
-                    f"Tọa độ hiển thị có thể không chính xác."
-                )
 
     def _on_clock(self, msg: Clock):
         """Callback /clock cho sim profile. Phát hiện clock tạm dừng và restart."""
@@ -467,10 +491,19 @@ class RosRobotAdapter(BaseRobotAdapter):
                         self._path = None
                         self._path_version = getattr(self, "_path_version", 0) + 1
 
+                # Phân biệt clock tiến với clock giữ nguyên cùng giá trị (sim pause)
+                if new_sec > self._last_clock_sec + 1e-6:
+                    self._last_clock_advancing_monotonic = now_mono
+                    self._clock_stalled = False
+                elif now_mono - getattr(self, "_last_clock_advancing_monotonic", now_mono) > 1.0:
+                    # Clock liên tục nhận cùng một giá trị trong > 1 giây
+                    self._clock_stalled = True
+            else:
+                self._last_clock_advancing_monotonic = now_mono
+                self._clock_stalled = False
+
             self._last_clock_sec = new_sec
             self._last_clock_monotonic = now_mono
-            # Mỗi khi nhận clock message, clock đang tiến → bỏ flag stalled
-            self._clock_stalled = False
 
     @staticmethod
     def _occupancy_grid_to_png(data: Any, width: int, height: int) -> bytes:
@@ -603,51 +636,20 @@ class RosRobotAdapter(BaseRobotAdapter):
             self._voice_state = msg.data
 
     def _on_voice_transcript(self, msg: String):
+        """Callback nhận kết quả nhận dạng giọng nói từ ROS topic (/airport/voice/transcript).
+        Tránh hoàn toàn khóa lồng nhau (deadlock).
+        Interface ROS hiện tại dùng std_msgs/String không có trường correlation (session_id / request_id).
+        Do đó đề xuất tự động trong ROS mode được giữ an toàn (khóa) cho đến khi có ROS interface hợp đồng đầy đủ.
+        """
+        transcript_text = str(msg.data).strip() if msg.data else ""
         with self._lock:
-            self._voice_transcript = msg.data
-            if getattr(self, "_voice_requester_id", ""):
-                match_res = match_destination_from_transcript(msg.data, self.get_destinations())
-                now_ms = int(time.time() * 1000)
-                if match_res["status"] == "MATCHED":
-                    dest = match_res["destination"]
-                    self._voice_proposal = {
-                        "proposal_id": str(uuid.uuid4()),
-                        "requester_id": self._voice_requester_id,
-                        "session_id": getattr(self, "_voice_session_id", ""),
-                        "status": "MATCHED",
-                        "destination_id": dest["id"],
-                        "destination_name": dest["name"],
-                        "transcript": msg.data,
-                        "created_at": now_ms,
-                        "expires_at": now_ms + 30000,
-                        "confirmed": False,
-                    }
-                elif match_res["status"] == "AMBIGUOUS":
-                    self._voice_proposal = {
-                        "proposal_id": str(uuid.uuid4()),
-                        "requester_id": self._voice_requester_id,
-                        "session_id": getattr(self, "_voice_session_id", ""),
-                        "status": "AMBIGUOUS",
-                        "destination_id": None,
-                        "destination_name": None,
-                        "transcript": msg.data,
-                        "created_at": now_ms,
-                        "expires_at": now_ms + 30000,
-                        "confirmed": False,
-                    }
-                else:
-                    self._voice_proposal = {
-                        "proposal_id": str(uuid.uuid4()),
-                        "requester_id": self._voice_requester_id,
-                        "session_id": getattr(self, "_voice_session_id", ""),
-                        "status": "NO_MATCH",
-                        "destination_id": None,
-                        "destination_name": None,
-                        "transcript": msg.data,
-                        "created_at": now_ms,
-                        "expires_at": now_ms + 30000,
-                        "confirmed": False,
-                    }
+            self._voice_transcript = transcript_text
+            # Ghi nhận transcript nhưng không tạo proposal tự động khi thiếu hợp đồng phiên ROS
+            self._voice_proposal = None
+            logger.debug(
+                f"Nhận transcript từ ROS voice node: '{transcript_text}'. "
+                f"Interface std_msgs/String chưa có trường session_id; giữ đề xuất khóa trong ROS mode."
+            )
 
     def _on_alerts(self, msg: DiagnosticArray):
         with self._lock:
@@ -708,6 +710,30 @@ class RosRobotAdapter(BaseRobotAdapter):
             ]
             self._path_version = getattr(self, "_path_version", 0) + 1
 
+    def has_valid_pose(self) -> bool:
+        """Kiểm tra xem robot đã có tọa độ định vị AMCL hợp lệ trong frame map hay chưa"""
+        with self._lock:
+            return self._has_valid_pose_locked()
+
+    def _has_valid_pose_locked(self) -> bool:
+        if not self._pose:
+            return False
+        if getattr(self, "_pose_frame_id", "") != "map":
+            return False
+        x = self._pose.get("x")
+        y = self._pose.get("y")
+        theta = self._pose.get("theta")
+        if not (isinstance(x, (int, float)) and isinstance(y, (int, float)) and isinstance(theta, (int, float))):
+            return False
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(theta)):
+            return False
+        if hasattr(self, "_cfg") and self._cfg and self._cfg.use_sim_time:
+            if getattr(self, "_sim_restarted", False):
+                return False
+            if getattr(self, "_pose_received_epoch", 0) != getattr(self, "_pose_epoch", 0):
+                return False
+        return True
+
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
             now = time.time()
@@ -722,12 +748,8 @@ class RosRobotAdapter(BaseRobotAdapter):
                 else:
                     self._clock_stalled = True
 
-                # Pose hợp lệ: đã nhận ít nhất 1 pose và thuộc đúng epoch hiện tại
-                has_valid_pose = (
-                    self._pose is not None
-                    and not getattr(self, "_sim_restarted", False)
-                    and (getattr(self, "_pose_received_epoch", 0) == getattr(self, "_pose_epoch", 0))
-                )
+                # Pose hợp lệ: dùng hàm kiểm tra chuẩn hóa
+                has_valid_pose = self._has_valid_pose_locked()
 
                 # is_connected cho sim:
                 # - True nếu có pose hợp lệ và sim clock đang hoạt động
@@ -797,30 +819,8 @@ class RosRobotAdapter(BaseRobotAdapter):
                 "manual_operator_id": getattr(self, "_manual_operator_id", None),
             }
 
-            reasons = []
-            if not is_conn:
-                reasons.append("Chưa kết nối với hệ thống ROS 2 hoặc robot đang offline.")
-            elif is_stale:
-                reasons.append("Dữ liệu ROS bị gián đoạn hoặc quá cũ (stale data).")
-            if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False):
-                reasons.append("Mô phỏng Gazebo đang tạm dừng (clock không tiến).")
-            if not self._pose:
-                reasons.append("Chưa có vị trí định vị robot từ AMCL (/amcl_pose).")
-            if not getattr(self, "_map_version", None) or not getattr(self, "_map_png", None):
-                reasons.append("Chưa nhận được bản đồ OccupancyGrid từ ROS (/map).")
-            if self._control_mode == "MANUAL":
-                reasons.append("Robot đang ở chế độ MANUAL (Cần chuyển sang AUTO).")
-            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
-                reasons.append(f"Robot đang có chuyến dẫn đường hoạt động ({self._navigation_state}).")
-            if getattr(self, "_nav2_has_active_goal", False) and not self._current_goal_handle:
-                reasons.append("Nav2 đang bận thực hiện mục tiêu ngoại vi (từ RViz hoặc phiên trước).")
+            result["readiness"] = self._get_readiness_locked()
 
-            result["readiness"] = {
-                "ready": len(reasons) == 0,
-                "reasons": reasons
-            }
-
-            # Thông tin bổ sung cho sim profile
             if self._cfg.use_sim_time:
                 result["sim_clock_stalled"] = self._clock_stalled
                 result["sim_restarted"] = self._sim_restarted and not (
@@ -828,6 +828,42 @@ class RosRobotAdapter(BaseRobotAdapter):
                 )
 
             return result
+
+    def get_readiness(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._get_readiness_locked()
+
+    def _get_readiness_locked(self) -> Dict[str, Any]:
+        reasons = []
+        if hasattr(self, "_action_nav") and self._action_nav is not None:
+            try:
+                if not self._action_nav.server_is_ready():
+                    reasons.append("Action server Nav2 (/navigate_to_pose) chưa sẵn sàng.")
+            except Exception:
+                reasons.append("Không thể kết nối tới Action server Nav2.")
+        elif not HAS_NAV2_ACTION:
+            reasons.append("Nav2 action client chưa được nạp trong môi trường ROS.")
+
+        if not getattr(self, "_is_connected", False):
+            reasons.append("Chưa kết nối với hệ thống ROS 2 hoặc robot đang offline.")
+        if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False):
+            reasons.append("Mô phỏng Gazebo đang tạm dừng (clock không tiến).")
+        if not self._has_valid_pose_locked():
+            reasons.append("Chưa có vị trí định vị robot hợp lệ từ AMCL trong frame map.")
+        if not getattr(self, "_map_version", None) or not getattr(self, "_map_png", None):
+            reasons.append("Chưa nhận được bản đồ OccupancyGrid từ ROS (/map).")
+        if self._control_mode == "MANUAL":
+            reasons.append("Robot đang ở chế độ MANUAL (Cần chuyển sang AUTO trước khi dẫn đường).")
+        if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
+            reasons.append(f"Robot đang có chuyến dẫn đường hoạt động ({self._navigation_state}).")
+        if getattr(self, "_nav2_has_active_goal", False) and not self._current_goal_handle:
+            reasons.append("Nav2 đang bận thực hiện mục tiêu ngoại vi (từ RViz hoặc phiên trước).")
+
+        return {
+            "ready": len(reasons) == 0,
+            "reasons": reasons,
+            "reason": reasons[0] if reasons else "Hệ thống sẵn sàng đón khách"
+        }
 
     def _load_destinations(self) -> List[Dict[str, Any]]:
         """
@@ -1062,6 +1098,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 return {"success": False, "message": f"Không thể lưu điểm đến: {save_err}"}
 
             self._destinations_version = getattr(self, "_destinations_version", 0) + 1
+            event_logger.add_event("SUCCESS", "DESTINATION", f"Đã lưu điểm đến '{name}' ({dest_id})")
             return {"success": True, "message": f"Đã lưu điểm đến '{name}' thành công"}
 
     def delete_destination(self, destination_id: str) -> Dict[str, Any]:
@@ -1105,6 +1142,7 @@ class RosRobotAdapter(BaseRobotAdapter):
 
             self._destinations_version = getattr(self, "_destinations_version", 0) + 1
             deleted_name = deleted_dest.get("name") or dest_id
+            event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
             logger.info(
                 f"Đã xóa thành công điểm đến '{dest_id}' ({deleted_name}). "
                 f"Danh sách còn lại {len(self._destinations)} điểm. destinations_version={self._destinations_version}"
@@ -1867,16 +1905,20 @@ class RosRobotAdapter(BaseRobotAdapter):
                     self._publish_zero_velocity()
                     self._current_manual_twist = (0.0, 0.0)
 
-    def set_manual_control(self, enable: bool, operator_id: str = "") -> Dict[str, Any]:
+    def set_manual_control(self, enable: bool, operator_id: str = "", force: bool = False) -> Dict[str, Any]:
         with self._lock:
             if enable:
                 # 1. Kiểm tra kết nối robot và clock stalled
-                has_pose = bool(getattr(self, "_pose", None) is not None)
-                clock_stalled = getattr(self, "_clock_stalled", False) if (hasattr(self, "_cfg") and self._cfg and self._cfg.use_sim_time) else False
-                if not has_pose or clock_stalled:
+                if not self._has_valid_pose_locked():
                     return {
                         "success": False,
-                        "message": "Không thể chuyển sang MANUAL: Robot chưa kết nối hoặc mô phỏng tạm dừng."
+                        "message": "Không thể chuyển sang MANUAL: Chưa có dữ liệu vị trí AMCL hợp lệ hoặc mô phỏng vừa reset."
+                    }
+                clock_stalled = getattr(self, "_clock_stalled", False) if (hasattr(self, "_cfg") and self._cfg and self._cfg.use_sim_time) else False
+                if clock_stalled:
+                    return {
+                        "success": False,
+                        "message": "Không thể chuyển sang MANUAL: Mô phỏng đang tạm dừng (clock stalled)."
                     }
 
                 # 2. Kiểm tra chuyến dẫn đường đang chạy hoặc tạm dừng
@@ -1896,7 +1938,7 @@ class RosRobotAdapter(BaseRobotAdapter):
 
                 # 4. Kiểm tra quyền phiên Admin (Single Admin control)
                 current_op = getattr(self, "_manual_operator_id", None)
-                if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id:
+                if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id and not force:
                     return {
                         "success": False,
                         "message": f"Quyền điều khiển thủ công đang thuộc về Admin khác ({current_op})."
@@ -1906,6 +1948,8 @@ class RosRobotAdapter(BaseRobotAdapter):
                 self._manual_operator_id = operator_id
                 self._last_manual_cmd_time = time.monotonic()
                 self._current_manual_twist = (0.0, 0.0)
+                self._active_hold_id = None
+                self._last_manual_seq = 0
                 self._message = f"Chế độ điều khiển thủ công (MANUAL) được kích hoạt bởi {operator_id or 'Admin'}."
 
                 # Gọi ROS service nếu có và đã sẵn sàng (không block nếu chưa có server trong Gazebo)
@@ -1923,6 +1967,8 @@ class RosRobotAdapter(BaseRobotAdapter):
             else:
                 self._control_mode = "AUTO"
                 self._manual_operator_id = None
+                self._active_hold_id = None
+                self._last_manual_seq = 0
                 self._publish_zero_velocity()
                 self._current_manual_twist = (0.0, 0.0)
                 self._last_manual_cmd_time = 0.0
@@ -1940,15 +1986,85 @@ class RosRobotAdapter(BaseRobotAdapter):
                 event_logger.track_control_mode("AUTO")
                 return {"success": True, "message": "Đã chuyển về chế độ tự động (AUTO)."}
 
-    def send_manual_velocity(self, linear_x: float, angular_z: float, operator_id: str = "") -> Dict[str, Any]:
+    def send_manual_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        operator_id: str = "",
+        seq: int = 0,
+        hold_id: str = ""
+    ) -> Dict[str, Any]:
         with self._lock:
+            if not hasattr(self, "_released_hold_ids"):
+                self._released_hold_ids = set()
+
+            # 1. Lệnh Dừng (linear=0, angular=0): Cho phép bất kỳ Admin nào gọi để dừng an toàn
+            is_stop_cmd = (abs(linear_x) < 1e-4 and abs(angular_z) < 1e-4)
+            if is_stop_cmd:
+                self._publish_zero_velocity()
+                self._current_manual_twist = (0.0, 0.0)
+                self._last_manual_cmd_time = time.monotonic()
+                if hold_id:
+                    self._released_hold_ids.add(hold_id)
+                self._active_hold_id = None
+                if seq > getattr(self, "_last_manual_seq", 0):
+                    self._last_manual_seq = seq
+                return {"success": True, "message": "Đã gửi lệnh dừng robot an toàn."}
+
+            # 2. Kiểm tra chế độ MANUAL
             if getattr(self, "_control_mode", "AUTO") != "MANUAL":
                 return {"success": False, "message": "Robot không ở chế độ điều khiển thủ công (MANUAL)."}
 
+            # 3. Kiểm tra phiên Admin đang giữ quyền
             current_op = getattr(self, "_manual_operator_id", None)
             if current_op and operator_id and current_op != operator_id:
-                return {"success": False, "message": f"Quyền điều khiển đang thuộc về Admin khác ({current_op})."}
+                return {"success": False, "message": f"Quyền điều khiển đang thuộc về phiên Admin khác ({current_op})."}
 
+            # 4. Kiểm tra dữ liệu đầu vào hữu hạn
+            if not (math.isfinite(linear_x) and math.isfinite(angular_z)):
+                return {"success": False, "message": "Giá trị vận tốc không hợp lệ (NaN hoặc Inf)."}
+
+            # 5. Kiểm tra đường điều khiển đã được xác minh (consumer có sẵn)
+            if not self.is_manual_consumer_available():
+                return {
+                    "success": False,
+                    "message": "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận."
+                }
+
+            # 6. Kiểm tra vị trí và clock
+            if not self._has_valid_pose_locked():
+                return {
+                    "success": False,
+                    "message": "Không thể lái tay: Chưa có vị trí định vị AMCL hợp lệ hoặc mô phỏng vừa reset."
+                }
+            if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False):
+                return {
+                    "success": False,
+                    "message": "Không thể lái tay: Mô phỏng đang tạm dừng (sim clock stalled)."
+                }
+
+            # 7. Kiểm tra không có chuyến dẫn đường đang hoạt động
+            nav_state = getattr(self, "_navigation_state", "IDLE")
+            if nav_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") or getattr(self, "_has_goal", False):
+                return {
+                    "success": False,
+                    "message": f"Không thể lái tay: Đang có chuyến dẫn đường ({nav_state})."
+                }
+
+            # 8. Xử lý thứ tự yêu cầu HTTP / Sequence check & Hold release check
+            if hold_id:
+                if hold_id in self._released_hold_ids:
+                    return {"success": True, "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."}
+                if getattr(self, "_active_hold_id", None) != hold_id:
+                    self._active_hold_id = hold_id
+                    self._last_manual_seq = seq
+                else:
+                    last_seq = getattr(self, "_last_manual_seq", 0)
+                    if seq > 0 and seq < last_seq:
+                        return {"success": True, "message": "Bỏ qua lệnh vận tốc đến trễ (out of sequence)."}
+                    self._last_manual_seq = seq
+
+            # 9. Giới hạn vận tốc
             if not hasattr(self, "_pub_cmd_vel") or not self._pub_cmd_vel:
                 return {"success": False, "message": "Topic vận tốc chưa được khởi tạo."}
 

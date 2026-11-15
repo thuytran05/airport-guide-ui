@@ -30,3 +30,8 @@ def get_robot_adapter() -> BaseRobotAdapter:
         logger.info("Đang sử dụng MockRobotAdapter (Dữ liệu mô phỏng phía Backend).")
 
     return _adapter_instance
+
+def set_robot_adapter(adapter: Optional[BaseRobotAdapter]) -> None:
+    global _adapter_instance
+    _adapter_instance = adapter
+

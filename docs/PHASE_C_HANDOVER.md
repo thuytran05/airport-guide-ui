@@ -984,3 +984,275 @@ Khi muốn tự nghiệm thu tính năng Điều khiển tay trên Gazebo:
 
 
 
+
+---
+
+## 16. PHẦN 16 — BIÊN BẢN SỬA LỖI HỆ THỐNG TOÀN DIỆN & TỐI ƯU HÓA DASHBOARD ADMIN (15/11/2026)
+
+### 16.1. Nguyên Nhân Gốc & Giải Pháp Kỹ Thuật Cho 6 Vấn Đề
+
+```mermaid
+flowchart TD
+    subgraph Frontend ["Giao diện Web (React / TypeScript)"]
+        Dpad["D-pad 5 nút (Góc bản đồ)"]
+        ToolBar["Thanh công cụ: Gộp AUTO / MANUAL"]
+        Readiness["Readiness Bar + Accordion 8 phân hệ"]
+        EventLogUI["Nhật ký vận hành (WebSocket + Refresh)"]
+    end
+
+    subgraph Backend ["FastAPI Gateway & Adapter"]
+        FastAPI_DI["Dependency Injection: Depends(get_robot_adapter)"]
+        SeqGuard["Chống gói tin trễ: _released_hold_ids & seq check"]
+        MultiAdmin["Phân quyền Admin: manual_operator_id"]
+        AMCL_Epoch["Xác thực AMCL: Frame, NaN/Inf, Clock Rewind"]
+        EventLogger["RAM Circular Buffer (100 sự kiện)"]
+    end
+
+    subgraph ROS2 ["Hạ tầng ROS 2 Jazzy & Gazebo"]
+        AMCL_Node["/amcl_pose (map frame)"]
+        Clock_Node["/clock (Sim Time)"]
+        SafetyMonitor["collision_monitor -> /cmd_vel"]
+    end
+
+    Dpad -->|send_manual_velocity (hold_id, seq)| SeqGuard
+    ToolBar -->|POST /api/robot/control-mode| MultiAdmin
+    FastAPI_DI --> SeqGuard
+    FastAPI_DI --> MultiAdmin
+    AMCL_Node -->|Pose Msg| AMCL_Epoch
+    Clock_Node -->|Clock Msg| AMCL_Epoch
+    EventLogger -->|WebSocket Broadcast: OPERATIONAL_EVENT| EventLogUI
+    AMCL_Epoch -->|Telemetry: Sẵn sàng| Readiness
+```
+
+#### 1. Khóa luồng / Async Blocking & Chuẩn Hóa FastAPI Dependency Injection
+- **Nguyên nhân gốc:** Trong `backend/app/api/robot_router.py`, các endpoint ban đầu gọi trực tiếp hàm singleton `get_robot_adapter()` ngay trong thân hàm xử lý thay vì thông qua cơ chế Dependency Injection của FastAPI (`adapter: BaseRobotAdapter = Depends(get_robot_adapter)`). Do đó, khi chạy các bài test tích hợp có override dependency (`app.dependency_overrides[get_robot_adapter] = lambda: mock_adapter`), FastAPI không thể tiêm adapter giả lập vào endpoint, dẫn đến gọi nhầm vào adapter thật hoặc gây sai lệch trạng thái test.
+- **Giải pháp:** 
+  - Khai báo bổ sung hàm `set_robot_adapter()` trong `backend/app/adapters/factory.py` để hỗ trợ thiết lập adapter cô lập cho test suite.
+  - Chuẩn hóa toàn bộ 18 endpoints trong `robot_router.py` sử dụng tham số `adapter: BaseRobotAdapter = Depends(get_robot_adapter)`.
+  - Mọi thao tác bất đồng bộ (voice service watchdog, async sleep) đều được bọc an toàn trong `asyncio.to_thread` hoặc `asyncio.wait_for`, triệt tiêu hoàn toàn nguy cơ block FastAPI event loop.
+
+#### 2. Đồng bộ Phiên Người Dùng & Phân Quyền Chủ Sở Hữu (Passenger Session & Ownership)
+- **Nguyên nhân gốc:** Khi một người dùng mở trang web ở chế độ ẩn danh hoặc lần đầu truy cập, trình duyệt chưa có token đăng nhập (`token = null`). Các request REST và kết nối WebSocket ban đầu rơi vào trạng thái người dùng ẩn danh chưa định danh, khiến backend không thể gắn `session_id` cho chuyến đi, cờ `is_owner` trả về `false`, và người dùng phải tải lại trang (F5) thì phiên mới hoạt động.
+- **Giải pháp:**
+  - Nâng cấp `frontend/src/contexts/AuthContext.tsx`: Bổ sung cơ chế tự động cấp `passengerToken` thông qua API `/api/auth/passenger-session` ngay khi ứng dụng mount nếu chưa có token nào.
+  - Thiết lập thuộc tính `effectiveToken = token || passengerToken`, bảo đảm mọi request HTTP và kết nối WebSocket (`/api/ws/telemetry?token=...`) đều mang danh tính phiên hợp lệ.
+  - Trong `frontend/src/contexts/RobotContext.tsx`, tích hợp cơ chế cập nhật lạc quan (optimistic update) `isOwner: true` ngay khi hành khách bấm Bắt đầu dẫn đường, đồng thời kiểm tra và cấp mới session token trước khi phát lệnh API nếu token bị thiếu.
+
+#### 3. Điều Khiển Tay Đa Phiên Admin (Multi-Session Admin Control Arbitration)
+- **Nguyên nhân gốc:** Chưa có cơ chế khóa phân xử khi có nhiều Admin cùng mở Dashboard quản trị. Nếu Admin A bật chế độ MANUAL và đang lái robot, Admin B mở tab khác có thể vô tình gửi đè lệnh vận tốc hoặc không nhận biết được robot đang bị người khác điều khiển.
+- **Giải pháp:**
+  - Bổ sung trường `manual_operator_id` (User ID của Admin đang kích hoạt MANUAL) vào trạng thái robot và telemetry payload.
+  - Khi Admin A đang giữ quyền MANUAL, Admin B mở giao diện sẽ thấy banner cảnh báo màu vàng: *"🔒 Quyền điều khiển tay đang thuộc về Admin: [ID]. Bạn chỉ có thể theo dõi hoặc bấm TẮT THỦ CÔNG để dừng an toàn"*, đồng thời cụm D-pad của Admin B tự động bị vô hiệu hóa.
+  - Bất kỳ Admin nào cũng được phép bấm "TẮT THỦ CÔNG (VỀ AUTO)" để dừng an toàn robot ngay lập tức trong tình huống khẩn cấp.
+
+#### 4. Chống Gói Tin Đến Trễ / Đảo Thứ Tự & Quản Lý Hold Release (Hold Sequence Protection)
+- **Nguyên nhân gốc:** Khi người dùng nhả chuột khỏi nút điều khiển tay (Hold Release), frontend gửi lệnh dừng khẩn cấp ($v = 0, \omega = 0$). Tuy nhiên, do độ trễ mạng HTTP/REST hoặc hàng đợi kết nối, một gói tin vận tốc từ thao tác giữ nút trước đó (ví dụ $seq = 1$) có thể đến sau lệnh dừng, vô tình tái kích hoạt chuyển động của robot.
+- **Giải pháp:**
+  - Frontend gắn mã phiên bấm giữ `hold_id` duy nhất (`hold_<timestamp>_<random>`) và số thứ tự tăng dần `seq` cho mỗi lần truyền vận tốc (tần số 10Hz). Khi nhả nút hoặc chuột rời khỏi vùng bấm, frontend gửi lệnh dừng với `seq` tiếp theo và đánh dấu kết thúc `hold_id`.
+  - Tại cả `MockRobotAdapter` và `RosRobotAdapter`, triển khai tập hợp `_released_hold_ids` (hàng đợi tròn lưu tối đa 100 hold_id đã kết thúc). Bất kỳ request nào mang `hold_id` nằm trong danh sách đã giải phóng, hoặc có `seq <= _last_manual_seq` của cùng một hold, đều bị adapter từ chối ngay lập tức và không phát lệnh ra ROS.
+
+#### 5. Xác Thực Định Vị AMCL, Khung Tọa Độ & Phát Hiện Clock Rewind / Stalled
+- **Nguyên nhân gốc:** Khi Gazebo được reset hoặc khởi động lại, topic `/clock` bị tua ngược thời gian về 0 trong khi node AMCL có thể tiếp tục giữ pose cũ từ phiên trước, dẫn đến việc backend công nhận nhầm robot đã sẵn sàng. Ngoài ra, các pose thiếu `frame_id: map` hoặc chứa giá trị `NaN`/`Inf` không được lọc triệt để.
+- **Giải pháp:**
+  - Kiểm tra tính hợp lệ của message `PoseWithCovarianceStamped`: bắt buộc `header.frame_id == 'map'`, tọa độ $x, y, z$ và quaternion $x, y, z, w$ phải là số thực hữu hạn (`math.isfinite()`).
+  - Theo dõi biến thiên `/clock`: Khi phát hiện bước nhảy lùi thời gian ($\Delta t < -1.0\text{s}$), adapter đánh dấu `sim_restarted = True`, hủy bỏ epoch AMCL hiện tại và chuyển trạng thái sang chờ pose mới của phiên mô phỏng mới trước khi công nhận `Robot: OK`.
+  - Giám sát đồng hồ mô phỏng bị đứng (`sim_clock_stalled`): Nếu hệ thống cấu hình `use_sim_time = True` nhưng `/clock` không thay đổi trong hơn 2.0 giây thực tế, adapter gắn cờ cảnh báo `sim_clock_stalled = True` và thông báo lý do lên Dashboard.
+
+#### 6. Đồng Bộ Nhật Ký Vận Hành Admin (RAM Circular Buffer Event Logger)
+- **Nguyên nhân gốc:** Trước đây các hành động thêm/sửa/xóa điểm đến trong `MockRobotAdapter` chưa gọi `event_logger.add_event()`, đồng thời giao diện Admin chưa có nút làm mới và chưa được liên kết chặt chẽ với kênh sự kiện WebSocket.
+- **Giải pháp:**
+  - Tích hợp `event_logger` xuyên suốt vào cả `RosRobotAdapter` và `MockRobotAdapter` cho mọi sự kiện cốt lõi: kết nối/mất kết nối ROS, chuyển chế độ AUTO/MANUAL, bắt đầu/tạm dừng/tiếp tục/hủy chuyến Nav2, thêm/sửa/xóa điểm đến bền vững.
+  - Bổ sung nút **"🔄 Làm mới"** trên thẻ Nhật ký vận hành Admin gọi hàm `refreshEvents()` từ API `/api/robot/admin/events`.
+  - WebSocket broadcaster tự động phát tin nhắn loại `OPERATIONAL_EVENT` mỗi khi có sự kiện mới, giúp giao diện Admin tự động cập nhật nhật ký theo thời gian thực mà không cần thao tác thủ công.
+
+---
+
+### 16.2. Bảng Ma Trận Trạng Thái 6 Nhóm Lỗi
+
+| STT | Vấn đề / Hạng mục kỹ thuật | Trạng thái Code & Test cô lập | Trạng thái Bản chạy Docker (Live) | Phụ thuộc ROS / Gazebo |
+|:---:|:---|:---:|:---:|:---|
+| **1** | FastAPI Dependency Injection & Khóa luồng | ✅ Sửa triệt để (18 routes) | ✅ Đã build & nạp vào container backend | ❌ Không phụ thuộc |
+| **2** | Phiên người dùng & Quyền chủ sở hữu chuyến | ✅ Sửa triệt để (`ensurePassengerSession`) | ✅ Đã build & nạp vào frontend | ❌ Không phụ thuộc |
+| **3** | Phân quyền điều khiển tay đa phiên Admin | ✅ Sửa triệt để (`manual_operator_id`) | ✅ Đã build & kiểm thử trực quan | ❌ Không phụ thuộc |
+| **4** | Chống gói tin trễ / đảo thứ tự (`hold_id`, `seq`) | ✅ Sửa triệt để (`_released_hold_ids`) | ✅ Đã build & kiểm thử an toàn | ❌ Không phụ thuộc |
+| **5** | AMCL Epoch, NaN/Inf & Gazebo Clock Rewind | ✅ Sửa triệt để (5 quy tắc xác thực) | ✅ Đã build & kiểm thử trên sim clock | ⚠️ Cần Gazebo phát `/amcl_pose` chuẩn |
+| **6** | Nhật ký vận hành Admin (RAM circular buffer) | ✅ Sửa triệt để (100 sự kiện) | ✅ Đã build, WebSocket push & Refresh OK | ❌ Không phụ thuộc |
+
+---
+
+### 16.3. Khảo Sát Đường Đi Của Lệnh Vận Tốc Trong ROS 2 & Cơ Chế An Toàn
+
+Qua quá trình kiểm tra môi trường ROS 2 Jazzy trên container `airport_guide_backend`, đường đi thực tế của lệnh vận tốc được xác định như sau:
+
+```mermaid
+flowchart LR
+    subgraph WebApp ["Airport Guide Backend (Docker)"]
+        ManualPub["Publisher: /airport/cmd_vel_manual (Twist)"]
+    end
+
+    subgraph Nav2_Stack ["Nav2 Navigation Stack"]
+        Nav2_Controller["Controller Server"]
+        Nav2_Smoother["velocity_smoother"]
+    end
+
+    subgraph Robot_Safety ["Lớp An Toàn & Phân Luồng (linorobot2)"]
+        CollisionMonitor["collision_monitor (time_before_collision: 1.2s)"]
+    end
+
+    subgraph Gazebo_Sim ["Gazebo Simulation"]
+        DiffDrive["DiffDrive Plugin -> /cmd_vel"]
+    end
+
+    Nav2_Controller --> Nav2_Smoother
+    Nav2_Smoother -->|/cmd_vel_smoothed| CollisionMonitor
+    CollisionMonitor -->|/cmd_vel| DiffDrive
+    ManualPub -.->|0 Subscriber (Chưa có twist_mux)| WebApp
+```
+
+- **Topic `/airport/cmd_vel_manual`:**
+  - Kiểu message: `geometry_msgs/msg/Twist`.
+  - Publisher: `airport_guide_backend`.
+  - Subscriber hiện tại: **0 subscriber**. Topic này hiện chưa có consumer lắng nghe trong không gian ROS của Gazebo.
+- **Topic `/cmd_vel_smoothed` và `/cmd_vel`:**
+  - Node `collision_monitor` (`linorobot2_gazebo`) đăng ký nhận topic `/cmd_vel_smoothed` và phát lệnh đã qua kiểm tra an toàn ra `/cmd_vel` với tham số `time_before_collision: 1.2s`.
+  - Nav2 tự động xuất lệnh qua `nav2_velocity_smoother` vào `/cmd_vel_smoothed`.
+- **Kết luận an toàn:**
+  - Web UI **tuyệt đối không phát thẳng vào `/cmd_vel`** vì làm như vậy sẽ vượt mặt (bypass) toàn bộ các lớp an toàn va chạm (`collision_monitor`) và làm mượt vận tốc.
+  - Giao diện Admin giữ cụm D-pad ở trạng thái an toàn (LOCKED) kèm thông báo rõ ràng cho người vận hành: *"⚠️ Đường lệnh điều khiển tay tới Gazebo (/airport/cmd_vel_manual) chưa có consumer (0 subscriber). Các nút vận tốc được khóa an toàn để tránh bỏ qua bộ phân luồng và các lớp an toàn"*.
+
+---
+
+### 16.4. Đề Xuất Cấu Hình Tối Thiểu Cho Workspace `ws` (Trình Duyệt Riêng)
+
+> [!IMPORTANT]
+> **Tuân thủ quy tắc bảo vệ Workspace `ws`:** Agent **không tự ý sửa đổi bất kỳ file nào** trong thư mục `/home/thuytran/ws`. Đề xuất dưới đây chỉ mang tính chất tham chiếu kỹ thuật để Người dùng tự duyệt và áp dụng khi muốn kích hoạt chuyển động tay trong Gazebo.
+
+Để kết nối topic `/airport/cmd_vel_manual` vào hệ thống lái của Linorobot2 mà vẫn bảo đảm đầy đủ an toàn va chạm, cấu hình tối thiểu cần bổ sung vào `ws` là sử dụng node `twist_mux`:
+
+1. **Tệp cấu hình đề xuất:** `src/linorobot2/linorobot2_navigation/config/twist_mux.yaml`
+   ```yaml
+   twist_mux:
+     ros__parameters:
+       topics:
+         navigation:
+           topic: cmd_vel_nav2
+           timeout: 0.5
+           priority: 10
+         manual:
+           topic: /airport/cmd_vel_manual
+           timeout: 0.5
+           priority: 100
+       locks:
+         pause:
+           topic: /airport/manual_override
+           timeout: 0.0
+           priority: 200
+   ```
+2. **Đường truyền:** `twist_mux` xuất ra `/cmd_vel_smoothed`, sau đó đi qua `collision_monitor` trước khi tới differential drive plugin của Gazebo. Nhờ vậy, lệnh điều khiển tay vừa có độ ưu tiên cao hơn Nav2 (priority 100 > 10), vừa được hệ thống cảm biến Lidar bảo vệ dừng xe tự động nếu cách chướng ngại vật dưới 1.2 giây di chuyển.
+
+---
+
+### 16.5. Bằng Chứng Nhật Ký Vận Hành Admin Đang Hoạt Động
+
+Dữ liệu kiểm chứng thực tế từ bộ đệm RAM circular buffer (100 sự kiện) thông qua API `/api/robot/admin/events`:
+
+```json
+{
+  "events": [
+    {
+      "id": "evt_1794736051964_1",
+      "timestamp": 1794736051964,
+      "level": "WARN",
+      "category": "CONNECTION",
+      "message": "Chưa kết nối với hệ thống ROS 2",
+      "details": {}
+    },
+    {
+      "id": "evt_1794736053568_2",
+      "timestamp": 1794736053568,
+      "level": "SUCCESS",
+      "category": "CONNECTION",
+      "message": "Đã phục hồi kết nối với hệ thống ROS 2",
+      "details": {}
+    },
+    {
+      "id": "evt_1794736117157_3",
+      "timestamp": 1794736117157,
+      "level": "INFO",
+      "category": "DESTINATION",
+      "message": "Đã xóa điểm đến 'Cổng Test Event' (gate_test_event)",
+      "details": {}
+    }
+  ],
+  "started_at": 1794736051074,
+  "version": 3,
+  "total": 3
+}
+```
+
+- **Kiểm chứng tính năng "🔄 Làm mới":** Nút bấm gọi thành công API backend, đồng bộ danh sách 3 sự kiện gần nhất lên giao diện Admin.
+- **Kiểm chứng phân quyền:** Request không có header `Authorization: Bearer <admin_token>` bị từ chối với lỗi: `{"detail":"Quyền hạn không đủ. Yêu cầu quyền: admin"}`.
+
+---
+
+### 16.6. Bằng Chứng Trực Quan Giao Diện Admin Mới Sau Khi Tái Cấu Trúc
+
+Giao diện Quản trị viên (Admin Dashboard) đã được thiết kế lại tối ưu theo đúng yêu cầu:
+
+1. **Bản đồ chiếm ưu thế vượt trội (Dominant Map):**
+   - Bản đồ đặt tại cột trái với tỉ lệ chiều rộng ~68% (`minmax(0, 2.1fr)`), chiều cao `clamp(480px, 65vh, 680px)`.
+   - Nút gạt chế độ **`BẬT THỦ CÔNG (MANUAL)`** được gộp trực tiếp vào thanh công cụ bản đồ phía trên góc phải, nằm cạnh các tab chọn chế độ bản đồ ("Bản đồ ROS" / "Sơ đồ hành khách").
+2. **Cụm 5 nút điều khiển tay (D-pad Overlay):**
+   - Vị trí: Đặt nổi tại góc dưới bên phải của bản đồ (`bottom: 16px; right: 16px; z-index: 20`).
+   - Thiết kế: Nền bán trong suốt tối màu (`rgba(15, 23, 42, 0.88)`), hiệu ứng làm mờ nền (backdrop blur).
+   - Bố cục 5 nút:
+     - Hàng 1: Nút **▲** (Tiến thẳng 0.25 m/s).
+     - Hàng 2: Nút **◀** (Quay trái 0.4 rad/s), nút trung tâm nhãn **`Dừng`** (màu đỏ nổi bật, dùng nhãn súc tích, không dùng thuật ngữ quá đà), nút **▶** (Quay phải -0.4 rad/s).
+     - Hàng 3: Nút **▼** (Lùi lại -0.2 m/s).
+   - Huy hiệu trạng thái: Hiển thị `AUTO` (khi ở chế độ tự động) hoặc `LOCKED` (khi đường lệnh `/airport/cmd_vel_manual` chưa có subscriber trên Gazebo).
+3. **Thanh trạng thái sẵn sàng (Readiness Bar) & Accordion:**
+   - Loại bỏ hoàn toàn các ô trạng thái trùng lặp chiếm diện tích.
+   - Thay thế bằng thanh trạng thái tổng thể duy nhất ở đầu trang: *"🟢 Robot sẵn sàng dẫn đường · SẴN SÀNG · Tất cả các hệ thống con hoạt động bình thường"*.
+   - Nút accordion **`⚙️ Chi tiết hệ thống ▼`** cho phép mở rộng/thu gọn danh sách 8 phân hệ (Gateway, AMCL, Map, Nav2, Mode, Active Trip, Battery, Voice) một cách mượt mà.
+4. **Nhật ký vận hành Admin gọn gàng bên dưới bản đồ:**
+   - Đặt ngay dưới bản đồ với tiêu đề `Nhật Ký Vận Hành Admin (X/100)`, hiển thị mốc thời gian bắt đầu bộ đệm RAM và tự động đồng bộ qua WebSocket.
+
+#### Hình ảnh nghiệm thu trực quan từ Browser Subagent:
+- **Ảnh tổng quan Admin Dashboard mới:** [admin_dashboard_redesigned.png](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/admin_dashboard_redesigned.png)
+- **Ảnh mở rộng Accordion 8 phân hệ:** [admin_subsystems_accordion.png](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/admin_subsystems_accordion.png)
+- **Ảnh chi tiết Nhật ký vận hành Admin:** [admin_event_log_live.png](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/admin_event_log_live.png)
+- **Ảnh màn hình Hành khách:** [passenger_page_verified.png](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/passenger_page_verified.png)
+
+---
+
+### 16.7. Checklist Các Bước Tự Nghiệm Thu Chuyển Động Trong Gazebo Dành Cho Người Dùng
+
+Để tự nghiệm thu chuyển động của robot trên Gazebo sau khi nhận bàn giao, Người dùng thực hiện theo các bước sau:
+
+#### Bước 1: Khởi động môi trường Gazebo & Dev Container
+- [ ] Khởi chạy Gazebo simulation và node điều hướng Nav2/AMCL trong Dev Container `thirsty_ishizaka`.
+- [ ] Xác nhận robot Linorobot2 xuất hiện trong thế giới mô phỏng và node `/amcl` bắt đầu phát tọa độ trên topic `/amcl_pose`.
+
+#### Bước 2: Kiểm tra kết nối Web Gateway
+- [ ] Mở trình duyệt truy cập Admin Dashboard: `http://localhost:5173/admin` (Đăng nhập: `admin` / `admin123`).
+- [ ] Xác nhận thanh trạng thái đầu trang hiển thị màu xanh: **`🟢 Robot sẵn sàng dẫn đường`**.
+- [ ] Nhấp vào **`⚙️ Chi tiết hệ thống ▼`**, xác nhận các phân hệ Gateway, AMCL, Bản đồ ROS và Nav2 đều có chấm xanh `OK`.
+
+#### Bước 3: Nghiệm thu chuyển động dẫn đường tự động (Nav2)
+- [ ] Tại bảng *Giám Sát & Điều Khiển Dẫn Đường (Nav2)* bên cột phải, chọn một điểm đến trong danh sách (ví dụ: *Cổng khởi hành số 1*).
+- [ ] Nhấp nút **`BẮT ĐẦU DẪN ĐƯỜNG`**.
+- [ ] Quan sát trong Gazebo: Robot bắt đầu xoay và lăn bánh di chuyển theo đường kẻ kế hoạch màu xanh lá trên bản đồ.
+- [ ] Thử bấm nút **`TẠM DỪNG`**: Xác nhận robot dừng đứng yên tại chỗ trong Gazebo, trạng thái chuyển thành `PAUSED`.
+- [ ] Bấm nút **`TIẾP TỤC DẪN ĐƯỜNG`**: Xác nhận robot tiếp tục lộ trình đến đích thành công.
+
+#### Bước 4: Nghiệm thu chế độ điều khiển tay (Manual D-pad)
+- [ ] (Nếu đã nạp cấu hình `twist_mux` cho `ws` theo mục 16.4): Trên thanh công cụ bản đồ, nhấp nút **`BẬT THỦ CÔNG (MANUAL)`**.
+- [ ] Xác nhận huy hiệu cụm D-pad chuyển sang màu xanh lá: **`MANUAL`**.
+- [ ] Nhấn và giữ nút **▲** (Tiến): Quan sát robot lăn bánh tiến thẳng trong Gazebo.
+- [ ] Thả chuột: Quan sát robot dừng lại ngay lập tức.
+- [ ] Thử nghiệm tương tự với nút **◀** (Quay trái), **▶** (Quay phải) và nút trung tâm **`Dừng`**.
+- [ ] Nhấp nút **`TẮT THỦ CÔNG (VỀ AUTO)`**: Xác nhận hệ thống trở về chế độ tự động an toàn.
+
+#### Bước 5: Kiểm tra Nhật ký vận hành Admin
+- [ ] Cuộn xuống bảng *Nhật Ký Vận Hành Admin* dưới bản đồ.
+- [ ] Nhấp nút **`🔄 Làm mới`**: Xác nhận các sự kiện chuyển đổi chế độ (`CONTROL: Đã chuyển sang chế độ thủ công (MANUAL)`, `NAVIGATION: Bắt đầu dẫn đường Nav2`) được ghi nhận đầy đủ kèm mốc thời gian chính xác.

@@ -309,6 +309,20 @@ export default function AdminDashboard() {
   // Vòng lặp gửi vận tốc 10Hz khi giữ nút điều khiển
   const driveTimerRef = useRef<any>(null);
   const activeVelRef = useRef<{ lin: number; ang: number }>({ lin: 0, ang: 0 });
+  const activeHoldIdRef = useRef<string | null>(null);
+  const holdSeqRef = useRef<number>(0);
+
+  const [showSystemDetails, setShowSystemDetails] = useState(false);
+  const [isRefreshingEvents, setIsRefreshingEvents] = useState(false);
+
+  const handleRefreshEvents = async () => {
+    setIsRefreshingEvents(true);
+    try {
+      await refreshEvents();
+    } finally {
+      setIsRefreshingEvents(false);
+    }
+  };
 
   const handleToggleManual = async () => {
     setIsSwitchingMode(true);
@@ -321,27 +335,47 @@ export default function AdminDashboard() {
     }
   };
 
-  const startDrive = (lin: number, ang: number) => {
-    if (!canDrive) return;
-    stopDrive();
-    activeVelRef.current = { lin, ang };
-    // Gửi ngay lập tức tick đầu tiên
-    sendManualVelocity(lin, ang);
-    // Gửi chu kỳ 10Hz (100ms) trong khi còn giữ nút
-    driveTimerRef.current = setInterval(() => {
-      sendManualVelocity(activeVelRef.current.lin, activeVelRef.current.ang);
-    }, 100);
-  };
-
-  const stopDrive = () => {
+  const stopDrive = useCallback(() => {
     if (driveTimerRef.current) {
       clearInterval(driveTimerRef.current);
       driveTimerRef.current = null;
     }
+    const finishedHoldId = activeHoldIdRef.current;
+    activeHoldIdRef.current = null;
     activeVelRef.current = { lin: 0, ang: 0 };
+    holdSeqRef.current += 1;
     if (isManual) {
-      sendManualVelocity(0, 0);
+      sendManualVelocity(0, 0, holdSeqRef.current, finishedHoldId || undefined);
     }
+  }, [isManual, sendManualVelocity]);
+
+  const startDrive = (lin: number, ang: number) => {
+    if (!canDrive) return;
+    if (driveTimerRef.current) {
+      clearInterval(driveTimerRef.current);
+      driveTimerRef.current = null;
+    }
+    const holdId = `hold_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    activeHoldIdRef.current = holdId;
+    holdSeqRef.current = 1;
+    activeVelRef.current = { lin, ang };
+
+    // Gửi ngay lập tức tick đầu tiên
+    sendManualVelocity(lin, ang, holdSeqRef.current, holdId);
+
+    // Gửi chu kỳ 10Hz (100ms) trong khi còn giữ nút
+    driveTimerRef.current = setInterval(async () => {
+      holdSeqRef.current += 1;
+      const ok = await sendManualVelocity(
+        activeVelRef.current.lin,
+        activeVelRef.current.ang,
+        holdSeqRef.current,
+        activeHoldIdRef.current || undefined
+      );
+      if (!ok) {
+        stopDrive();
+      }
+    }, 100);
   };
 
   useEffect(() => {
@@ -353,15 +387,19 @@ export default function AdminDashboard() {
 
     window.addEventListener('blur', handleStop);
     window.addEventListener('pagehide', handleStop);
+    window.addEventListener('pointerup', handleStop);
+    window.addEventListener('pointercancel', handleStop);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       stopDrive();
       window.removeEventListener('blur', handleStop);
       window.removeEventListener('pagehide', handleStop);
+      window.removeEventListener('pointerup', handleStop);
+      window.removeEventListener('pointercancel', handleStop);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [isManual]);
+  }, [stopDrive]);
 
   const handleSaveDestination = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -501,360 +539,481 @@ export default function AdminDashboard() {
 
   return (
     <div className={styles.container}>
-      {/* Hàng trạng thái nhanh */}
-      <div className={styles.statsRow}>
-        <div className={styles.statBox}>
-          <span className={styles.statLabel}>Chế độ điều khiển</span>
-          <strong className={`${styles.statValue} ${styles[status.controlMode.toLowerCase()]}`}>
-            {status.controlMode}
-          </strong>
+      {/* 1. Thanh trạng thái vận hành & sẵn sàng gọn gàng */}
+      <div className={styles.readinessBar}>
+        <div className={styles.readinessBarLeft}>
+          <span className={styles.readinessIcon}>
+            {readinessCheck.severity === 'ready' ? '🟢' : readinessCheck.severity === 'warn' ? '🟡' : '🔴'}
+          </span>
+          <div className={styles.readinessInfo}>
+            <div className={styles.readinessTitleLine}>
+              <strong className={styles.readinessTitle}>{readinessCheck.title}</strong>
+              <span
+                className={`${styles.readinessBadge} ${
+                  readinessCheck.severity === 'ready'
+                    ? styles.badgeReady
+                    : readinessCheck.severity === 'warn'
+                    ? styles.badgeWarn
+                    : styles.badgeErr
+                }`}
+              >
+                {readinessCheck.badge}
+              </span>
+            </div>
+            <div className={styles.readinessReason}>{readinessCheck.reason}</div>
+          </div>
         </div>
-        <div className={styles.statBox}>
-          <span className={styles.statLabel}>Dung lượng Pin</span>
-          <strong className={styles.statValue}>
-            {status.batteryPercent !== null
-              ? `${(status.batteryPercent * 100).toFixed(0)}%`
-              : 'Chưa có dữ liệu'}
-          </strong>
-        </div>
-        <div className={styles.statBox}>
-          <span className={styles.statLabel}>Tọa độ Robot (Map)</span>
-          <strong className={styles.statValue}>
-            {status.pose
-              ? `X: ${status.pose.x.toFixed(2)}m, Y: ${status.pose.y.toFixed(2)}m`
-              : 'Chưa có dữ liệu'}
-          </strong>
-        </div>
-        <div className={styles.statBox}>
-          <span className={styles.statLabel}>Trạng thái Điều hướng</span>
-          <strong className={styles.statValue}>{status.navigationState}</strong>
-        </div>
+        <button
+          type="button"
+          className={`${styles.detailsToggleBtn} ${showSystemDetails ? styles.detailsActive : ''}`}
+          onClick={() => setShowSystemDetails((v) => !v)}
+          title="Bật/tắt xem thông số kỹ thuật 8 hệ thống con"
+        >
+          ⚙️ Chi tiết hệ thống {showSystemDetails ? '▲' : '▼'}
+        </button>
       </div>
 
-      <div className={styles.grid}>
-        {/* Cột 1: Điều khiển thủ công & Điểm đến */}
-        <div className={styles.leftCol}>
-          {/* Card: Trạng Thái Sẵn Sàng & Vận Hành Hệ Thống */}
-          <div className={styles.card}>
-            <div className={styles.cardHeader}>
-              <h2 className={styles.cardTitle}>Trạng Thái Vận Hành & Sẵn Sàng</h2>
+      {/* Accordion 8 hệ thống con */}
+      {showSystemDetails && (
+        <div className={styles.subsystemsAccordion}>
+          <div className={styles.subsystemsList}>
+            {/* 1. Gateway / WebSocket */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Gateway / WebSocket</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    isBackendConnected ? styles.indicatorOk : styles.indicatorErr
+                  }`}
+                />
+              </div>
+              <span className={styles.subsystemVal}>
+                {isBackendConnected ? 'Đã kết nối' : 'Mất kết nối'}
+              </span>
             </div>
 
-            {/* Banner tổng thể */}
-            <div
-              className={`${styles.readinessBanner} ${
-                readinessCheck.severity === 'ready'
-                  ? styles.readinessBannerReady
-                  : readinessCheck.severity === 'warn'
-                  ? styles.readinessBannerWarn
-                  : styles.readinessBannerErr
-              }`}
-            >
-              <div className={styles.readinessBannerHeader}>
-                <span className={styles.readinessBannerTitle}>
-                  {readinessCheck.severity === 'ready' ? '🟢' : readinessCheck.severity === 'warn' ? '🟡' : '🔴'}{' '}
-                  {readinessCheck.title}
-                </span>
-                <span className={styles.readinessBannerBadge}>{readinessCheck.badge}</span>
+            {/* 2. Định vị AMCL */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Định vị AMCL</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    status.pose && !status.isDataStale
+                      ? styles.indicatorOk
+                      : status.isDataStale
+                      ? styles.indicatorErr
+                      : styles.indicatorWarn
+                  }`}
+                />
               </div>
-              <div className={styles.readinessBannerReason}>{readinessCheck.reason}</div>
+              <span className={styles.subsystemVal}>
+                {status.pose
+                  ? status.isDataStale
+                    ? 'Dữ liệu cũ (Stale)'
+                    : `X: ${status.pose.x.toFixed(1)}m, Y: ${status.pose.y.toFixed(1)}m`
+                  : 'Chờ /amcl_pose'}
+              </span>
             </div>
 
-            {/* Lưới các hệ thống con */}
-            <div className={styles.subsystemsList}>
-              {/* 1. Gateway / WebSocket */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Gateway / WebSocket</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      isBackendConnected ? styles.indicatorOk : styles.indicatorErr
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>
-                  {isBackendConnected ? 'Đã kết nối' : 'Mất kết nối'}
-                </span>
+            {/* 3. Bản đồ ROS */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Bản đồ ROS (/map)</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    hasValidMap ? styles.indicatorOk : isMapLoading ? styles.indicatorWarn : styles.indicatorErr
+                  }`}
+                />
               </div>
+              <span className={styles.subsystemVal}>
+                {hasValidMap
+                  ? `Sẵn sàng (${mapData?.metadata.width}x${mapData?.metadata.height})`
+                  : isMapLoading
+                  ? 'Đang tải bản đồ...'
+                  : 'Chưa nhận được'}
+              </span>
+            </div>
 
-              {/* 2. Định vị AMCL */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Định vị AMCL</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      status.pose && !status.isDataStale
-                        ? styles.indicatorOk
-                        : status.isDataStale
-                        ? styles.indicatorErr
-                        : styles.indicatorWarn
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>
-                  {status.pose
-                    ? status.isDataStale
-                      ? 'Dữ liệu cũ (Stale)'
-                      : `X: ${status.pose.x.toFixed(1)}m, Y: ${status.pose.y.toFixed(1)}m`
-                    : 'Chờ /amcl_pose'}
-                </span>
+            {/* 4. Nav2 Stack */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Nav2 Stack</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    ['IDLE', 'SUCCEEDED'].includes(status.navigationState)
+                      ? styles.indicatorOk
+                      : ['NAVIGATING', 'ACCEPTED', 'PENDING'].includes(status.navigationState)
+                      ? styles.indicatorOk
+                      : status.navigationState === 'PAUSED'
+                      ? styles.indicatorWarn
+                      : styles.indicatorErr
+                  }`}
+                />
               </div>
+              <span className={styles.subsystemVal}>{status.navigationState}</span>
+            </div>
 
-              {/* 3. Bản đồ ROS */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Bản đồ ROS (/map)</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      hasValidMap ? styles.indicatorOk : isMapLoading ? styles.indicatorWarn : styles.indicatorErr
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>
-                  {hasValidMap
-                    ? `Sẵn sàng (${mapData?.metadata.width}x${mapData?.metadata.height})`
-                    : isMapLoading
-                    ? 'Đang tải bản đồ...'
-                    : 'Chưa nhận được'}
-                </span>
+            {/* 5. Chế độ điều khiển */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Chế độ điều khiển</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    status.controlMode === 'AUTO' ? styles.indicatorOk : styles.indicatorWarn
+                  }`}
+                />
               </div>
+              <span className={styles.subsystemVal}>
+                {status.controlMode === 'AUTO'
+                  ? 'Tự động (AUTO)'
+                  : `Thủ công (${status.manualOperatorId ? 'Admin ' + status.manualOperatorId : 'MANUAL'})`}
+              </span>
+            </div>
 
-              {/* 4. Nav2 Stack */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Nav2 Stack</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      ['IDLE', 'SUCCEEDED'].includes(status.navigationState)
-                        ? styles.indicatorOk
-                        : ['NAVIGATING', 'ACCEPTED', 'PENDING'].includes(status.navigationState)
-                        ? styles.indicatorOk
-                        : status.navigationState === 'PAUSED'
-                        ? styles.indicatorWarn
-                        : styles.indicatorErr
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>{status.navigationState}</span>
+            {/* 6. Chuyến hiện tại */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Chuyến hiện tại</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    status.hasActiveTrip ? styles.indicatorOk : styles.indicatorNeutral
+                  }`}
+                />
               </div>
+              <span className={styles.subsystemVal}>
+                {status.hasActiveTrip
+                  ? status.navigationState === 'PAUSED'
+                    ? 'Đang tạm dừng'
+                    : 'Đang hoạt động'
+                  : 'Không có chuyến'}
+              </span>
+            </div>
 
-              {/* 5. Chế độ điều khiển */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Chế độ điều khiển</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      status.controlMode === 'AUTO' ? styles.indicatorOk : styles.indicatorWarn
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>
-                  {status.controlMode === 'AUTO'
-                    ? 'Tự động (AUTO)'
-                    : `Thủ công (${status.manualOperatorId ? 'Admin ' + status.manualOperatorId : 'MANUAL'})`}
-                </span>
+            {/* 7. Pin Robot (chỉ hiện dữ liệu thật) */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Pin Robot</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    status.batteryPercent !== null ? styles.indicatorOk : styles.indicatorNeutral
+                  }`}
+                />
               </div>
+              <span className={styles.subsystemVal}>
+                {status.batteryPercent !== null
+                  ? `${(status.batteryPercent * 100).toFixed(0)}%`
+                  : 'Chưa có cảm biến'}
+              </span>
+            </div>
 
-              {/* 6. Chuyến hiện tại */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Chuyến hiện tại</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      status.hasActiveTrip ? styles.indicatorOk : styles.indicatorNeutral
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>
-                  {status.hasActiveTrip
-                    ? status.navigationState === 'PAUSED'
-                      ? 'Đang tạm dừng'
-                      : 'Đang hoạt động'
-                    : 'Không có chuyến'}
-                </span>
+            {/* 8. Giọng nói ROS (chỉ hiện dữ liệu thật) */}
+            <div className={styles.subsystemItem}>
+              <div className={styles.subsystemTop}>
+                <span className={styles.subsystemLabel}>Giọng nói ROS</span>
+                <span
+                  className={`${styles.subsystemIndicator} ${
+                    status.voiceAvailable ? styles.indicatorOk : styles.indicatorNeutral
+                  }`}
+                />
               </div>
-
-              {/* 7. Pin Robot (chỉ hiện dữ liệu thật) */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Pin Robot</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      status.batteryPercent !== null ? styles.indicatorOk : styles.indicatorNeutral
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>
-                  {status.batteryPercent !== null
-                    ? `${(status.batteryPercent * 100).toFixed(0)}%`
-                    : 'Chưa có cảm biến'}
-                </span>
-              </div>
-
-              {/* 8. Giọng nói ROS (chỉ hiện dữ liệu thật) */}
-              <div className={styles.subsystemItem}>
-                <div className={styles.subsystemTop}>
-                  <span className={styles.subsystemLabel}>Giọng nói ROS</span>
-                  <span
-                    className={`${styles.subsystemIndicator} ${
-                      status.voiceAvailable ? styles.indicatorOk : styles.indicatorNeutral
-                    }`}
-                  />
-                </div>
-                <span className={styles.subsystemVal}>
-                  {status.voiceAvailable ? `Sẵn sàng (${status.voiceState})` : 'Node chưa kết nối'}
-                </span>
-              </div>
+              <span className={styles.subsystemVal}>
+                {status.voiceAvailable ? `Sẵn sàng (${status.voiceState})` : 'Node chưa kết nối'}
+              </span>
             </div>
           </div>
-          {/* Bảng điều khiển thủ công */}
-          <div className={styles.card}>
-            <div className={styles.cardHeader}>
-              <h2 className={styles.cardTitle}>Điều Khiển Vận Tốc Thủ Công</h2>
-              <button
-                type="button"
-                className={`${styles.modeBtn} ${isManual ? styles.manualActive : ''}`}
-                onClick={handleToggleManual}
-                disabled={isSwitchingMode || (!isManual && (!status.isConnected || isNavTripActive))}
-                title={
-                  !isManual && !status.isConnected
-                    ? 'Robot chưa kết nối'
-                    : !isManual && isNavTripActive
-                    ? `Đang có chuyến dẫn đường (${status.navigationState}), không thể chuyển sang MANUAL`
+        </div>
+      )}
+
+      <div className={styles.grid}>
+        {/* Cột 1: Bản đồ giám sát (Dominant) + D-pad Overlay + Nhật ký vận hành + Cảnh báo */}
+        <div className={styles.leftCol}>
+          {/* Bản đồ Dominant */}
+          <div className={styles.mapCard}>
+            <div className={styles.mapHeader}>
+              <div className={styles.mapHeaderLeft}>
+                <h2 className={styles.cardTitle}>Bản Đồ Giám Sát Vận Hành</h2>
+                <div className={styles.mapTabs} role="tablist">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mapMode === 'ros'}
+                    className={`${styles.mapTabBtn} ${mapMode === 'ros' ? styles.activeTab : ''}`}
+                    onClick={() => setMapMode('ros')}
+                  >
+                    Bản đồ ROS
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mapMode === 'passenger'}
+                    className={`${styles.mapTabBtn} ${mapMode === 'passenger' ? styles.activeTab : ''}`}
+                    onClick={() => setMapMode('passenger')}
+                  >
+                    Sơ đồ hành khách
+                  </button>
+                </div>
+              </div>
+              <div className={styles.mapHeaderRight}>
+                <button
+                  type="button"
+                  className={`${styles.modeBtn} ${isManual ? styles.manualActive : ''}`}
+                  onClick={handleToggleManual}
+                  disabled={isSwitchingMode || (!isManual && (!status.isConnected || isNavTripActive))}
+                  title={
+                    !isManual && !status.isConnected
+                      ? 'Robot chưa kết nối'
+                      : !isManual && isNavTripActive
+                      ? `Đang có chuyến dẫn đường (${status.navigationState}), không thể chuyển sang MANUAL`
+                      : isManual
+                      ? 'Chuyển về chế độ tự động AUTO'
+                      : 'Kích hoạt chế độ thủ công MANUAL'
+                  }
+                >
+                  {isSwitchingMode
+                    ? 'Đang chuyển...'
                     : isManual
-                    ? 'Chuyển về chế độ tự động AUTO'
-                    : 'Kích hoạt chế độ thủ công MANUAL'
-                }
-              >
-                {isSwitchingMode
-                  ? 'Đang chuyển...'
-                  : isManual
-                  ? 'TẮT THỦ CÔNG (VỀ AUTO)'
-                  : 'BẬT THỦ CÔNG (MANUAL)'}
-              </button>
+                    ? 'TẮT THỦ CÔNG (VỀ AUTO)'
+                    : 'BẬT THỦ CÔNG (MANUAL)'}
+                </button>
+              </div>
             </div>
 
-            {controlMsg && <div className={styles.errorText}>{controlMsg}</div>}
+            {controlMsg && <div className={styles.mapBannerError}>{controlMsg}</div>}
 
             {isManual && isOccupiedByOther && (
-              <div className={styles.warnText} style={{ marginBottom: 10 }}>
-                🔒 Quyền điều khiển tay đang thuộc về Admin: <strong>{status.manualOperatorId}</strong>. Bạn chỉ có thể theo dõi hoặc bấm "TẮT THỦ CÔNG" để dừng an toàn.
+              <div className={styles.mapBannerWarn}>
+                🔒 Quyền điều khiển tay đang thuộc về Admin: <strong>{status.manualOperatorId}</strong>. Bạn chỉ có thể theo dõi hoặc bấm &ldquo;TẮT THỦ CÔNG&rdquo; để dừng an toàn.
               </div>
             )}
 
             {isManual && !hasConsumer && (
-              <div className={styles.warnText} style={{ marginBottom: 10 }}>
+              <div className={styles.mapBannerWarn}>
                 ⚠️ Đường lệnh điều khiển tay tới Gazebo (<code>/airport/cmd_vel_manual</code>) chưa có consumer (0 subscriber). Các nút vận tốc được khóa an toàn để tránh bỏ qua bộ phân luồng và các lớp an toàn (collision_monitor / velocity_smoother).
               </div>
             )}
 
-            <p className={styles.helpText}>
-              {isManual
-                ? hasConsumer
-                  ? 'Nhấn và giữ chuột hoặc nút cảm ứng để di chuyển. Nhả nút sẽ dừng ngay lập tức.'
-                  : 'Đang khóa an toàn: Đường lệnh ROS 2 tới robot chưa có consumer. Vui lòng tham khảo tài liệu cấu hình Gazebo/twist_mux.'
-                : 'Cần bấm "BẬT THỦ CÔNG" để kích hoạt bàn điều khiển bên dưới.'}
-            </p>
+            <div className={styles.mapWrapper}>
+              <MapView
+                backgroundMode={mapMode}
+                robotPose={status.pose}
+                destinations={destinations}
+                path={path}
+                isSelectingCoordinate={isPickingCoord}
+                onCoordinateSelect={handleCoordinateSelect}
+                previewPoint={previewPoint}
+              />
 
-            <div className={`${styles.dpad} ${!canDrive ? styles.disabled : ''}`}>
-              <div className={styles.dpadRow}>
-                <button
-                  type="button"
-                  className={styles.dpadBtn}
-                  onMouseDown={() => startDrive(0.25, 0)}
-                  onMouseUp={stopDrive}
-                  onMouseLeave={stopDrive}
-                  onTouchStart={() => startDrive(0.25, 0)}
-                  onTouchEnd={stopDrive}
-                  onTouchCancel={stopDrive}
-                  disabled={!canDrive}
-                  title={
-                    !hasConsumer
-                      ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                      : isOccupiedByOther
-                      ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                      : 'Tiến thẳng (0.25 m/s)'
-                  }
-                >
-                  ▲
-                </button>
-              </div>
-              <div className={styles.dpadRow}>
-                <button
-                  type="button"
-                  className={styles.dpadBtn}
-                  onMouseDown={() => startDrive(0, 0.4)}
-                  onMouseUp={stopDrive}
-                  onMouseLeave={stopDrive}
-                  onTouchStart={() => startDrive(0, 0.4)}
-                  onTouchEnd={stopDrive}
-                  onTouchCancel={stopDrive}
-                  disabled={!canDrive}
-                  title={
-                    !hasConsumer
-                      ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                      : isOccupiedByOther
-                      ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                      : 'Quay trái (0.4 rad/s)'
-                  }
-                >
-                  ◀
-                </button>
-                <button
-                  type="button"
-                  className={`${styles.dpadBtn} ${styles.stopBtn}`}
-                  onClick={stopDrive}
-                  disabled={!isManual}
-                  title="Dừng khẩn cấp / Dừng di chuyển"
-                >
-                  ■
-                </button>
-                <button
-                  type="button"
-                  className={styles.dpadBtn}
-                  onMouseDown={() => startDrive(0, -0.4)}
-                  onMouseUp={stopDrive}
-                  onMouseLeave={stopDrive}
-                  onTouchStart={() => startDrive(0, -0.4)}
-                  onTouchEnd={stopDrive}
-                  onTouchCancel={stopDrive}
-                  disabled={!canDrive}
-                  title={
-                    !hasConsumer
-                      ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                      : isOccupiedByOther
-                      ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                      : 'Quay phải (-0.4 rad/s)'
-                  }
-                >
-                  ▶
-                </button>
-              </div>
-              <div className={styles.dpadRow}>
-                <button
-                  type="button"
-                  className={styles.dpadBtn}
-                  onMouseDown={() => startDrive(-0.2, 0)}
-                  onMouseUp={stopDrive}
-                  onMouseLeave={stopDrive}
-                  onTouchStart={() => startDrive(-0.2, 0)}
-                  onTouchEnd={stopDrive}
-                  onTouchCancel={stopDrive}
-                  disabled={!canDrive}
-                  title={
-                    !hasConsumer
-                      ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
-                      : isOccupiedByOther
-                      ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
-                      : 'Lùi lại (-0.2 m/s)'
-                  }
-                >
-                  ▼
-                </button>
+              {/* D-pad 5 nút phủ góc dưới phải bản đồ */}
+              <div
+                className={`${styles.dpadOverlay} ${!canDrive ? styles.dpadDisabled : ''}`}
+                title={
+                  !isManual
+                    ? 'Cần bật MANUAL trên thanh công cụ bản đồ để điều khiển'
+                    : !hasConsumer
+                    ? 'Đang khóa an toàn: /airport/cmd_vel_manual chưa có consumer trên Gazebo'
+                    : isOccupiedByOther
+                    ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
+                    : 'Bàn điều khiển tay 5 nút'
+                }
+              >
+                <div className={styles.dpadOverlayHeader}>
+                  <span className={styles.dpadOverlayTitle}>Điều khiển tay</span>
+                  <span
+                    className={`${styles.dpadOverlayBadge} ${
+                      !isManual
+                        ? styles.badgeAuto
+                        : canDrive
+                        ? styles.badgeManualOk
+                        : styles.badgeManualLocked
+                    }`}
+                  >
+                    {!isManual ? 'AUTO' : canDrive ? 'MANUAL' : 'LOCKED'}
+                  </span>
+                </div>
+                <div className={styles.dpadRow}>
+                  <button
+                    type="button"
+                    className={styles.dpadBtn}
+                    onPointerDown={() => startDrive(0.25, 0)}
+                    onPointerUp={stopDrive}
+                    onPointerLeave={stopDrive}
+                    onPointerCancel={stopDrive}
+                    disabled={!canDrive}
+                    title={
+                      !hasConsumer
+                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
+                        : isOccupiedByOther
+                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
+                        : 'Tiến thẳng (0.25 m/s)'
+                    }
+                    aria-label="Tiến thẳng"
+                  >
+                    ▲
+                  </button>
+                </div>
+                <div className={styles.dpadRow}>
+                  <button
+                    type="button"
+                    className={styles.dpadBtn}
+                    onPointerDown={() => startDrive(0, 0.4)}
+                    onPointerUp={stopDrive}
+                    onPointerLeave={stopDrive}
+                    onPointerCancel={stopDrive}
+                    disabled={!canDrive}
+                    title={
+                      !hasConsumer
+                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
+                        : isOccupiedByOther
+                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
+                        : 'Quay trái (0.4 rad/s)'
+                    }
+                    aria-label="Quay trái"
+                  >
+                    ◀
+                  </button>
+                  <button
+                    type="button"
+                    className={`${styles.dpadBtn} ${styles.stopBtn}`}
+                    onClick={stopDrive}
+                    disabled={!isManual}
+                    title="Dừng di chuyển"
+                    aria-label="Dừng di chuyển"
+                  >
+                    Dừng
+                  </button>
+                  <button
+                    type="button"
+                    className={styles.dpadBtn}
+                    onPointerDown={() => startDrive(0, -0.4)}
+                    onPointerUp={stopDrive}
+                    onPointerLeave={stopDrive}
+                    onPointerCancel={stopDrive}
+                    disabled={!canDrive}
+                    title={
+                      !hasConsumer
+                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
+                        : isOccupiedByOther
+                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
+                        : 'Quay phải (-0.4 rad/s)'
+                    }
+                    aria-label="Quay phải"
+                  >
+                    ▶
+                  </button>
+                </div>
+                <div className={styles.dpadRow}>
+                  <button
+                    type="button"
+                    className={styles.dpadBtn}
+                    onPointerDown={() => startDrive(-0.2, 0)}
+                    onPointerUp={stopDrive}
+                    onPointerLeave={stopDrive}
+                    onPointerCancel={stopDrive}
+                    disabled={!canDrive}
+                    title={
+                      !hasConsumer
+                        ? 'Chưa có consumer trên Gazebo cho /airport/cmd_vel_manual'
+                        : isOccupiedByOther
+                        ? `Quyền điều khiển đang thuộc về ${status.manualOperatorId}`
+                        : 'Lùi lại (-0.2 m/s)'
+                    }
+                    aria-label="Lùi lại"
+                  >
+                    ▼
+                  </button>
+                </div>
               </div>
             </div>
           </div>
 
+          {/* Bảng Nhật ký vận hành Admin (RAM circular buffer 100 sự kiện) */}
+          <div className={styles.card}>
+            <div className={styles.cardHeader}>
+              <h2 className={styles.cardTitle}>Nhật Ký Vận Hành Admin ({events.length}/100)</h2>
+              <button
+                type="button"
+                className={styles.refreshEventsBtn}
+                onClick={() => refreshEvents()}
+                title="Tải lại danh sách sự kiện từ bộ đệm RAM backend"
+              >
+                🔄 Làm mới
+              </button>
+            </div>
+            <p className={styles.eventLogSubtitle}>
+              Ghi nhận trong bộ đệm RAM từ lúc khởi động
+              {eventsStartedAt
+                ? `: ${new Date(eventsStartedAt).toLocaleTimeString('vi-VN', { hour12: false })} ngày ${new Date(
+                    eventsStartedAt
+                  ).toLocaleDateString('vi-VN')}`
+                : ''}
+              . Tự động đồng bộ thời gian thực qua WebSocket.
+            </p>
+
+            {sortedEvents.length === 0 ? (
+              <p className={styles.helpText}>Chưa ghi nhận sự kiện nào kể từ khi khởi động hệ thống.</p>
+            ) : (
+              <div className={styles.eventLogList}>
+                {sortedEvents.map((evt) => {
+                  const levelClass =
+                    evt.level === 'SUCCESS'
+                      ? styles.evtSuccess
+                      : evt.level === 'WARN'
+                      ? styles.evtWarn
+                      : evt.level === 'ERROR'
+                      ? styles.evtError
+                      : styles.evtInfo;
+
+                  const catLabel =
+                    evt.category === 'SYSTEM'
+                      ? 'Hệ thống'
+                      : evt.category === 'CONNECTION'
+                      ? 'Kết nối'
+                      : evt.category === 'NAVIGATION'
+                      ? 'Điều hướng'
+                      : evt.category === 'CONTROL'
+                      ? 'Điều khiển'
+                      : evt.category;
+
+                  return (
+                    <div key={evt.id} className={`${styles.eventLogItem} ${levelClass}`}>
+                      <span className={styles.eventTime}>
+                        {new Date(evt.timestamp).toLocaleTimeString('vi-VN', { hour12: false })}
+                      </span>
+                      <span className={styles.eventCat}>{catLabel}</span>
+                      <span className={styles.eventMsg}>{evt.message}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Bảng chẩn đoán cảnh báo */}
+          <div className={styles.card}>
+            <h2 className={styles.cardTitle}>Hệ Thống Cảnh Báo (/airport/alerts)</h2>
+            {alerts.length === 0 ? (
+              <p className={styles.helpText}>Hiện không có cảnh báo nào từ các node ROS.</p>
+            ) : (
+              <div className={styles.alertList}>
+                {alerts.map((al, idx) => (
+                  <div
+                    key={idx}
+                    className={`${styles.alertItem} ${al.level === 0 ? styles.ok : styles.warn}`}
+                  >
+                    <div className={styles.alertTop}>
+                      <strong>{al.name}</strong>
+                      <span className={styles.hwId}>[{al.hardware_id || 'system'}]</span>
+                    </div>
+                    <p className={styles.alertMsg}>{al.message}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Cột 2: Quản lý Nav2 & Điểm đến */}
+        <div className={styles.rightCol}>
           {/* Quản lý & Điều khiển dẫn đường Nav2 */}
           <div className={styles.card}>
             <div className={styles.cardHeader}>
@@ -1131,134 +1290,6 @@ export default function AdminDashboard() {
                         Xóa
                       </button>
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Cột 2: Bản đồ và Cảnh báo */}
-        <div className={styles.rightCol}>
-          {/* Bản đồ */}
-          <div className={styles.card} style={{ padding: 0, overflow: 'hidden' }}>
-            <div className={styles.mapHeader}>
-              <span className={styles.cardTitle}>
-                Bản Đồ Giám Sát Vận Hành
-              </span>
-              <div className={styles.mapTabs} role="tablist">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={mapMode === 'ros'}
-                  className={`${styles.mapTabBtn} ${mapMode === 'ros' ? styles.activeTab : ''}`}
-                  onClick={() => setMapMode('ros')}
-                >
-                  Bản đồ ROS
-                </button>
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={mapMode === 'passenger'}
-                  className={`${styles.mapTabBtn} ${mapMode === 'passenger' ? styles.activeTab : ''}`}
-                  onClick={() => setMapMode('passenger')}
-                >
-                  Sơ đồ hành khách
-                </button>
-              </div>
-            </div>
-            <div style={{ height: '360px' }}>
-              <MapView
-                backgroundMode={mapMode}
-                robotPose={status.pose}
-                destinations={destinations}
-                path={path}
-                isSelectingCoordinate={isPickingCoord}
-                onCoordinateSelect={handleCoordinateSelect}
-                previewPoint={previewPoint}
-              />
-            </div>
-          </div>
-
-          {/* Bảng Nhật ký vận hành Admin (RAM circular buffer 100 sự kiện) */}
-          <div className={styles.card}>
-            <div className={styles.cardHeader}>
-              <h2 className={styles.cardTitle}>Nhật Ký Vận Hành Admin ({events.length}/100)</h2>
-              <button
-                type="button"
-                className={styles.refreshEventsBtn}
-                onClick={() => refreshEvents()}
-                title="Tải lại danh sách sự kiện từ bộ đệm RAM backend"
-              >
-                🔄 Làm mới
-              </button>
-            </div>
-            <p className={styles.eventLogSubtitle}>
-              Ghi nhận trong bộ đệm RAM từ lúc khởi động
-              {eventsStartedAt
-                ? `: ${new Date(eventsStartedAt).toLocaleTimeString('vi-VN', { hour12: false })} ngày ${new Date(
-                    eventsStartedAt
-                  ).toLocaleDateString('vi-VN')}`
-                : ''}
-              . Tự động đồng bộ thời gian thực qua WebSocket.
-            </p>
-
-            {sortedEvents.length === 0 ? (
-              <p className={styles.helpText}>Chưa ghi nhận sự kiện nào kể từ khi khởi động hệ thống.</p>
-            ) : (
-              <div className={styles.eventLogList}>
-                {sortedEvents.map((evt) => {
-                  const levelClass =
-                    evt.level === 'SUCCESS'
-                      ? styles.evtSuccess
-                      : evt.level === 'WARN'
-                      ? styles.evtWarn
-                      : evt.level === 'ERROR'
-                      ? styles.evtError
-                      : styles.evtInfo;
-
-                  const catLabel =
-                    evt.category === 'SYSTEM'
-                      ? 'Hệ thống'
-                      : evt.category === 'CONNECTION'
-                      ? 'Kết nối'
-                      : evt.category === 'NAVIGATION'
-                      ? 'Điều hướng'
-                      : evt.category === 'CONTROL'
-                      ? 'Điều khiển'
-                      : evt.category;
-
-                  return (
-                    <div key={evt.id} className={`${styles.eventLogItem} ${levelClass}`}>
-                      <span className={styles.eventTime}>
-                        {new Date(evt.timestamp).toLocaleTimeString('vi-VN', { hour12: false })}
-                      </span>
-                      <span className={styles.eventCat}>{catLabel}</span>
-                      <span className={styles.eventMsg}>{evt.message}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* Bảng chẩn đoán cảnh báo */}
-          <div className={styles.card}>
-            <h2 className={styles.cardTitle}>Hệ Thống Cảnh Báo (/airport/alerts)</h2>
-            {alerts.length === 0 ? (
-              <p className={styles.helpText}>Hiện không có cảnh báo nào từ các node ROS.</p>
-            ) : (
-              <div className={styles.alertList}>
-                {alerts.map((al, idx) => (
-                  <div
-                    key={idx}
-                    className={`${styles.alertItem} ${al.level === 0 ? styles.ok : styles.warn}`}
-                  >
-                    <div className={styles.alertTop}>
-                      <strong>{al.name}</strong>
-                      <span className={styles.hwId}>[{al.hardware_id || 'system'}]</span>
-                    </div>
-                    <p className={styles.alertMsg}>{al.message}</p>
                   </div>
                 ))}
               </div>

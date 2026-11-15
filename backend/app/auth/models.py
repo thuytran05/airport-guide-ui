@@ -18,6 +18,7 @@ class User(BaseModel):
     role: UserRole
     hashed_password: str
     is_active: bool = True
+    session_id: Optional[str] = None
 
 class UserOut(BaseModel):
     id: str
@@ -41,6 +42,7 @@ class TokenPayload(BaseModel):
     username: str
     role: UserRole
     exp: int
+    sid: Optional[str] = None
 
 class PassengerSessionOut(BaseModel):
     session_token: str

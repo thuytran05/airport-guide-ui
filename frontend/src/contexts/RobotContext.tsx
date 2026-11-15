@@ -26,7 +26,7 @@ interface RobotContextType {
   confirmVoiceProposal: (proposalId: string, destinationId?: string) => Promise<{ success: boolean; message?: string }>;
   dismissVoiceProposal: () => Promise<{ success: boolean; message?: string }>;
   setManualControl: (enable: boolean) => Promise<{ success: boolean; message?: string }>;
-  sendManualVelocity: (linear_x: number, angular_z: number) => Promise<boolean>;
+  sendManualVelocity: (linear_x: number, angular_z: number, seq?: number, hold_id?: string) => Promise<boolean>;
   upsertDestination: (dest: Destination) => Promise<{ success: boolean; message?: string }>;
   deleteDestination: (id: string) => Promise<{ success: boolean; message?: string }>;
 }
@@ -65,7 +65,7 @@ const DEFAULT_STATUS: RobotStatus = {
 const RobotContext = createContext<RobotContextType | undefined>(undefined);
 
 export function RobotProvider({ children }: { children: ReactNode }) {
-  const { token, currentUser } = useAuth();
+  const { token, effectiveToken, currentUser } = useAuth();
   const [status, setStatus] = useState<RobotStatus>(DEFAULT_STATUS);
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
@@ -191,11 +191,24 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // 3. Kết nối WebSocket khi khởi động
+  // Dọn dẹp dữ liệu Admin khi chuyển sang vai trò Passenger (logout)
+  useEffect(() => {
+    if (currentUser?.role !== 'admin') {
+      setEvents([]);
+      setEventsStartedAt(null);
+      setAlerts([]);
+      setStatus((prev) => ({
+        ...prev,
+        voiceProposal: null,
+      }));
+    }
+  }, [currentUser?.role]);
+
+  // 3. Kết nối WebSocket khi khởi động hoặc khi token phiên thay đổi
   useEffect(() => {
     activeMapVersionRef.current = null;
     lastFailedMapRef.current = { version: null, time: 0 };
-    wsClient.connect(token);
+    wsClient.connect(effectiveToken);
 
     const unsubStatus = wsClient.onStatusChange((connected) => {
       setIsBackendConnected(connected);
@@ -298,14 +311,26 @@ export function RobotProvider({ children }: { children: ReactNode }) {
       unsubStatus();
       unsubTelemetry();
     };
-  }, [token, currentUser?.role, refreshDestinations, fetchMapData, refreshEvents]);
+  }, [effectiveToken, currentUser?.role, refreshDestinations, fetchMapData, refreshEvents]);
 
   // 4. Các hàm nghiệp vụ (REST calls)
   const startNavigation = async (destinationId: string) => {
     try {
+      if (!token) {
+        await apiClient.ensurePassengerToken();
+      }
       const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/navigate', {
         destination_id: destinationId,
       });
+      if (res && res.success) {
+        setStatus((prev) => ({
+          ...prev,
+          isOwner: true,
+          hasActiveTrip: true,
+          destinationId: destinationId,
+          navigationState: prev.navigationState === 'IDLE' ? 'PENDING' : prev.navigationState,
+        }));
+      }
       return res;
     } catch (err: any) {
       return { success: false, message: err.message };
@@ -384,9 +409,19 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const sendManualVelocity = async (linear_x: number, angular_z: number): Promise<boolean> => {
+  const sendManualVelocity = async (
+    linear_x: number,
+    angular_z: number,
+    seq?: number,
+    hold_id?: string
+  ): Promise<boolean> => {
     try {
-      await apiClient.post('/api/robot/control/velocity', { linear_x, angular_z });
+      await apiClient.post('/api/robot/control/velocity', {
+        linear_x,
+        angular_z,
+        seq: seq ?? 0,
+        hold_id: hold_id || undefined,
+      });
       return true;
     } catch {
       return false;

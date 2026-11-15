@@ -16,11 +16,13 @@ async def create_passenger_session():
     Token dùng để xác thực quyền hủy chuyến do chính phiên này tạo ra.
     """
     passenger_id = f"passenger-{uuid.uuid4().hex[:12]}"
+    session_id = f"sess_p_{uuid.uuid4().hex[:12]}"
     expires_in_seconds = 30 * 86400  # 30 ngày
     session_token = create_access_token(
         data={
             "sub": passenger_id,
-            "role": UserRole.PASSENGER.value
+            "role": UserRole.PASSENGER.value,
+            "sid": session_id
         },
         expires_delta_seconds=expires_in_seconds
     )
@@ -35,6 +37,7 @@ async def create_passenger_session():
 async def login(request: LoginRequest):
     """
     Xác thực tài khoản và mật khẩu đã băm. Trả về JWT token kèm vai trò được quyết định từ server.
+    Mỗi lần đăng nhập tạo một định danh phiên session_id duy nhất để phân biệt đa phiên cùng tài khoản.
     """
     user = user_service.authenticate(request.username, request.password)
     if not user:
@@ -43,11 +46,13 @@ async def login(request: LoginRequest):
             detail="Tên đăng nhập hoặc mật khẩu không chính xác",
         )
 
+    session_id = f"sess_{uuid.uuid4().hex[:12]}"
     access_token = create_access_token(
         data={
             "sub": user.id,
             "username": user.username,
-            "role": user.role.value
+            "role": user.role.value,
+            "sid": session_id
         }
     )
 

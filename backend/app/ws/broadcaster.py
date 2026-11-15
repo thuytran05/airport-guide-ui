@@ -32,21 +32,21 @@ async def telemetry_broadcaster_loop():
             if hasattr(adapter, "check_manual_timeout"):
                 adapter.check_manual_timeout()
 
+            # Thu thập trạng thái từ adapter để theo dõi kết nối ngay cả khi 0 client
+            status = adapter.get_status()
+
+            # Theo dõi chuyển đổi trạng thái kết nối ROS và chế độ điều khiển (chống ghi lặp)
+            event_logger.track_connection(status.get("is_connected", False))
+            event_logger.track_control_mode(status.get("control_mode", "AUTO"))
+
             if not ws_manager.active_connections:
                 last_sent_path_versions.clear()
                 last_sent_event_versions.clear()
                 continue
 
             now_ms = int(time.time() * 1000)
-
-            # Thu thập trạng thái từ adapter
-            status = adapter.get_status()
             current_path_version = getattr(adapter, "get_path_version", lambda: 0)()
             owner_id = getattr(adapter, "get_owner_id", lambda: "")()
-
-            # Theo dõi trạng thái chuyển đổi kết nối và chế độ điều khiển (chống ghi lặp)
-            event_logger.track_connection(status.get("is_connected", False))
-            event_logger.track_control_mode(status.get("control_mode", "AUTO"))
 
             # Mỗi 1 giây (5 ticks) lấy alerts
             alerts = adapter.get_alerts() if (tick_count % 5 == 0) else None
@@ -85,6 +85,19 @@ async def telemetry_broadcaster_loop():
                             "created_at": active_proposal["created_at"],
                         }
 
+                voice_req_id = status.get("voice_requester_id") or (active_proposal.get("requester_id") if active_proposal else "")
+                can_see_voice = True
+                if voice_req_id:
+                    can_see_voice = bool(
+                        user and (
+                            user.id == voice_req_id or
+                            getattr(user, "session_id", None) == voice_req_id or
+                            user.role == UserRole.ADMIN
+                        )
+                    )
+                user_transcript = status["voice_transcript"] if can_see_voice else None
+                user_response = status["voice_response"] if can_see_voice else None
+
                 payload: Dict[str, Any] = {
                     "type": "telemetry",
                     "server_time": now_ms,
@@ -107,8 +120,8 @@ async def telemetry_broadcaster_loop():
                         "distance_remaining": status.get("distance_remaining"),
                         "estimated_time_remaining": status.get("estimated_time_remaining"),
                         "voice_state": status["voice_state"],
-                        "voice_transcript": status["voice_transcript"],
-                        "voice_response": status["voice_response"],
+                        "voice_transcript": user_transcript,
+                        "voice_response": user_response,
                         "voice_available": status.get("voice_available", False),
                         "voice_proposal": user_proposal,
                         "message": status["message"],

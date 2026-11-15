@@ -14,7 +14,8 @@ GUEST_PASSENGER = User(
     full_name="Hành khách",
     role=UserRole.PASSENGER,
     hashed_password="",
-    is_active=True
+    is_active=True,
+    session_id="passenger-guest"
 )
 
 async def get_current_user(
@@ -46,16 +47,19 @@ async def get_current_user(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Tài khoản không tồn tại hoặc đã bị khóa",
                 )
-            return user
+            sid = payload.get("sid") or payload.get("session_id") or user.id
+            return user.model_copy(update={"session_id": sid})
         
         if payload.get("role") == UserRole.PASSENGER.value and payload.get("sub"):
+            sid = payload.get("sid") or payload.get("session_id") or payload["sub"]
             return User(
                 id=payload["sub"],
                 username=payload["sub"],
                 full_name="Hành khách",
                 role=UserRole.PASSENGER,
                 hashed_password="",
-                is_active=True
+                is_active=True,
+                session_id=sid
             )
 
         raise HTTPException(
@@ -72,13 +76,15 @@ async def get_current_user(
                 detail="Token phiên hành khách không hợp lệ hoặc đã bị chỉnh sửa",
             )
         if payload.get("role") == UserRole.PASSENGER.value and payload.get("sub"):
+            sid = payload.get("sid") or payload.get("session_id") or payload["sub"]
             return User(
                 id=payload["sub"],
                 username=payload["sub"],
                 full_name="Hành khách",
                 role=UserRole.PASSENGER,
                 hashed_password="",
-                is_active=True
+                is_active=True,
+                session_id=sid
             )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -93,7 +99,8 @@ async def get_current_user(
         full_name="Hành khách vãng lai",
         role=UserRole.PASSENGER,
         hashed_password="",
-        is_active=True
+        is_active=True,
+        session_id=ephemeral_id
     )
 
 def require_role(required_role: UserRole):
@@ -129,16 +136,21 @@ def authenticate_ws_token(token: Optional[str]) -> User:
     username = payload.get("username")
     if username:
         user = user_service.get_by_username(username)
-        return user if user else GUEST_PASSENGER
+        if user:
+            sid = payload.get("sid") or payload.get("session_id") or user.id
+            return user.model_copy(update={"session_id": sid})
+        return GUEST_PASSENGER
 
     if payload.get("role") == UserRole.PASSENGER.value and payload.get("sub"):
+        sid = payload.get("sid") or payload.get("session_id") or payload["sub"]
         return User(
             id=payload["sub"],
             username=payload["sub"],
             full_name="Hành khách",
             role=UserRole.PASSENGER,
             hashed_password="",
-            is_active=True
+            is_active=True,
+            session_id=sid
         )
     
     return GUEST_PASSENGER

@@ -262,6 +262,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                 return {"success": False, "message": "Không thể lưu điểm đến"}
 
             self._destinations_version += 1
+            event_logger.add_event("SUCCESS", "DESTINATION", f"Đã lưu điểm đến '{destination.get('name')}' ({dest_id})")
             return {"success": True, "message": f"Đã lưu điểm đến '{destination.get('name')}' thành công"}
 
     def delete_destination(self, destination_id: str) -> Dict[str, Any]:
@@ -288,6 +289,7 @@ class MockRobotAdapter(BaseRobotAdapter):
 
             self._destinations_version += 1
             deleted_name = deleted_dest.get("name") or dest_id
+            event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
             return {"success": True, "message": f"Đã xóa thành công điểm đến '{deleted_name}'", "destinations_version": self._destinations_version}
 
     def start_navigation(self, destination_id: str, owner_id: str) -> Dict[str, Any]:
@@ -461,12 +463,14 @@ class MockRobotAdapter(BaseRobotAdapter):
                     # Thu âm trong 1.5s
                     time.sleep(1.5)
                     with self._lock:
+                        if getattr(self, "_voice_session_id", "") != session_id:
+                            return
                         self._voice_state = "PROCESSING"
                         transcript = self._mock_custom_transcript or "Hãy dẫn tôi đến Cổng khởi hành số 1"
                         self._voice_transcript = transcript
 
-                        # Đối chiếu điểm đến từ transcript
-                        dests = self.get_destinations()
+                        # Đối chiếu điểm đến từ transcript (lấy trực tiếp danh sách để tránh khóa lồng)
+                        dests = list(self._destinations)
                         match_res = match_destination_from_transcript(transcript, dests)
                         now_ms = int(time.time() * 1000)
 
@@ -517,19 +521,30 @@ class MockRobotAdapter(BaseRobotAdapter):
                     # Xử lý 1.0s
                     time.sleep(1.0)
                     with self._lock:
+                        if getattr(self, "_voice_session_id", "") != session_id:
+                            return
                         self._voice_state = "SPEAKING"
                         self._voice_response = response_text
 
                     # Nói trong 1.5s
                     time.sleep(1.5)
                     with self._lock:
-                        self._voice_state = "IDLE"
+                        if getattr(self, "_voice_session_id", "") == session_id:
+                            self._voice_state = "IDLE"
                 finally:
                     with self._lock:
                         self._voice_start_in_progress = False
 
+            session_id = self._voice_session_id
+
             threading.Thread(target=_voice_flow, daemon=True).start()
             return {"success": True, "message": "Đã kích hoạt microphone robot thành công"}
+
+    def has_valid_pose(self) -> bool:
+        with self._lock:
+            if not self._pose:
+                return False
+            return math.isfinite(self._pose.get("x", 0)) and math.isfinite(self._pose.get("y", 0))
 
     def is_manual_consumer_available(self) -> bool:
         return getattr(self, "_manual_consumer_available", True)
@@ -556,7 +571,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                     self._publish_zero_velocity()
                     self._current_manual_twist = (0.0, 0.0)
 
-    def set_manual_control(self, enable: bool, operator_id: str = "") -> Dict[str, Any]:
+    def set_manual_control(self, enable: bool, operator_id: str = "", force: bool = False) -> Dict[str, Any]:
         with self._lock:
             if enable:
                 if not getattr(self, "_is_connected", True):
@@ -568,7 +583,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                         "message": f"Không thể chuyển sang MANUAL: Đang có chuyến dẫn đường ({nav_state}). Hãy hoàn thành hoặc hủy chuyến trước."
                     }
                 current_op = getattr(self, "_manual_operator_id", None)
-                if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id:
+                if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id and not force:
                     return {
                         "success": False,
                         "message": f"Quyền điều khiển thủ công đang thuộc về Admin khác ({current_op})."
@@ -577,12 +592,16 @@ class MockRobotAdapter(BaseRobotAdapter):
                 self._manual_operator_id = operator_id
                 self._last_manual_cmd_time = time.monotonic()
                 self._current_manual_twist = (0.0, 0.0)
+                self._active_hold_id = None
+                self._last_manual_seq = 0
                 self._message = f"Chế độ điều khiển thủ công (MANUAL) được kích hoạt bởi {operator_id or 'Admin'}."
                 event_logger.track_control_mode("MANUAL")
                 return {"success": True, "message": "Đã chuyển sang MANUAL"}
             else:
                 self._control_mode = "AUTO"
                 self._manual_operator_id = None
+                self._active_hold_id = None
+                self._last_manual_seq = 0
                 self._publish_zero_velocity()
                 self._current_manual_twist = (0.0, 0.0)
                 self._last_manual_cmd_time = 0.0
@@ -590,14 +609,58 @@ class MockRobotAdapter(BaseRobotAdapter):
                 event_logger.track_control_mode("AUTO")
                 return {"success": True, "message": "Đã chuyển sang AUTO"}
 
-    def send_manual_velocity(self, linear_x: float, angular_z: float, operator_id: str = "") -> Dict[str, Any]:
+    def send_manual_velocity(
+        self,
+        linear_x: float,
+        angular_z: float,
+        operator_id: str = "",
+        seq: int = 0,
+        hold_id: str = ""
+    ) -> Dict[str, Any]:
         with self._lock:
+            if not hasattr(self, "_released_hold_ids"):
+                self._released_hold_ids = set()
+
+            is_stop_cmd = (abs(linear_x) < 1e-4 and abs(angular_z) < 1e-4)
+            if is_stop_cmd:
+                self._publish_zero_velocity()
+                self._current_manual_twist = (0.0, 0.0)
+                self._last_manual_cmd_time = time.monotonic()
+                if hold_id:
+                    self._released_hold_ids.add(hold_id)
+                self._active_hold_id = None
+                if seq > getattr(self, "_last_manual_seq", 0):
+                    self._last_manual_seq = seq
+                return {"success": True, "message": "Đã gửi lệnh dừng robot an toàn."}
+
             if getattr(self, "_control_mode", "AUTO") != "MANUAL":
                 return {"success": False, "message": "Robot không ở chế độ điều khiển thủ công (MANUAL)."}
 
             current_op = getattr(self, "_manual_operator_id", None)
             if current_op and operator_id and current_op != operator_id:
                 return {"success": False, "message": f"Quyền điều khiển đang thuộc về Admin khác ({current_op})."}
+
+            if not (math.isfinite(linear_x) and math.isfinite(angular_z)):
+                return {"success": False, "message": "Giá trị vận tốc không hợp lệ (NaN hoặc Inf)."}
+
+            if not self.is_manual_consumer_available():
+                return {
+                    "success": False,
+                    "message": "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận."
+                }
+
+            # Xử lý thứ tự yêu cầu HTTP / Sequence check & Hold release check
+            if hold_id:
+                if hold_id in self._released_hold_ids:
+                    return {"success": True, "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."}
+                if getattr(self, "_active_hold_id", None) != hold_id:
+                    self._active_hold_id = hold_id
+                    self._last_manual_seq = seq
+                else:
+                    last_seq = getattr(self, "_last_manual_seq", 0)
+                    if seq > 0 and seq < last_seq:
+                        return {"success": True, "message": "Bỏ qua lệnh vận tốc đến trễ (out of sequence)."}
+                    self._last_manual_seq = seq
 
             limits = self._ros_config.velocity_limits if hasattr(self, "_ros_config") and hasattr(self._ros_config, "velocity_limits") else {}
             lin_max = limits.get("linear_max", 0.3)

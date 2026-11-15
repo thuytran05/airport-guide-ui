@@ -6,8 +6,11 @@ interface AuthContextType {
   currentUser: User;
   isAdmin: boolean;
   token: string | null;
+  passengerToken: string | null;
+  effectiveToken: string | null;
   loginAdmin: (username: string, password: string) => Promise<{ success: boolean; message?: string }>;
   logout: () => void;
+  ensurePassengerSession: () => Promise<string | null>;
 }
 
 const DEFAULT_PASSENGER: User = {
@@ -51,6 +54,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     return saved;
   });
+
+  const [passengerToken, setPassengerToken] = useState<string | null>(() => {
+    return apiClient.getStoredPassengerToken();
+  });
+
+  // Tự động khởi tạo phiên hành khách nếu chưa có token admin hoặc passenger token
+  useEffect(() => {
+    if (!token && !passengerToken) {
+      apiClient.ensurePassengerToken().then((tok) => {
+        if (tok) {
+          setPassengerToken(tok);
+        }
+      });
+    }
+  }, [token, passengerToken]);
+
+  const ensurePassengerSession = async (): Promise<string | null> => {
+    const tok = await apiClient.ensurePassengerToken();
+    if (tok) {
+      setPassengerToken(tok);
+    }
+    return tok;
+  };
+
+  const effectiveToken = token || passengerToken;
 
   useEffect(() => {
     const unsub = apiClient.onAuthError(() => {
@@ -111,6 +139,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     setToken(null);
     setCurrentUser(DEFAULT_PASSENGER);
+    apiClient.ensurePassengerToken().then((tok) => {
+      if (tok) setPassengerToken(tok);
+    });
   };
 
   return (
@@ -119,8 +150,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         currentUser,
         isAdmin: currentUser.role === 'admin',
         token,
+        passengerToken,
+        effectiveToken,
         loginAdmin,
         logout,
+        ensurePassengerSession,
       }}
     >
       {children}

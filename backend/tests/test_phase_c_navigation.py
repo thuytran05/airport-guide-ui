@@ -2695,6 +2695,422 @@ async def test_operational_event_logger_and_admin_monitoring_lifecycle():
     assert st_auto["readiness"]["ready"] is True
 
 
+# =========================================================================
+# 8. Deadlock Prevention, Non-Blocking Async Voice, and Watchdog Tests
+# =========================================================================
+
+def test_ros_adapter_voice_transcript_lock_and_deadlock_prevention():
+    """
+    Kiểm tra callback _on_voice_transcript của RosRobotAdapter với khóa threading.Lock()
+    giống hệt production, bảo đảm không bị deadlock do khóa lồng nhau khi xử lý transcript.
+    Đồng thời kiểm tra ROS mode không tự ý tạo proposal từ bare String khi thiếu hợp đồng phiên.
+    """
+    class StringMsg:
+        def __init__(self, data: str):
+            self.data = data
+
+    adapter = RosRobotAdapter.__new__(RosRobotAdapter)
+    adapter._lock = threading.Lock()
+    adapter._destinations = [
+        {"id": "gate_1", "name": "Cổng số 1", "map_id": "map", "pose": {"position": {"x": 1.0, "y": 2.0, "z": 0.0}}}
+    ]
+    adapter._voice_transcript = None
+    adapter._voice_proposal = None
+    adapter._voice_requester_id = "user_test_1"
+    adapter._voice_session_id = "sess_voice_123"
+
+    t_start = time.time()
+    deadlock_detected = False
+
+    def _invoke():
+        adapter._on_voice_transcript(StringMsg("Hãy dẫn tôi tới Cổng số 1"))
+
+    th = threading.Thread(target=_invoke)
+    th.start()
+    th.join(timeout=1.0)
+    if th.is_alive():
+        deadlock_detected = True
+        assert False, "Deadlock phát hiện trong _on_voice_transcript! Callback không hoàn thành sau 1.0s."
+
+    assert not deadlock_detected
+    assert (time.time() - t_start) < 0.5
+    assert adapter._voice_transcript == "Hãy dẫn tôi tới Cổng số 1"
+    assert adapter._voice_proposal is None
+
+
+@pytest.mark.anyio
+async def test_voice_service_async_non_blocking_and_watchdog_timeout():
+    """
+    Kiểm tra:
+    1. Khi gọi /voice/start với ROS service bị chậm hoặc timeout, main asyncio loop của FastAPI
+       không bị khóa (API khác vẫn phản hồi, watchdog manual control vẫn chạy hết hạn).
+    2. Watchdog chuyển động hết hạn sau timeout_sec với dung sai thời gian thực tế,
+       phát lệnh dừng robot an toàn.
+    """
+    from app.adapters.factory import get_robot_adapter
+    adapter = MockRobotAdapter()
+    adapter._is_connected = True
+    adapter._control_mode = "MANUAL"
+    adapter._manual_operator_id = "sess_adm_1"
+    adapter._current_manual_twist = (0.2, 0.0)
+    adapter._last_manual_cmd_time = time.monotonic()
+
+    def slow_voice(requester_id: str):
+        time.sleep(1.2)
+        return {"success": False, "message": "Timeout từ ROS voice service"}
+
+    adapter.start_voice_session = slow_voice
+
+    app.dependency_overrides[get_robot_adapter] = lambda: adapter
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        login_res = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        adm_token = login_res.json()["access_token"]
+        headers = {"Authorization": f"Bearer {adm_token}"}
+
+        t0 = time.monotonic()
+
+        async def call_voice():
+            return await client.post("/api/robot/voice/start", headers=headers)
+
+        async def check_api_responsive():
+            await asyncio.sleep(0.2)
+            res = await client.get("/api/robot/status", headers=headers)
+            assert res.status_code == 200
+            await asyncio.sleep(0.4)
+            adapter.check_manual_timeout()
+            assert adapter._current_manual_twist == (0.0, 0.0)
+            return True
+
+        v_res, api_ok = await asyncio.gather(call_voice(), check_api_responsive())
+        elapsed = time.monotonic() - t0
+        assert api_ok is True
+        assert elapsed >= 1.0
+        assert v_res.status_code == 400
+
+    app.dependency_overrides.pop(get_robot_adapter, None)
+
+
+@pytest.mark.anyio
+async def test_admin_multi_session_distinct_control_arbitration():
+    """
+    Kiểm tra hai phiên đăng nhập thật của cùng một tài khoản Admin ('admin'):
+    - Hai phiên nhận hai session_id (sid) khác nhau trong JWT.
+    - Phiên 1 bật MANUAL -> thành công (operator_id = sid_1).
+    - Phiên 2 gửi lệnh vận tốc khác 0 -> BỊ TỪ CHỐI (400) vì quyền đang thuộc về phiên 1.
+    - Phiên 1 gửi lệnh vận tốc khác 0 -> THÀNH CÔNG.
+    - Phiên 2 gửi lệnh Dừng (0, 0) -> THÀNH CÔNG (lệnh dừng khẩn cấp được chấp nhận từ bất kỳ Admin nào).
+    - Phiên 2 tắt MANUAL -> THÀNH CÔNG, robot chuyển về AUTO.
+    """
+    from app.adapters.factory import get_robot_adapter
+    adapter = MockRobotAdapter()
+    adapter._is_connected = True
+    adapter._control_mode = "AUTO"
+    adapter._manual_consumer_available = True
+
+    app.dependency_overrides[get_robot_adapter] = lambda: adapter
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res1 = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        assert res1.status_code == 200
+        token1 = res1.json()["access_token"]
+
+        res2 = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        assert res2.status_code == 200
+        token2 = res2.json()["access_token"]
+
+        assert token1 != token2
+
+        h1 = {"Authorization": f"Bearer {token1}"}
+        h2 = {"Authorization": f"Bearer {token2}"}
+
+        # Phiên 1 bật MANUAL
+        r_manual = await client.post("/api/robot/control/manual", json={"enable": True}, headers=h1)
+        assert r_manual.status_code == 200
+        assert adapter._control_mode == "MANUAL"
+        op1 = adapter._manual_operator_id
+        assert op1 is not None and op1.startswith("sess_")
+
+        # Phiên 2 gửi lệnh vận tốc chuyển động (khác 0) -> BỊ TỪ CHỐI
+        r_vel2 = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.0}, headers=h2)
+        assert r_vel2.status_code == 400
+        assert "thuộc về" in r_vel2.json()["detail"] or "Admin khác" in r_vel2.json()["detail"]
+
+        # Phiên 1 gửi lệnh vận tốc chuyển động -> THÀNH CÔNG
+        r_vel1 = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.0}, headers=h1)
+        assert r_vel1.status_code == 200
+        assert adapter._current_manual_twist[0] > 0
+
+        # Phiên 2 gửi lệnh DỪNG (0, 0) -> THÀNH CÔNG (Dừng an toàn được phép từ mọi Admin)
+        r_stop2 = await client.post("/api/robot/control/velocity", json={"linear_x": 0.0, "angular_z": 0.0}, headers=h2)
+        assert r_stop2.status_code == 200
+        assert adapter._current_manual_twist == (0.0, 0.0)
+
+        # Phiên 2 tắt MANUAL -> THÀNH CÔNG, chuyển về AUTO
+        r_auto2 = await client.post("/api/robot/control/manual", json={"enable": False}, headers=h2)
+        assert r_auto2.status_code == 200
+        assert adapter._control_mode == "AUTO"
+        assert adapter._manual_operator_id is None
+
+    app.dependency_overrides.pop(get_robot_adapter, None)
+
+
+@pytest.mark.anyio
+async def test_manual_control_out_of_order_http_sequence_and_hold_release():
+    """
+    Kiểm tra xử lý thứ tự lệnh HTTP vận tốc:
+    - Gửi lượt giữ 1 (hold_1) với seq=1, seq=2.
+    - Nhả nút / Gửi lệnh Dừng -> kết thúc hold_1.
+    - Một lệnh vận tốc cũ đến muộn (hold_1, seq=1) sau lệnh Dừng không được kích hoạt lại chuyển động robot.
+    """
+    from app.adapters.factory import get_robot_adapter
+    from app.auth.security import decode_access_token
+
+    adapter = MockRobotAdapter()
+    adapter._is_connected = True
+    adapter._control_mode = "MANUAL"
+    adapter._manual_consumer_available = True
+
+    app.dependency_overrides[get_robot_adapter] = lambda: adapter
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        login_res = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        adm_token = login_res.json()["access_token"]
+        headers = {"Authorization": f"Bearer {adm_token}"}
+        payload = decode_access_token(adm_token)
+        adapter._manual_operator_id = payload.get("sid")
+
+        # Lượt giữ 1: seq=1
+        r1 = await client.post("/api/robot/control/velocity", json={"linear_x": 0.25, "angular_z": 0.0, "seq": 1, "hold_id": "hold_abc"}, headers=headers)
+        assert r1.status_code == 200
+        assert adapter._current_manual_twist[0] == 0.25
+
+        # Lượt giữ 1: seq=2
+        r2 = await client.post("/api/robot/control/velocity", json={"linear_x": 0.25, "angular_z": 0.0, "seq": 2, "hold_id": "hold_abc"}, headers=headers)
+        assert r2.status_code == 200
+
+        # Nhả nút: Gửi Stop (0, 0)
+        r_stop = await client.post("/api/robot/control/velocity", json={"linear_x": 0.0, "angular_z": 0.0, "seq": 3, "hold_id": "hold_abc"}, headers=headers)
+        assert r_stop.status_code == 200
+        assert adapter._current_manual_twist == (0.0, 0.0)
+
+        # Giả lập lệnh seq=1 đến trễ (out-of-order) sau khi đã Dừng
+        r_late = await client.post("/api/robot/control/velocity", json={"linear_x": 0.25, "angular_z": 0.0, "seq": 1, "hold_id": "hold_abc"}, headers=headers)
+        assert r_late.status_code == 200
+        assert adapter._current_manual_twist == (0.0, 0.0)
+
+    app.dependency_overrides.pop(get_robot_adapter, None)
+
+
+def test_amcl_epoch_extended_validation_rules():
+    """
+    Kiểm tra toàn diện các quy tắc xác thực Pose và AMCL Epoch:
+    1. Pose trong frame khác 'map' (ví dụ 'odom') bị từ chối.
+    2. Pose chứa giá trị NaN hoặc Inf bị từ chối.
+    3. Pose chứa quaternion không chuẩn hóa bị từ chối.
+    4. Pose timestamp thuộc phiên trước đến muộn sau khi clock reset bị từ chối.
+    5. /clock liên tục nhận cùng một giá trị (> 1.0s) phát hiện stalled.
+    6. Pose đến trước clock trong lần kết nối đầu vẫn được xử lý đúng (epoch 0).
+    """
+    class MockPoint:
+        def __init__(self, x, y, z=0.0):
+            self.x, self.y, self.z = x, y, z
+
+    class MockQuaternion:
+        def __init__(self, x=0.0, y=0.0, z=0.0, w=1.0):
+            self.x, self.y, self.z, self.w = x, y, z, w
+
+    class MockPose:
+        def __init__(self, pos, q):
+            self.position = pos
+            self.orientation = q
+
+    class MockPoseWithCovariance:
+        def __init__(self, pose):
+            self.pose = pose
+
+    class MockStamp:
+        def __init__(self, sec, nanosec=0):
+            self.sec, self.nanosec = sec, nanosec
+
+    class MockHeader:
+        def __init__(self, frame_id, stamp):
+            self.frame_id = frame_id
+            self.stamp = stamp
+
+    class MockPoseWithCovarianceStamped:
+        def __init__(self, frame_id, sec, x, y, q=None):
+            self.header = MockHeader(frame_id, MockStamp(sec))
+            self.pose = MockPoseWithCovariance(MockPose(MockPoint(x, y), q or MockQuaternion()))
+
+    class MockClockMsg:
+        def __init__(self, sec, nanosec=0):
+            self.clock = MockStamp(sec, nanosec)
+
+    adapter = RosRobotAdapter.__new__(RosRobotAdapter)
+    adapter._lock = threading.Lock()
+    adapter._cfg = get_ros_config()
+    adapter._pose = None
+    adapter._pose_frame_id = None
+    adapter._pose_stamp = None
+    adapter._last_pose_time = 0.0
+    adapter._last_pose_time_mono = 0.0
+    adapter._pose_epoch = 0
+    adapter._pose_received_epoch = -1
+    adapter._sim_restarted = False
+    adapter._is_connected = False
+    adapter._message = "Đang kết nối..."
+    adapter._last_clock_sec = None
+    adapter._last_clock_monotonic = 0.0
+    adapter._clock_stalled = False
+    adapter._navigation_state = "IDLE"
+
+    # Case 6: Pose đến trước clock trong lần kết nối đầu
+    msg_init = MockPoseWithCovarianceStamped("map", 10, 1.5, 2.5)
+    adapter._on_amcl_pose(msg_init)
+    assert adapter._pose is not None
+    assert adapter._pose["x"] == 1.5
+    assert adapter._pose_received_epoch == 0
+    assert adapter.has_valid_pose() is True
+
+    # Clock bắt đầu chạy
+    adapter._on_clock(MockClockMsg(12))
+    assert adapter._last_clock_sec == 12.0
+    assert adapter.has_valid_pose() is True
+
+    # Case 1: Pose sai frame
+    msg_bad_frame = MockPoseWithCovarianceStamped("odom", 13, 99.0, 99.0)
+    adapter._on_amcl_pose(msg_bad_frame)
+    assert adapter._pose["x"] == 1.5
+    assert adapter._pose_frame_id == "map"
+
+    # Case 2: NaN / Inf
+    msg_nan = MockPoseWithCovarianceStamped("map", 14, float("nan"), 2.0)
+    adapter._on_amcl_pose(msg_nan)
+    assert adapter._pose["x"] == 1.5
+
+    # Case 3: Quaternion không chuẩn hóa
+    msg_bad_q = MockPoseWithCovarianceStamped("map", 14, 3.0, 3.0, q=MockQuaternion(0, 0, 0, 0))
+    adapter._on_amcl_pose(msg_bad_q)
+    assert adapter._pose["x"] == 1.5
+
+    # Case 4: Clock reset về 0 (Gazebo restart), pose cũ đến muộn
+    adapter._on_clock(MockClockMsg(100))
+    adapter._on_clock(MockClockMsg(1))
+    assert adapter._sim_restarted is True
+    assert adapter._pose_epoch == 1
+    assert adapter.has_valid_pose() is False
+
+    # Pose cũ từ trước reset đến muộn (timestamp = 98s)
+    msg_late = MockPoseWithCovarianceStamped("map", 98, 4.0, 4.0)
+    adapter._on_amcl_pose(msg_late)
+    assert adapter._pose["x"] == 1.5
+    assert adapter.has_valid_pose() is False
+
+    # Pose mới của phiên mới (timestamp = 2s)
+    msg_new = MockPoseWithCovarianceStamped("map", 2, 5.0, 6.0)
+    adapter._on_amcl_pose(msg_new)
+    assert adapter._pose["x"] == 5.0
+    assert adapter._pose_received_epoch == 1
+    assert adapter.has_valid_pose() is True
+
+    # Case 5: Clock nhận cùng một giá trị liên tục (> 1s)
+    adapter._on_clock(MockClockMsg(2))
+    adapter._last_clock_advancing_monotonic = time.monotonic() - 2.0
+    adapter._on_clock(MockClockMsg(2))
+    assert adapter._clock_stalled is True
+
+
+def test_nav2_readiness_checks_action_server():
+    """
+    Kiểm tra Action Server Nav2 chưa sẵn sàng thì readiness.ready = False
+    kèm theo lý do chính xác.
+    """
+    adapter = RosRobotAdapter.__new__(RosRobotAdapter)
+    adapter._lock = threading.Lock()
+    adapter._cfg = get_ros_config()
+    adapter._is_connected = True
+    adapter._clock_stalled = False
+    adapter._pose = {"x": 1.0, "y": 1.0, "theta": 0.0}
+    adapter._pose_frame_id = "map"
+    adapter._pose_epoch = 0
+    adapter._pose_received_epoch = 0
+    adapter._sim_restarted = False
+    adapter._map_version = "v1"
+    adapter._map_png = b"png"
+    adapter._control_mode = "AUTO"
+    adapter._navigation_state = "IDLE"
+    adapter._nav2_has_active_goal = False
+    adapter._current_goal_handle = None
+
+    class MockActionClient:
+        def server_is_ready(self):
+            return False
+
+    adapter._action_nav = MockActionClient()
+    readiness = adapter.get_readiness()
+    assert readiness["ready"] is False
+    assert any("Action server Nav2" in r for r in readiness["reasons"])
+
+
+@pytest.mark.anyio
+async def test_operational_event_logger_lifecycle_hooks_and_destinations(tmp_path):
+    """
+    Kiểm tra:
+    1. Thao tác lưu/xóa điểm đến thành công ghi sự kiện vào event_logger.
+    2. Chuyển đổi trạng thái dẫn đường ghi sự kiện chính xác.
+    3. Endpoint /api/robot/admin/events trả về sự kiện đầy đủ cho Admin.
+    4. Hành khách vãng lai bị từ chối (403 Forbidden).
+    """
+    from app.services.event_logger import event_logger
+    from app.adapters.factory import get_robot_adapter
+    event_logger.clear()
+
+    adapter = MockRobotAdapter()
+    adapter._destinations_file = tmp_path / "mock_dest.yaml"
+    adapter._destinations = []
+    adapter._is_connected = True
+
+    dest = {
+        "id": "gate_test_event",
+        "name": "Cổng Test Event",
+        "map_id": "map",
+        "pose": {"position": {"x": 2.0, "y": 2.0, "z": 0.0}}
+    }
+    r_up = adapter.upsert_destination(dest)
+    assert r_up["success"] is True
+
+    evts = event_logger.get_events()
+    assert any(e["category"] == "DESTINATION" and "Cổng Test Event" in e["message"] for e in evts)
+
+    r_del = adapter.delete_destination("gate_test_event")
+    assert r_del["success"] is True
+    evts = event_logger.get_events()
+    assert any(e["category"] == "DESTINATION" and "Đã xóa" in e["message"] for e in evts)
+
+    app.dependency_overrides[get_robot_adapter] = lambda: adapter
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        r_pass = await client.get("/api/robot/admin/events")
+        assert r_pass.status_code == 403
+
+        login_res = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        adm_token = login_res.json()["access_token"]
+        r_adm = await client.get("/api/robot/admin/events", headers={"Authorization": f"Bearer {adm_token}"})
+        assert r_adm.status_code == 200
+        data = r_adm.json()
+        assert "events" in data
+        assert len(data["events"]) > 0
+        assert data["events"][0]["category"] in ("DESTINATION", "SYSTEM", "CONNECTION", "CONTROL", "NAVIGATION")
+
+    app.dependency_overrides.pop(get_robot_adapter, None)
+
+
+
 
 
 
