@@ -3516,19 +3516,302 @@ async def test_manual_control_cmd_vel_twist_and_issues_a_to_f(tmp_path):
         ros_dummy._pub_cmd_vel = DummyPub("/cmd_vel")
         ros_dummy._cmd_vel_is_twist = True
 
-        # Khi chỉ có CLI topic echo (_ros2cli_echo) -> Không coi là consumer hợp lệ
+        # 1. Graph rỗng (subs = []) -> Khóa an toàn
+        ros_dummy._node = DummyNode([])
+        assert ros_dummy.is_manual_consumer_available() is False
+
+        # 2. Graph None -> Khóa an toàn
+        ros_dummy._node = DummyNode(None)
+        assert ros_dummy.is_manual_consumer_available() is False
+
+        # 3. Node None -> Khóa an toàn
+        ros_dummy._node = None
+        assert ros_dummy.is_manual_consumer_available() is False
+
+        # 4. Count <= 0 -> Khóa an toàn
+        class DummyPubZero:
+            def __init__(self, topic_name):
+                self.topic_name = topic_name
+            def get_subscription_count(self):
+                return 0
+        ros_dummy._pub_cmd_vel = DummyPubZero("/cmd_vel")
+        ros_dummy._node = DummyNode([DummySub("ros_gz_bridge", "geometry_msgs/msg/Twist")])
+        assert ros_dummy.is_manual_consumer_available() is False
+        ros_dummy._pub_cmd_vel = DummyPub("/cmd_vel")
+
+        # 5. Khi chỉ có CLI topic echo (_ros2cli_echo) -> Không coi là consumer hợp lệ
         ros_dummy._node = DummyNode([DummySub("_ros2cli_echo_123", "geometry_msgs/msg/Twist")])
         assert ros_dummy.is_manual_consumer_available() is False
 
-        # Khi có ros_gz_bridge với geometry_msgs/msg/Twist -> Hợp lệ
+        # 6. Sai kiểu topic (std_msgs/msg/String thay vì Twist) -> Không hợp lệ
+        ros_dummy._node = DummyNode([DummySub("ros_gz_bridge", "std_msgs/msg/String")])
+        assert ros_dummy.is_manual_consumer_available() is False
+
+        # 7. Khi có ros_gz_bridge với geometry_msgs/msg/Twist -> Hợp lệ
         ros_dummy._node = DummyNode([DummySub("ros_gz_bridge", "geometry_msgs/msg/Twist")])
         assert ros_dummy.is_manual_consumer_available() is True
 
-        # Khi có command_timeout với geometry_msgs/msg/Twist -> Hợp lệ
+        # 8. Khi có command_timeout với geometry_msgs/msg/Twist -> Hợp lệ
         ros_dummy._node = DummyNode([DummySub("command_timeout", "geometry_msgs/msg/Twist")])
         assert ros_dummy.is_manual_consumer_available() is True
 
+        # 9. Chế độ TwistStamped (profile robot thật / twist_mux)
+        ros_dummy._cmd_vel_is_twist = False
+        ros_dummy._node = DummyNode([DummySub("twist_mux", "geometry_msgs/msg/TwistStamped")])
+        assert ros_dummy.is_manual_consumer_available() is True
+
     app.dependency_overrides.pop(get_robot_adapter, None)
+
+
+# =========================================================================
+# 11. Concurrency Transactions & Strict Order Control for Destinations
+# =========================================================================
+
+def test_destinations_concurrency_transactions_and_isolation(tmp_path):
+    """
+    Kiểm thử kiểm soát thứ tự đồng thời cho upsert/delete điểm đến:
+    1. A ghi lỗi rồi B thành công (Race condition tái hiện từ user issue).
+       - Kết quả: A báo lỗi, B báo thành công.
+       - Bộ nhớ không bị rollback về rỗng, chứa đúng điểm của B.
+       - File trên đĩa chứa đúng điểm của B. Bộ nhớ và file hoàn toàn khớp nhau.
+    2. Hai thao tác thêm thành công đồng thời (Barrier controlled).
+    3. Thêm và xóa đồng thời (Barrier controlled).
+    4. Ghi file chậm trong lúc watchdog cần phát zero / timeout (Event controlled).
+    Chạy trên cả MockRobotAdapter và RosRobotAdapter.
+    """
+    from collections import OrderedDict
+    from app.adapters.ros_adapter import RosRobotAdapter
+    from app.adapters.mock_adapter import MockRobotAdapter
+    from app.coordinate.transform import MapMetadata
+
+    def create_adapters(base_dir, name):
+        f_mock = base_dir / f"{name}_mock_dest.yaml"
+        f_ros = base_dir / f"{name}_ros_dest.yaml"
+
+        ad_mock = MockRobotAdapter()
+        ad_mock._destinations = []
+        ad_mock._destinations_version = 0
+        ad_mock._destinations_file = f_mock
+        ad_mock._navigation_state = "IDLE"
+        ad_mock._destination_id = None
+        ad_mock._control_mode = "AUTO"
+        ad_mock._manual_operator_id = None
+        ad_mock._active_hold_id = None
+        ad_mock._released_hold_ids = OrderedDict()
+        ad_mock._last_manual_seq = 0
+        ad_mock._current_manual_twist = (0.0, 0.0)
+        ad_mock._last_manual_cmd_time = 0.0
+
+        ad_ros = object.__new__(RosRobotAdapter)
+        ad_ros._lock = threading.Lock()
+        ad_ros._io_lock = threading.Lock()
+        ad_ros._cfg = get_ros_config()
+        ad_ros._destinations = []
+        ad_ros._destinations_version = 0
+        ad_ros._destinations_file = f_ros
+        ad_ros._navigation_state = "IDLE"
+        ad_ros._destination_id = None
+        ad_ros._control_mode = "AUTO"
+        ad_ros._manual_operator_id = None
+        ad_ros._active_hold_id = None
+        ad_ros._released_hold_ids = OrderedDict()
+        ad_ros._last_manual_seq = 0
+        ad_ros._current_manual_twist = (0.0, 0.0)
+        ad_ros._last_manual_cmd_time = 0.0
+        ad_ros._pub_cmd_vel = None
+        ad_ros._map_meta = MapMetadata(width=200, height=200, resolution=0.05, origin_x=0.0, origin_y=0.0, origin_yaw=0.0)
+        ad_ros._occupancy_grid_data = [0] * 40000
+
+        return [("MockAdapter", ad_mock, f_mock), ("RosAdapter", ad_ros, f_ros)]
+
+    # -------------------------------------------------------------
+    # KỊCH BẢN 1: A GHI LỖI RỒI B THÀNH CÔNG (User Bug Isolation)
+    # -------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_adapters(tmp_path, "scenario1"):
+        dest_a = {"id": "dest_A", "name": "Điểm A", "pose": {"position": {"x": 1.0, "y": 1.0, "z": 0.0}}}
+        dest_b = {"id": "dest_B", "name": "Điểm B", "pose": {"position": {"x": 2.0, "y": 2.0, "z": 0.0}}}
+
+        orig_write = adapter._write_destinations_file
+
+        event_a_in_write = threading.Event()
+        event_allow_a_fail = threading.Event()
+        event_b_entered = threading.Event()
+
+        results = {}
+
+        def faulty_write_for_a(dest_list):
+            # Chỉ can thiệp lần gọi đầu tiên từ Thread A
+            if any(d.get("id") == "dest_A" for d in dest_list) and not event_a_in_write.is_set():
+                event_a_in_write.set()
+                event_allow_a_fail.wait(timeout=5.0)
+                if adapter_name == "MockAdapter":
+                    return False
+                return False, "Lỗi giả lập ổ đĩa chỉ đọc trên Thread A"
+            return orig_write(dest_list)
+
+        adapter._write_destinations_file = faulty_write_for_a
+
+        def run_thread_a():
+            results["res_a"] = adapter.upsert_destination(dest_a)
+
+        def run_thread_b():
+            event_b_entered.set()
+            results["res_b"] = adapter.upsert_destination(dest_b)
+
+        thread_a = threading.Thread(target=run_thread_a)
+        thread_b = threading.Thread(target=run_thread_b)
+
+        thread_a.start()
+        # Chờ Thread A đã vào _write_destinations_file và đang giữ _io_lock
+        assert event_a_in_write.wait(timeout=5.0)
+
+        # Khởi chạy Thread B (sẽ bị chặn ở _io_lock)
+        thread_b.start()
+        assert event_b_entered.wait(timeout=5.0)
+
+        # Cho phép Thread A kết thúc với lỗi ghi file
+        event_allow_a_fail.set()
+
+        thread_a.join(timeout=5.0)
+        thread_b.join(timeout=5.0)
+
+        assert results["res_a"]["success"] is False, f"[{adapter_name}] Thread A phải trả về thất bại"
+        assert results["res_b"]["success"] is True, f"[{adapter_name}] Thread B phải trả về thành công"
+
+        # Kiểm tra bộ nhớ: Không bị rollback về rỗng, chứa đúng điểm B
+        mem_dests = adapter.get_destinations()
+        dest_ids_in_mem = [d["id"] for d in mem_dests]
+        assert "dest_B" in dest_ids_in_mem, f"[{adapter_name}] Điểm B phải tồn tại trong bộ nhớ"
+        assert "dest_A" not in dest_ids_in_mem, f"[{adapter_name}] Điểm A không được lưu vì ghi file thất bại"
+        assert len(mem_dests) == 1
+
+        # Kiểm tra file trên đĩa: Khớp hoàn toàn với bộ nhớ
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data = yaml.safe_load(f)
+        disk_ids = [d["id"] for d in disk_data.get("destinations", [])]
+        assert disk_ids == ["dest_B"], f"[{adapter_name}] File trên đĩa phải có duy nhất dest_B: {disk_ids}"
+
+    # -------------------------------------------------------------
+    # KỊCH BẢN 2: HAI THAO TÁC THÀNH CÔNG ĐỒNG THỜI (Barrier)
+    # -------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_adapters(tmp_path, "scenario2"):
+        barrier = threading.Barrier(2)
+        results = {}
+
+        dest_1 = {"id": "gate_1", "name": "Cổng số 1", "pose": {"position": {"x": 1.0, "y": 1.0, "z": 0.0}}}
+        dest_2 = {"id": "gate_2", "name": "Cổng số 2", "pose": {"position": {"x": 2.0, "y": 2.0, "z": 0.0}}}
+
+        def worker1():
+            barrier.wait(timeout=5.0)
+            results["res1"] = adapter.upsert_destination(dest_1)
+
+        def worker2():
+            barrier.wait(timeout=5.0)
+            results["res2"] = adapter.upsert_destination(dest_2)
+
+        t1 = threading.Thread(target=worker1)
+        t2 = threading.Thread(target=worker2)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert results["res1"]["success"] is True
+        assert results["res2"]["success"] is True
+
+        mem_dests = adapter.get_destinations()
+        mem_ids = {d["id"] for d in mem_dests}
+        assert mem_ids == {"gate_1", "gate_2"}, f"[{adapter_name}] Cả 2 điểm phải có trong bộ nhớ"
+        assert adapter.get_destinations_version() == 2
+
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data = yaml.safe_load(f)
+        disk_ids = {d["id"] for d in disk_data.get("destinations", [])}
+        assert disk_ids == {"gate_1", "gate_2"}, f"[{adapter_name}] Cả 2 điểm phải có trên đĩa"
+
+    # -------------------------------------------------------------
+    # KỊCH BẢN 3: THÊM VÀ XÓA ĐỒNG THỜI (Barrier)
+    # -------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_adapters(tmp_path, "scenario3"):
+        # Khởi tạo điểm ban đầu
+        init_dest1 = {"id": "gate_init_1", "name": "Cổng Khởi Tạo 1", "pose": {"position": {"x": 1.0, "y": 1.0, "z": 0.0}}}
+        init_dest2 = {"id": "gate_init_2", "name": "Cổng Khởi Tạo 2", "pose": {"position": {"x": 2.0, "y": 2.0, "z": 0.0}}}
+        adapter.upsert_destination(init_dest1)
+        adapter.upsert_destination(init_dest2)
+        assert len(adapter.get_destinations()) == 2
+
+        barrier = threading.Barrier(2)
+        results = {}
+
+        new_dest = {"id": "gate_new_3", "name": "Cổng Mới 3", "pose": {"position": {"x": 3.0, "y": 3.0, "z": 0.0}}}
+
+        def worker_add():
+            barrier.wait(timeout=5.0)
+            results["res_add"] = adapter.upsert_destination(new_dest)
+
+        def worker_del():
+            barrier.wait(timeout=5.0)
+            results["res_del"] = adapter.delete_destination("gate_init_1")
+
+        t_add = threading.Thread(target=worker_add)
+        t_del = threading.Thread(target=worker_del)
+        t_add.start()
+        t_del.start()
+        t_add.join(timeout=5.0)
+        t_del.join(timeout=5.0)
+
+        assert results["res_add"]["success"] is True
+        assert results["res_del"]["success"] is True
+
+        mem_dests = adapter.get_destinations()
+        mem_ids = {d["id"] for d in mem_dests}
+        assert mem_ids == {"gate_init_2", "gate_new_3"}, f"[{adapter_name}] Memory phải còn gate_init_2 và gate_new_3: {mem_ids}"
+
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data = yaml.safe_load(f)
+        disk_ids = {d["id"] for d in disk_data.get("destinations", [])}
+        assert disk_ids == {"gate_init_2", "gate_new_3"}, f"[{adapter_name}] Disk phải còn gate_init_2 và gate_new_3: {disk_ids}"
+
+    # -------------------------------------------------------------
+    # KỊCH BẢN 4: GHI CHẬM TRONG LÚC WATCHDOG CẦN PHÁT ZERO
+    # -------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_adapters(tmp_path, "scenario4"):
+        # Đặt xe vào trạng thái MANUAL đang chạy và đã quá hạn timeout 0.5s
+        adapter._control_mode = "MANUAL"
+        adapter._manual_operator_id = "admin_drive"
+        adapter._current_manual_twist = (0.25, 0.1)
+        adapter._last_manual_cmd_time = time.monotonic() - 1.0  # quá hạn
+
+        orig_write = adapter._write_destinations_file
+        event_write_entered = threading.Event()
+        event_allow_write_finish = threading.Event()
+
+        def slow_write(dest_list):
+            event_write_entered.set()
+            event_allow_write_finish.wait(timeout=5.0)
+            return orig_write(dest_list)
+
+        adapter._write_destinations_file = slow_write
+
+        slow_dest = {"id": "gate_slow", "name": "Cổng Chậm", "pose": {"position": {"x": 1.0, "y": 1.0, "z": 0.0}}}
+        t_save = threading.Thread(target=lambda: adapter.upsert_destination(slow_dest))
+        t_save.start()
+
+        assert event_write_entered.wait(timeout=5.0)
+
+        # Trong lúc tệp đang ghi chậm (giữ _io_lock), watchdog check_manual_timeout()
+        # KHÔNG bị chặn bởi self._lock!
+        t_start = time.monotonic()
+        adapter.check_manual_timeout()
+        elapsed = time.monotonic() - t_start
+
+        assert elapsed < 0.1, f"[{adapter_name}] Watchdog bị chặn bởi I/O: {elapsed}s"
+        assert adapter._control_mode == "AUTO", f"[{adapter_name}] Watchdog phải chuyển robot về AUTO"
+        assert adapter._current_manual_twist == (0.0, 0.0), f"[{adapter_name}] Watchdog phải dừng xe về (0,0)"
+
+        event_allow_write_finish.set()
+        t_save.join(timeout=5.0)
+        assert len(adapter.get_destinations()) == 1
 
 
 

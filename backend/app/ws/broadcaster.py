@@ -53,9 +53,8 @@ async def telemetry_broadcaster_loop():
             # Thu thập trạng thái từ adapter để theo dõi kết nối ngay cả khi 0 client
             status = adapter.get_status()
 
-            # Theo dõi chuyển đổi trạng thái kết nối ROS và chế độ điều khiển (chống ghi lặp)
+            # Theo dõi chuyển đổi trạng thái kết nối ROS (chống ghi lặp)
             event_logger.track_connection(status.get("is_connected", False))
-            event_logger.track_control_mode(status.get("control_mode", "AUTO"))
 
             if not ws_manager.active_connections:
                 last_sent_path_versions.clear()
@@ -149,7 +148,7 @@ async def telemetry_broadcaster_loop():
                     manual_lock_reason = "Đường lệnh điều khiển tay ROS chưa có consumer tiếp nhận"
                 elif current_manual_op and not is_manual_controller:
                     can_manual_control = False
-                    manual_lock_reason = f"Quyền điều khiển đang thuộc về phiên Admin khác ({current_manual_op})"
+                    manual_lock_reason = "Quyền điều khiển đang thuộc về một phiên Admin khác"
                 else:
                     can_manual_control = True
                     manual_lock_reason = None

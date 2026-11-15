@@ -91,7 +91,7 @@ export default function PassengerHome() {
       {/* Cảnh báo mất kết nối nếu có */}
       {!status.isConnected && (
         <div className={styles.alertBanner}>
-          ⚠️ Chưa kết nối với Robot ROS 2. Vui lòng kiểm tra Docker hoặc mạng nội bộ.
+          ⚠️ Mất kết nối tới robot dẫn đường. Hệ thống đang tự động thử kết nối lại...
         </div>
       )}
 

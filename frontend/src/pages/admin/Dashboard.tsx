@@ -160,6 +160,15 @@ export default function AdminDashboard() {
     }
   };
 
+  // Vòng lặp gửi vận tốc 10Hz khi giữ nút điều khiển
+  const driveTimerRef = useRef<any>(null);
+  const activeVelRef = useRef<{ lin: number; ang: number }>({ lin: 0, ang: 0 });
+  const activeHoldIdRef = useRef<string | null>(null);
+  const holdSeqRef = useRef<number>(0);
+  const stopDriveRef = useRef<() => void>(() => {});
+  const isVelocityInFlightRef = useRef<boolean>(false);
+  const currentAbortControllerRef = useRef<AbortController | null>(null);
+
   // Trạng thái chuyến đi & quyền điều khiển
   const isNavTripActive =
     status.navigationState === 'NAVIGATING' ||
@@ -175,11 +184,12 @@ export default function AdminDashboard() {
 
   const isManual = status.controlMode === 'MANUAL';
   const hasConsumer = status.manualConsumerAvailable ?? false;
+  // Nhận diện phiên lái tay dựa trên is_manual_controller do backend tính theo JWT session_id
   const isOccupiedByOther = Boolean(
     isManual &&
     status.manualOperatorId &&
-    currentUser &&
-    status.manualOperatorId !== currentUser.id
+    !status.isManualController &&
+    !activeHoldIdRef.current
   );
 
   // Phân quyền lái tay trực tiếp (Direct Press-and-Hold)
@@ -187,10 +197,10 @@ export default function AdminDashboard() {
     status.canManualControl ??
     (!isNavTripActive && status.isConnected && !status.isDataStale && hasConsumer && !isOccupiedByOther)
   );
-  const manualLockReason = status.manualLockReason || (!hasConsumer ? 'Đường lệnh ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận' : null);
+  const manualLockReason = status.manualLockReason || (!hasConsumer ? 'Đường lệnh ROS (/cmd_vel) chưa có consumer tiếp nhận' : null);
 
   // Đánh giá trạng thái sẵn sàng dẫn đường & phân tích lý do nếu bị khóa
-  // Dùng status.readiness từ backend làm nguồn sự thật duy nhất
+  // Tách sức khỏe hệ thống thật (Gateway, AMCL, Bản đồ, Nav2) khỏi điều kiện nhấn giữ nút lái MANUAL tạm thời
   const readinessCheck = useMemo(() => {
     if (!isBackendConnected) {
       return {
@@ -202,15 +212,21 @@ export default function AdminDashboard() {
       };
     }
 
-    if (status.readiness && !status.readiness.ready) {
-      const primaryReason = status.readiness.reasons[0] || 'Robot chưa sẵn sàng dẫn đường';
+    // Lọc các lý do liên quan đến hạ tầng hệ thống ROS/AMCL/Bản đồ/Nav2
+    // Bỏ qua cảnh báo MANUAL tạm thời vì khi nhả nút lái xe sẽ tự động chuyển về AUTO
+    const subsystemReasons = (status.readiness?.reasons || []).filter(
+      (r) => !r.includes('MANUAL')
+    );
+
+    if (subsystemReasons.length > 0) {
+      const primaryReason = subsystemReasons[0];
       const isSevere = !status.isConnected || status.isDataStale;
       return {
         ready: false,
         severity: isSevere ? ('err' as const) : ('warn' as const),
         title: primaryReason,
         badge: isSevere ? 'LỖI HỆ THỐNG' : 'CHƯA SẴN SÀNG',
-        reason: status.readiness.reasons.join(' • '),
+        reason: subsystemReasons.join(' • '),
       };
     }
 
@@ -249,7 +265,7 @@ export default function AdminDashboard() {
       severity: 'ready' as const,
       title: 'Robot sẵn sàng dẫn đường',
       badge: 'SẴN SÀNG',
-      reason: 'Tất cả các hệ thống con (Gateway, AMCL, Bản đồ, Nav2, AUTO) đều sẵn sàng.',
+      reason: 'Tất cả các hệ thống con (Gateway, AMCL, Bản đồ, Nav2) đều sẵn sàng.',
     };
   }, [
     isBackendConnected,
@@ -264,15 +280,6 @@ export default function AdminDashboard() {
   const sortedEvents = useMemo(() => {
     return [...events].sort((a, b) => b.timestamp - a.timestamp);
   }, [events]);
-
-  // Vòng lặp gửi vận tốc 10Hz khi giữ nút điều khiển
-  const driveTimerRef = useRef<any>(null);
-  const activeVelRef = useRef<{ lin: number; ang: number }>({ lin: 0, ang: 0 });
-  const activeHoldIdRef = useRef<string | null>(null);
-  const holdSeqRef = useRef<number>(0);
-  const stopDriveRef = useRef<() => void>(() => {});
-  const isVelocityInFlightRef = useRef<boolean>(false);
-  const currentAbortControllerRef = useRef<AbortController | null>(null);
 
   const [showSystemDetails, setShowSystemDetails] = useState(false);
   const [isRefreshingEvents, setIsRefreshingEvents] = useState(false);
@@ -670,24 +677,7 @@ export default function AdminDashboard() {
               <span className={styles.subsystemVal}>{status.navigationState}</span>
             </div>
 
-            {/* 5. Chế độ điều khiển */}
-            <div className={styles.subsystemItem}>
-              <div className={styles.subsystemTop}>
-                <span className={styles.subsystemLabel}>Chế độ điều khiển</span>
-                <span
-                  className={`${styles.subsystemIndicator} ${
-                    status.controlMode === 'AUTO' ? styles.indicatorOk : styles.indicatorWarn
-                  }`}
-                />
-              </div>
-              <span className={styles.subsystemVal}>
-                {status.controlMode === 'AUTO'
-                  ? 'Tự động (AUTO)'
-                  : `Thủ công (${status.manualOperatorId ? 'Admin ' + status.manualOperatorId : 'MANUAL'})`}
-              </span>
-            </div>
-
-            {/* 6. Chuyến hiện tại */}
+            {/* 5. Chuyến hiện tại */}
             <div className={styles.subsystemItem}>
               <div className={styles.subsystemTop}>
                 <span className={styles.subsystemLabel}>Chuyến hiện tại</span>
@@ -706,7 +696,7 @@ export default function AdminDashboard() {
               </span>
             </div>
 
-            {/* 7. Pin Robot (chỉ hiện dữ liệu thật) */}
+            {/* 6. Pin Robot (chỉ hiện dữ liệu thật) */}
             <div className={styles.subsystemItem}>
               <div className={styles.subsystemTop}>
                 <span className={styles.subsystemLabel}>Pin Robot</span>
@@ -723,7 +713,7 @@ export default function AdminDashboard() {
               </span>
             </div>
 
-            {/* 8. Giọng nói ROS (chỉ hiện dữ liệu thật) */}
+            {/* 7. Giọng nói ROS (chỉ hiện dữ liệu thật) */}
             <div className={styles.subsystemItem}>
               <div className={styles.subsystemTop}>
                 <span className={styles.subsystemLabel}>Giọng nói ROS</span>
@@ -776,13 +766,13 @@ export default function AdminDashboard() {
 
             {isOccupiedByOther && (
               <div className={styles.mapBannerWarn}>
-                🔒 Quyền điều khiển tay đang thuộc về Admin: <strong>{status.manualOperatorId}</strong>. Bạn chỉ có thể theo dõi hoặc bấm nút &ldquo;Dừng&rdquo; trên bàn điều khiển để dừng khẩn cấp an toàn.
+                🔒 Quyền điều khiển tay đang thuộc về một phiên Admin khác. Bạn có thể theo dõi hoặc bấm nút &ldquo;Dừng&rdquo; trên bàn điều khiển để dừng khẩn cấp an toàn.
               </div>
             )}
 
             {!hasConsumer && (
               <div className={styles.mapBannerWarn}>
-                ⚠️ Đường lệnh điều khiển tay tới Gazebo (<code>/airport/cmd_vel_manual</code>) chưa có consumer (0 subscriber). Các nút vận tốc được khóa an toàn để tránh bỏ qua bộ phân luồng và các lớp an toàn (collision_monitor / velocity_smoother).
+                ⚠️ Đường lệnh điều khiển tay tới Gazebo (<code>/cmd_vel</code>) chưa có consumer tiếp nhận. Các nút điều khiển được khóa an toàn.
               </div>
             )}
 
@@ -807,20 +797,6 @@ export default function AdminDashboard() {
                     : 'Bàn điều khiển tay 5 nút (Nhấn giữ để di chuyển, nhả để dừng)'
                 }
               >
-                <div className={styles.dpadOverlayHeader}>
-                  <span className={styles.dpadOverlayTitle}>Điều khiển tay</span>
-                  <span
-                    className={`${styles.dpadOverlayBadge} ${
-                      isDrivingNow
-                        ? styles.badgeManualOk
-                        : canDrive
-                        ? styles.badgeReady
-                        : styles.badgeManualLocked
-                    }`}
-                  >
-                    {isDrivingNow ? 'ĐANG LÁI' : canDrive ? 'SẴN SÀNG' : 'KHÓA'}
-                  </span>
-                </div>
                 <div className={styles.dpadRow}>
                   <button
                     type="button"
@@ -1078,8 +1054,12 @@ export default function AdminDashboard() {
                       type="button"
                       className={styles.adminResumeBtn}
                       onClick={handleAdminResume}
-                      disabled={isNavSubmitting || isManual || !status.isConnected}
-                      title="Tiếp tục dẫn đường tới điểm đến hiện tại"
+                      disabled={isNavSubmitting || isManual || isDrivingNow || !status.isConnected}
+                      title={
+                        isManual || isDrivingNow
+                          ? 'Khóa an toàn: Thả nút điều khiển tay để tiếp tục dẫn đường'
+                          : 'Tiếp tục dẫn đường tới điểm đến hiện tại'
+                      }
                     >
                       {isNavSubmitting ? 'Đang gửi lệnh tiếp tục...' : 'TIẾP TỤC DẪN ĐƯỜNG'}
                     </button>
@@ -1131,28 +1111,29 @@ export default function AdminDashboard() {
                   </div>
                 )}
 
-                {isManual && (
-                  <div className={styles.warnText}>
-                    ⚠️ Robot đang ở chế độ MANUAL. Vui lòng tắt thủ công trước khi kích hoạt Nav2.
+                {/* Khóa và thông báo trạng thái dẫn đường: Chỉ hiện 1 thông báo ngắn gọn, dễ hiểu */}
+                {(isManual || isDrivingNow) ? (
+                  <div className={styles.blockedNavNote}>
+                    <span>ℹ️</span>
+                    <div>
+                      <strong>Chưa thể bắt đầu:</strong> Thả nút điều khiển tay để bắt đầu dẫn đường.
+                    </div>
                   </div>
-                )}
-
-                {!readinessCheck.ready && (
+                ) : !readinessCheck.ready ? (
                   <div className={styles.blockedNavNote}>
                     <span>ℹ️</span>
                     <div>
                       <strong>Chưa thể bắt đầu:</strong> {readinessCheck.reason}
                     </div>
                   </div>
-                )}
-                {readinessCheck.ready && !selectedNavDestId && destinations.length > 0 && (
+                ) : !selectedNavDestId && destinations.length > 0 ? (
                   <div className={styles.blockedNavNote} style={{ background: '#EFF6FF', borderColor: '#BFDBFE', color: '#1E40AF' }}>
                     <span>ℹ️</span>
                     <div>
                       <strong>Sẵn sàng:</strong> Vui lòng chọn một điểm đến trong danh sách để bắt đầu dẫn đường.
                     </div>
                   </div>
-                )}
+                ) : null}
 
                 <div className={styles.navActions}>
                   <button
@@ -1164,11 +1145,15 @@ export default function AdminDashboard() {
                       destinations.length === 0 ||
                       isNavigating ||
                       isManual ||
+                      isDrivingNow ||
                       !status.isConnected ||
-                      isNavSubmitting
+                      isNavSubmitting ||
+                      !readinessCheck.ready
                     }
                     title={
-                      !readinessCheck.ready
+                      isManual || isDrivingNow
+                        ? 'Khóa an toàn: Thả nút điều khiển tay để bắt đầu dẫn đường'
+                        : !readinessCheck.ready
                         ? `Khóa an toàn: ${readinessCheck.reason}`
                         : !selectedNavDestId
                         ? 'Vui lòng chọn một điểm đến'

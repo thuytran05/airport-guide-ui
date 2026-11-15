@@ -61,18 +61,18 @@ export const VoicePanel: React.FC = () => {
 
   const getStatusText = () => {
     if (!isAvailable) {
-      return 'Chưa kết nối node giọng nói ROS (chưa có service /airport/voice/start). Nút microphone được khóa an toàn.';
+      return 'Tính năng trợ lý giọng nói hiện chưa sẵn sàng. Nút microphone tạm thời được khóa an toàn.';
     }
     if (isCalling) return 'Đang gửi yêu cầu tới robot...';
     switch (status.voiceState) {
       case 'LISTENING':
         return '🎤 Đang nghe (nói vào microphone của robot)...';
       case 'PROCESSING':
-        return '⚙️ ROS đang xử lý yêu cầu giọng nói...';
+        return '⚙️ Đang xử lý yêu cầu giọng nói...';
       case 'SPEAKING':
         return '🔊 Robot đang phát âm thanh phản hồi...';
       case 'ERROR':
-        return '⚠️ Hệ thống giọng nói ROS báo lỗi.';
+        return '⚠️ Trợ lý giọng nói gặp sự cố tạm thời.';
       case 'IDLE':
       default:
         return 'Nhấn nút microphone để bắt đầu trò chuyện với robot';
@@ -81,7 +81,7 @@ export const VoicePanel: React.FC = () => {
 
   const getButtonTitle = () => {
     if (!isAvailable) {
-      return 'Chưa kết nối node giọng nói ROS (/airport/voice/start)';
+      return 'Trợ lý giọng nói hiện chưa sẵn sàng';
     }
     if (isBusy) {
       return 'Đang trong phiên tương tác giọng nói';
@@ -106,7 +106,7 @@ export const VoicePanel: React.FC = () => {
 
       {!isAvailable && (
         <div className={styles.offlineBanner}>
-          <span>⚠️ Node giọng nói ROS chưa kết nối (/airport/voice/start offline). Nút microphone đã được khóa an toàn.</span>
+          <span>⚠️ Trợ lý giọng nói trên robot hiện chưa sẵn sàng. Nút microphone đã được khóa an toàn.</span>
         </div>
       )}
 
@@ -211,7 +211,7 @@ export const VoicePanel: React.FC = () => {
       )}
 
       <div className={styles.footerNote}>
-        <small>💡 Giọng nói được xử lý trực tiếp trên phần cứng robot qua ROS 2. Trình duyệt không thu âm.</small>
+        <small>💡 Giọng nói được xử lý trực tiếp qua microphone trên thân robot. Trình duyệt không thu âm microphone máy tính.</small>
       </div>
     </div>
   );
