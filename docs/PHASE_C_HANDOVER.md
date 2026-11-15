@@ -1,8 +1,8 @@
-# Biên Bản Bàn Giao Triển Khai & Kiểm Thử Toàn Diện Giai Đoạn C (Part 1, Part 2, Part 3, Part 4, Part 5: Pause & Resume & Part 6: Boot Lifecycle & Auth Recovery)
+# Biên Bản Bàn Giao Triển Khai & Kiểm Thử Toàn Diện Giai Đoạn C (Part 1 - Part 9: Điều Khiển Tay & Điểm Đến Từ Giọng Nói)
 **Dự án:** Airport Guide Robot UI (`airport-guide-ui`)  
 **Môi trường:** ROS 2 Jazzy (Docker, Domain ID 0, Sim Time = True)  
 **Thời gian cập nhật:** 15/11/2026  
-**Trạng thái nghiệm thu:** **23 / 23 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, Pause & Resume Navigation Architecture Completed, **Startup Lifecycle, AMCL Epoch Synchronization & Expired Token Recovery Fully Verified**.
+**Trạng thái nghiệm thu:** **26 / 26 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, Pause & Resume Navigation Completed, **Manual Control, Voice Safety & Destination Proposal Confirmation Fully Verified**.
 
 ---
 
@@ -579,4 +579,408 @@ INFO:     127.0.0.1:0 - "POST /api/robot/navigate HTTP/1.1" 200 OK
   - Khi AMCL trong phiên Gazebo mới định vị và phát pose mới:
     - Callback gán `_pose_received_epoch = _pose_epoch = 1` và xóa cờ `_sim_restarted = False`.
     - Trạng thái chuyển sang `is_connected = True` (Robot: OK), `is_data_stale = False`. Nút Bắt đầu được mở lại an toàn.
+
+---
+
+## 11. Bàn Giao Hạng Mục Điều Khiển Tay Cho Admin (Manual Control)
+
+### 11.1. Khảo Sát Đường Đi Của Lệnh Vận Tốc Trên Gazebo & Phân Tích Khoảng Trống
+Qua kiểm tra ROS 2 graph trực tiếp trong môi trường ROS 2 Jazzy trên container mô phỏng `thirsty_ishizaka` và container backend `airport_guide_backend`:
+
+1. **Chuỗi vận tốc tự động hiện tại của Nav2:**
+   - Nav2 `controller_server` & `behavior_server` $\rightarrow$ topic `/cmd_vel_nav` (`geometry_msgs/msg/Twist`)
+   - Node `velocity_smoother` $\rightarrow$ topic `/cmd_vel_smoothed` (`geometry_msgs/msg/Twist`)
+   - Node `collision_monitor` $\rightarrow$ topic `/cmd_vel` (`geometry_msgs/msg/Twist`)
+   - Node `ros_gz_bridge` $\rightarrow$ Gazebo Sim (`gz.msgs.Twist`)
+   - Node an toàn `command_timeout` (`linorobot2_gazebo`): Lắng nghe `/cmd_vel` ở tần số 5Hz. Nếu không nhận được lệnh sau $\ge 0.2$ giây, node này tự động phát vận tốc zero vào `/cmd_vel` để dừng robot.
+2. **Thực trạng đường lệnh điều khiển tay (`/airport/cmd_vel_manual`):**
+   - Web Gateway đã khởi tạo Publisher cho `/airport/cmd_vel_manual` (`geometry_msgs/msg/TwistStamped`).
+   - Kết quả kiểm tra số lượng subscriber: **0 subscriber**. Hiện tại Gazebo chưa có node consumer nào đăng ký lắng nghe topic này.
+   - Node `twist_mux` hiện chưa được cấu hình/chạy trong môi trường Gazebo hiện có.
+   - Service `/airport/control/set_manual` (`std_srvs/srv/SetBool`) hiện chưa có Service Server trong Gazebo.
+   - Topic `/cmd_vel_teleop` chỉ được đăng ký bởi `behavior_server` (dành cho Nav2 assisted teleop action, không phải teleop độc lập).
+3. **Khoảng trống kỹ thuật và thay đổi tối thiểu cần làm bên Gazebo/Nav2 (khi hoàn thiện hệ thống):**
+   - Cần bổ sung node `twist_mux` (hoặc cấu hình topic multiplexer) trong gói mô phỏng robot:
+     - Nhận nguồn 1: `/cmd_vel_nav` (Nav2 tự động, priority ví dụ: 10).
+     - Nhận nguồn 2: `/airport/cmd_vel_manual` (hoặc chuyển đổi TwistStamped sang Twist cho `cmd_vel_manual`, priority ví dụ: 20).
+     - Đầu ra phát vào: đầu vào của `velocity_smoother` hoặc `collision_monitor` để đảm bảo lệnh điều khiển tay **vẫn đi qua lớp giám sát va chạm an toàn**.
+4. **Giải pháp an toàn trên Web Gateway (Tuân thủ ràng buộc và Rule 6 AGENTS.md):**
+   - Không tự ý phát thẳng vào `/cmd_vel` để tránh bỏ qua bộ phân luồng, bộ làm mịn tốc độ và hệ thống cảm biến va chạm `collision_monitor`.
+   - Backend cung cấp cờ `manual_consumer_available` dựa trên `_pub_cmd_vel.get_subscription_count() > 0`.
+   - Trên giao diện Admin Web thực tế: Khi bật MANUAL, nếu `manual_consumer_available == False`, giao diện hiển thị banner cảnh báo an toàn rõ ràng và **khóa an toàn các nút vận tốc** (disabled), không tạo nút bấm vô tác dụng.
+
+---
+
+### 11.2. Phân Quyền Và Quản Lý Trạng Thái AUTO / MANUAL
+1. **Phân quyền người dùng:**
+   - Các API `/api/robot/control/manual` và `/api/robot/control/velocity` được bảo vệ bằng FastAPI dependency `require_role(UserRole.ADMIN)`.
+   - Anonymous (chưa đăng nhập) bị chặn với mã `401 Unauthorized`.
+   - Hành khách (Viewer mang `X-Passenger-Token`) bị chặn với mã `403 Forbidden`.
+   - Giao diện Hành khách (`Home.tsx`) hoàn toàn không hiển thị bất kỳ thành phần điều khiển tay nào.
+2. **Điều kiện chuyển sang MANUAL:**
+   - Robot phải đang kết nối (`is_connected == True`).
+   - Robot phải ở trạng thái rảnh (`IDLE`, `SUCCEEDED`, `CANCELED`, `FAILED`). Nếu đang có chuyến dẫn đường đang hoạt động hoặc tạm dừng (`NAVIGATING`, `PENDING`, `ACCEPTED`, `PAUSING`, `PAUSED`, `CANCELING`), backend chặn chuyển chế độ và nêu rõ lý do.
+   - Nav2 không có mục tiêu dẫn đường nào đang chạy từ nguồn ngoài (`_nav2_has_active_goal == False`).
+3. **Phân quyền phiên Admin đơn (Single Admin Lock):**
+   - Khi Admin A bật chế độ MANUAL: Backend ghi nhận `manual_operator_id = "adminA"`.
+   - Nếu Admin B cố gắng bật chế độ tay hoặc gửi lệnh vận tốc khi Admin A đang nắm quyền: Backend từ chối với thông báo: *"Quyền điều khiển thủ công đang thuộc về Admin khác (adminA)"*.
+   - Trên giao diện của Admin B xuất hiện thông báo khóa quyền và chỉ cho phép tắt để dừng an toàn.
+4. **Phân luồng xung đột giữa MANUAL và Nav2:**
+   - Trong khi ở chế độ MANUAL: Các endpoint `start_navigation` và `resume_navigation` bị chặn hoàn toàn ở cả backend lẫn frontend với thông báo yêu cầu chuyển về AUTO trước.
+   - Khi Admin bấm "TẮT THỦ CÔNG (VỀ AUTO)": Backend phát ngay lệnh dừng $(0, 0)$, gỡ bỏ operator lock, đưa trạng thái về `AUTO`, và mở khóa lại chức năng dẫn đường Nav2.
+5. **Giới hạn vận tốc an toàn (Speed Clamping):**
+   - Vận tốc tiến/lùi $v_x$ được backend kẹp chặt trong khoảng $[-0.3, +0.3]$ m/s theo `velocity_limits.linear_max`.
+   - Vận tốc góc $\omega_z$ được backend kẹp chặt trong khoảng $[-0.5, +0.5]$ rad/s theo `velocity_limits.angular_max`.
+6. **Cơ chế Watchdog và Giữ-để-chạy (Hold-to-run):**
+   - Frontend gửi lệnh vận tốc chu kỳ 10Hz (100ms) khi người dùng nhấn giữ chuột hoặc chạm màn hình cảm ứng.
+   - Ngắt lệnh gửi ngay khi: Nhả chuột (`onMouseUp`), rời con trỏ (`onMouseLeave`), thả cảm ứng (`onTouchEnd`/`onTouchCancel`), chuyển tab/ẩn trang (`document.visibilitychange`), cửa sổ mất focus (`window.blur`), hoặc tắt trang (`window.pagehide`).
+   - Watchdog Backend (`check_manual_timeout` tích hợp trong vòng lặp 5Hz của `broadcaster.py`): Nếu quá thời gian `cmd_timeout_sec` (0.5 giây) mà backend không nhận được heartbeat lệnh mới, robot tự động phát vận tốc zero và chuyển `_current_manual_twist` về $(0.0, 0.0)$.
+   - Đối chiếu Gazebo: Node `command_timeout` trên Gazebo cũng có cơ chế watchdog độc lập ở mức 0.2 giây trên topic `/cmd_vel`.
+
+---
+
+### 11.3. Giao Diện Điều Khiển Tay Trên Admin Dashboard
+- **Cụm điều khiển D-pad gọn gàng, trực quan:**
+  - Nút chuyển đổi chế độ: `BẬT THỦ CÔNG (MANUAL)` / `TẮT THỦ CÔNG (VỀ AUTO)`.
+  - 4 nút hướng giữ-để-chạy:
+    - ▲: Tiến thẳng (0.25 m/s)
+    - ◀: Quay trái (0.4 rad/s)
+    - ▶: Quay phải (-0.4 rad/s)
+    - ▼: Lùi lại (-0.2 m/s)
+  - Nút dừng khẩn cấp ■: Dừng di chuyển ngay lập tức.
+- **Xử lý trạng thái an toàn:**
+  - Khi chưa có consumer trên Gazebo: Hiển thị banner cảnh báo màu vàng và khóa an toàn 4 nút hướng, giải thích rõ lý do không tạo nút bấm vô tác dụng.
+  - Khi bị Admin khác chiếm quyền: Hiển thị tên Admin đang giữ quyền và khóa thao tác gửi vận tốc.
+  - Giữ nguyên toàn bộ các thành phần hiện có: Bản đồ ROS, sơ đồ hành khách, marker vị trí, trạng thái pin và danh sách điểm đến.
+
+---
+
+### 11.4. Kết Quả Kiểm Thử Toàn Diện
+1. **Kiểm thử tự động Backend (Pytest):**
+   - Chạy toàn bộ 24 test case trong container `airport_guide_backend`: **24 / 24 PASSED (100%)**.
+   - Bổ sung bài test cô lập:
+     - `test_manual_control_arbitration_concurrency_and_timeout`:
+       - Phân quyền API: Anonymous (401), Passenger (403), Admin (200).
+       - Chặn chuyển MANUAL khi mất kết nối, khi NAVIGATING hoặc PAUSED, khi Nav2 có goal ngoài.
+       - Cho phép chuyển MANUAL khi rảnh (IDLE) và kết nối.
+       - Phân quyền đơn Admin: Admin 1 giữ quyền, Admin 2 bị từ chối gửi lệnh.
+       - Kẹp tốc độ an toàn: linear 2.0 m/s $\rightarrow$ 0.3 m/s, angular -3.0 rad/s $\rightarrow$ -0.5 rad/s.
+       - Watchdog heartbeat: tự dừng về 0 sau khi hết thời gian timeout.
+       - Phân luồng xung đột: chặn Nav2 Start/Resume khi ở MANUAL; mở lại khi về AUTO.
+       - Kiểm thử độc lập trên `RosRobotAdapter` (subscriber count = 0, arbitration, watchdog).
+2. **Kiểm thử Build Frontend:**
+   - Biên dịch hoàn tất 100% không có lỗi cú pháp hay TypeScript: `docker compose build frontend`.
+3. **Kiểm thử trực quan giao diện (Automated Browser QA):**
+   - **Giao diện Hành khách (`http://localhost:5173`):** Xác nhận hiển thị đầy đủ sơ đồ sân bay, danh sách điểm đến và marker định hướng. Hoàn toàn không có nút điều khiển tay nào.
+   - **Giao diện Admin (`http://localhost:5173/admin`):**
+     - Đăng nhập thành công với tài khoản Admin.
+     - Bấm "BẬT THỦ CÔNG (MANUAL)": Chế độ chuyển sang MANUAL, xuất hiện banner cảnh báo màu vàng giải thích `/airport/cmd_vel_manual` chưa có consumer trên Gazebo, các nút vận tốc bị khóa an toàn, nút dừng khẩn ■ và nút chuyển về AUTO hoạt động bình thường.
+     - Bấm "TẮT THỦ CÔNG (VỀ AUTO)": Hệ thống trở về AUTO an toàn, cảnh báo ẩn đi, hệ thống Nav2 trở lại trạng thái sẵn sàng.
+   - **Bằng chứng hình ảnh:**
+     - [Ảnh chụp kết thúc bước kiểm thử và quay về AUTO thành công](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/admin_returned_to_auto.png)
+4. **Cam kết an toàn:**
+   - Chỉ quan sát và đọc trạng thái từ Gazebo. Tuyệt đối không tự phát lệnh vận tốc làm di chuyển robot khi chưa có sự xác nhận của người dùng. Không thay đổi file trong `ws` hoặc cấu hình Docker Compose.
+
+---
+
+### 11.5. Hướng Dẫn Các Bước Tự Thử Nghiệm Trên Gazebo (Dành Cho Người Dùng)
+Khi muốn tự nghiệm thu tính năng Điều khiển tay trên Gazebo:
+
+1. **Bước 1 — Kiểm tra giao diện Hành khách:**
+   - Mở trình duyệt vào `http://localhost:5173`.
+   - Xác nhận sơ đồ sân bay, vị trí robot và danh sách điểm đến hiển thị bình thường.
+   - Xác nhận không có bất kỳ nút điều khiển tay hay D-pad nào trên trang này.
+2. **Bước 2 — Đăng nhập Admin và kiểm tra Khóa An Toàn:**
+   - Vào `http://localhost:5173/admin` (hoặc click "Quản trị" trên thanh header).
+   - Đăng nhập: username `admin`, password `admin123`.
+   - Tại card "Điều Khiển Vận Tốc Thủ Công", bấm nút **BẬT THỦ CÔNG (MANUAL)**.
+   - Quan sát:
+     - Huy hiệu chế độ chuyển sang màu cam `MANUAL`.
+     - Xuất hiện thông báo cảnh báo màu vàng: *"Đường lệnh điều khiển tay tới Gazebo (/airport/cmd_vel_manual) chưa có consumer (0 subscriber). Các nút vận tốc được khóa an toàn để tránh bỏ qua bộ phân luồng và các lớp an toàn..."*.
+     - 4 nút điều hướng ▲, ◀, ▶, ▼ bị làm mờ và vô hiệu hóa để bảo vệ an toàn robot.
+     - Bấm thử nút "Bắt đầu dẫn đường" ở card Nav2 bên dưới: nút bị khóa và có cảnh báo *"Robot đang ở chế độ MANUAL. Vui lòng tắt thủ công trước khi kích hoạt Nav2."*.
+3. **Bước 3 — Trở về chế độ AUTO:**
+   - Bấm nút **TẮT THỦ CÔNG (VỀ AUTO)**.
+   - Xác nhận chế độ chuyển về xanh lá `AUTO`, thông báo an toàn biến mất, các nút Nav2 mở lại bình thường.
+4. **Bước 4 — Thử nghiệm chuyển động thực tế (khi Gazebo được nối thêm consumer / `twist_mux`):**
+   - Khi topic `/airport/cmd_vel_manual` có subscriber $\ge 1$ (ví dụ chạy `ros2 run teleop_twist_keyboard teleop_twist_keyboard` hoặc cấu hình `twist_mux`):
+     - Biểu tượng cảnh báo sẽ tự động biến mất và các nút ▲, ◀, ▶, ▼ sẽ được kích hoạt.
+     - Nhấn giữ nút ▲: robot trong Gazebo tiến thẳng với vận tốc 0.25 m/s.
+     - Nhả chuột: robot dừng lại ngay lập tức.
+     - Nhấn giữ nút ▲ rồi rê chuột ra ngoài nút: robot dừng lại ngay lập tức.
+     - Bấm nút ■: robot dừng khẩn cấp ngay lập tức.
+
+---
+
+## 12. PHẦN 12 — TÍCH HỢP NÚT GIỌNG NÓI ROBOT & KHÓA AN TOÀN TRẠNG THÁI ROS
+
+### 12.1. Khảo Sát Hiện Trạng ROS & Phân Tích Ranh Giới Phần Cứng
+- **Kiểm tra ranh giới hệ thống:**
+  - Toàn bộ microphone và thuật toán xử lý âm thanh/giọng nói (Speech-to-Text, Dialog, Text-to-Speech) được quy định đặt trực tiếp trên phần cứng robot ROS.
+  - Ứng dụng web (`airport-guide-ui`) tuyệt đối **không** xin quyền microphone của trình duyệt, **không** thu âm hay truyền stream âm thanh từ trình duyệt, và **không** gọi các dịch vụ nhận dạng giọng nói đám mây bên ngoài.
+- **Khảo sát đồ thị ROS 2 thực tế:**
+  - Cấu hình trong `config/robot_interface.yaml`:
+    - Service `voice_start`: `/airport/voice/start` (`std_srvs/srv/Trigger`, timeout 3.0s).
+    - Topic `voice_state`: `/airport/voice/state` (`std_msgs/msg/String`, QoS 1).
+    - Topic `voice_transcript`: `/airport/voice/transcript` (`std_msgs/msg/String`, QoS 1).
+    - Topic `voice_response`: `/airport/voice/response` (`std_msgs/msg/String`, QoS 1).
+  - Trạng thái trực tiếp trên đồ thị ROS Jazzy:
+    - Node `airport_web_gateway` đã khởi tạo Client `/airport/voice/start` và Subscribe các topic trạng thái.
+    - Hiện tại trong môi trường mô phỏng Gazebo chưa có node âm thanh/giọng nói nào khởi chạy (`service_is_ready()` trả về `False`, 0 publishers trên topic trạng thái).
+
+---
+
+### 12.2. Cơ Chế Khóa An Toàn, In-Flight Debounce & Tránh Deadlock
+1. **Khóa an toàn khi ROS Voice Node Offline:**
+   - Giao diện người dùng: Khi backend báo `voice_available = False`, nút microphone trên component `VoicePanel` (trang Hành khách) được làm mờ và khóa an toàn (`disabled`).
+   - Tooltip giải thích rõ ràng: *"Chưa kết nối node giọng nói ROS (/airport/voice/start)"*.
+   - Banner cảnh báo: *"⚠️ Node giọng nói ROS chưa kết nối (/airport/voice/start offline). Nút microphone đã được khóa an toàn."*
+   - Huy hiệu trạng thái hiển thị rõ: `OFFLINE`.
+2. **Chống kích hoạt dồn dập (In-Flight Debounce):**
+   - Phía Frontend: biến cờ `isCalling` và kiểm tra `isDisabled` chặn mọi cú click chuột liên tiếp trong khi request trước đang được gửi.
+   - Phía Backend: cờ nguyên tử `_voice_start_in_progress` chặn các request đồng thời, trả về thông báo lỗi rõ ràng nếu có request mới chen ngang.
+3. **Non-blocking & Timeout Handling:**
+   - Thay thế hoàn toàn hàm chặn đồng bộ `wait_for_service(timeout_sec=2.0)` bằng `service_is_ready()` kiểm tra tức thì, không gây nghẽn luồng.
+   - Gọi service bất đồng bộ `call_async` kết hợp `threading.Event(timeout=3.0)`: nếu service không phản hồi trong 3.0 giây, trả về lỗi timeout rõ ràng và giải phóng cờ `_voice_start_in_progress` trong khối `finally`.
+4. **Tránh Deadlock với Reentrant Lock (RLock):**
+   - Trong `MockRobotAdapter`, chuyển đổi `self._lock` từ `threading.Lock()` sang `threading.RLock()` và đọc trực tiếp thuộc tính `_voice_available` mà không tái chiếm lock lồng nhau trong `get_status()`, loại bỏ hoàn toàn nguy cơ deadlock khi API lấy status.
+
+---
+
+### 12.3. Kết Quả Kiểm Thử Toàn Diện
+- **Kiểm thử tự động Backend (Pytest):** **25 / 25 PASSED (100%)**.
+  - Thêm bộ test `test_voice_interface_lifecycle_and_debouncing`:
+    - Xác thực quyền API (token không hợp lệ trả về 401 Unauthorized).
+    - Khi voice node offline: trả về 400 Bad Request kèm giải thích rõ ràng.
+    - Khi voice node online: kích hoạt thành công, chuyển trạng thái `LISTENING`, chặn bấm dồn dập (spam 400).
+    - Kiểm thử cô lập `RosRobotAdapter`: client chưa sẵn sàng, timeout 3.0s, ROS service trả về thành công/thất bại.
+- **Biên dịch Frontend:** Hoàn tất 100% không có lỗi (`docker compose build frontend`).
+
+---
+
+### 12.4. Hướng Dẫn Thử Nghiệm Cho Người Dùng
+1. **Kiểm tra trạng thái mặc định (Voice Node Offline):**
+   - Mở trình duyệt tại `http://localhost:5173`.
+   - Quan sát card "Trợ lý Giọng nói Robot" ở cột bên trái:
+     - Huy hiệu trạng thái: `OFFLINE`.
+     - Banner cảnh báo: *"⚠️ Node giọng nói ROS chưa kết nối (/airport/voice/start offline)..."*.
+     - Nút microphone hình tròn bị làm mờ và khóa (`disabled`). Rê chuột vào hiện tooltip giải thích rõ ràng.
+2. **Chạy thử nghiệm Voice Node trên ROS:**
+   - Khi một node giọng nói ROS cung cấp service `/airport/voice/start` (hoặc chuyển sang chế độ Mock Adapter), telemetry `voice_available` sẽ chuyển sang `True`.
+   - Nút microphone sẽ tự động mở khóa, huy hiệu chuyển sang `IDLE`.
+   - Bấm nút microphone:
+     - Trạng thái chuyển sang `LISTENING` ("🎤 Đang nghe...").
+     - Trạng thái chuyển sang `PROCESSING` ("⚙️ ROS đang xử lý...").
+     - Trạng thái chuyển sang `SPEAKING` ("🔊 Robot đang phát âm thanh phản hồi...").
+     - Trở về `IDLE` khi hoàn tất.
+
+---
+
+## 13. PHẦN 13 — NHẬN DIỆN YÊU CẦU ĐIỂM ĐẾN TỪ GIỌNG NÓI & LUỒNG XÁC NHẬN HÀNH KHÁCH
+
+### 13.1. Kết Quả Khảo Sát ROS & Luồng Giọng Nói Thực Tế
+1. **Kiểm tra đồ thị ROS 2 & Workspace `ws`:**
+   - Trong `ws/src` và môi trường Gazebo Jazzy hiện tại, chưa có package/node giọng nói độc lập nào khởi chạy.
+   - Các topic `/airport/voice/transcript`, `/airport/voice/response`, `/airport/voice/state` chưa có publisher.
+   - **Xác nhận an toàn:** Chương trình ROS **không** tự động phát lệnh Nav2 goal từ giọng nói.
+2. **Cơ chế truyền nhận dữ liệu:**
+   - Khi ROS nhận diện được câu nói của hành khách, ROS gửi văn bản nhận dạng qua topic `std_msgs/msg/String` `/airport/voice/transcript`.
+   - Web tiếp nhận chuỗi nhận dạng này để đối chiếu với cơ sở dữ liệu điểm đến đang hoạt động.
+
+---
+
+### 13.2. Thuật Toán Đối Chiếu Điểm Đến & Phân Tách Phiên Hành Khách
+1. **Thuật toán đối chiếu (`match_destination_from_transcript`):**
+   - Chuẩn hóa văn bản: Chữ thường, mã hóa Unicode NFC, loại bỏ dấu câu và khoảng trắng thừa.
+   - Lọc từ dừng tiếng Việt (stop words: *hãy, dẫn, tôi, cho, đi, đến, tới, ở, đâu, muốn, nhờ, bạn, robot, xin, vui, lòng...*).
+   - Khớp chính xác: So sánh toàn bộ chuỗi tên (`name`) hoặc mã (`id`) điểm đến.
+   - Khớp theo từ khóa và số thứ tự: Ví dụ câu nói *"Dẫn tôi tới Cổng 2"* khớp chính xác với điểm *"Cổng khởi hành số 2"* (`gate_2`).
+   - Xử lý 3 kịch bản:
+     - **MATCHED (Khớp duy nhất 1 điểm):** Xuất đề xuất điểm đến để hành khách xác nhận.
+     - **AMBIGUOUS (Khớp nhiều điểm hoặc trùng tên):** Thông báo *"Tìm thấy nhiều điểm đến trùng khớp. Vui lòng chọn trực tiếp từ danh sách"*.
+     - **NO_MATCH (Không tìm thấy điểm nào hoặc điểm đã bị xóa):** Thông báo *"Không tìm thấy điểm đến phù hợp. Vui lòng chọn lại từ danh sách"*.
+2. **Phân tách phiên và bảo mật (Session Isolation):**
+   - Khi bấm mic, backend lưu `requester_id` từ token JWT phiên hành khách (`X-Passenger-Token`).
+   - Telemetry qua WebSocket chỉ truyền `voice_proposal` tới đúng kết nối có `user.id == requester_id` (hoặc Admin). Hành khách khác hoàn toàn **không** nhìn thấy đề xuất này.
+   - Endpoint `POST /api/robot/voice/confirm` kiểm tra quyền nghiêm ngặt: Nếu Hành khách B cố ý gửi request xác nhận đề xuất của Hành khách A, backend từ chối với mã **403 Forbidden**.
+   - Hạn sử dụng đề xuất: Tự động hết hạn sau **30 giây**. Quá hạn sẽ bị từ chối với mã **400 Bad Request**.
+
+---
+
+### 13.3. Luồng Xác Nhận Trên Web & Điều Hướng An Toàn
+1. **Giao diện xác nhận (`VoicePanel.tsx`):**
+   - Khi có đề xuất `MATCHED`: Hiển thị card màu xanh lá với câu hỏi:
+     $$\text{Bạn muốn đến } \textbf{[Tên điểm đến]}\text{?}$$
+   - Hai nút bấm trực quan:
+     - **[ ✓ Xác nhận ]**: Gửi yêu cầu xác nhận tới backend, chuyển sang trạng thái đang xử lý (`isConfirming`), khóa nút để chống bấm lặp.
+     - **[ ✕ Bỏ qua ]**: Hủy bỏ đề xuất ngay lập tức qua API `/api/robot/voice/dismiss`.
+2. **Điều hướng an toàn qua luồng Start hiện có:**
+   - Sau khi kiểm tra đề xuất hợp lệ, backend dọn dẹp proposal và gọi trực tiếp `start_navigation(destination_id, owner_id)`.
+   - Toàn bộ cơ chế kiểm tra an toàn sẵn sàng của robot (kiểm tra kết nối, trạng thái đang NAVIGATING, kiểm tra quyền chủ chuyến) được kế thừa trọn vẹn.
+   - Chặn xác nhận lặp: Ngay khi đề xuất được xác nhận hoặc bỏ qua, nó bị xóa khỏi bộ nhớ đệm, các lần bấm tiếp theo lập tức bị từ chối.
+
+---
+
+### 13.4. Kết Quả Kiểm Thử Toàn Diện
+1. **Kiểm thử tự động Backend (Pytest):**
+   - Chạy toàn bộ 26 test case trong container `airport_guide_backend`: **26 / 26 PASSED (100%)**.
+   - Bổ sung bài test cô lập:
+     - `test_voice_destination_matching_and_confirmation_workflow`:
+       - Kiểm tra thuật toán đối chiếu: 1 điểm khớp (MATCHED), mập mờ (AMBIGUOUS), không khớp (NO_MATCH).
+       - Phân tách 2 phiên hành khách A và B: A yêu cầu, B cố xác nhận $\rightarrow$ 403 Forbidden.
+       - Hết hạn đề xuất sau 30s $\rightarrow$ 400 Bad Request.
+       - A xác nhận thành công $\rightarrow$ Chuyến đi bắt đầu, chủ sở hữu là A.
+       - A bấm xác nhận lần 2 $\rightarrow$ 400 Bad Request (chặn xác nhận lặp).
+       - Bỏ qua đề xuất qua API `/voice/dismiss` $\rightarrow$ đề xuất bị xóa sạch.
+2. **Biên dịch Frontend:**
+   - Biên dịch hoàn tất 100% không có lỗi TypeScript: `docker compose build frontend`.
+
+---
+
+### 13.5. Hướng Dẫn Thử Nghiệm Cho Người Dùng
+1. **Trong môi trường mô phỏng ROS (Gazebo):**
+   - Do node giọng nói ROS hiện tại chưa chạy trong Gazebo, nút microphone ở chế độ ROS được khóa an toàn (hiển thị `OFFLINE`), tuân thủ quy tắc an toàn không gửi lệnh giả định vào ROS.
+2. **Thử nghiệm trên chế độ Mock Robot Adapter:**
+   - Khi chuyển sang Mock Adapter, mở `http://localhost:5173`.
+   - Bấm nút microphone:
+     - Robot thu âm (LISTENING) $\rightarrow$ Xử lý (PROCESSING) với câu nói giả lập: *"Hãy dẫn tôi đến Cổng khởi hành số 1"*.
+     - Robot phát giọng nói (SPEAKING) và xuất hiện card xác nhận:
+       $$\text{Bạn muốn đến } \textbf{Cổng khởi hành số 1}\text{?}$$
+     - Bấm **[ ✓ Xác nhận ]**: Hệ thống lập tức tạo chuyến đi tới Cổng số 1, sơ đồ bản đồ hiển thị đường dẫn và marker robot bắt đầu di chuyển. Nút xác nhận biến mất ngay để ngăn bấm lặp.
+     - Bấm **[ ✕ Bỏ qua ]**: Đề xuất biến mất, hệ thống trở về trạng thái bình thường.
+
+---
+
+## 14. PHẦN 14 — GIÁM SÁT SẴN SÀNG & NHẬT KÝ VẬN HÀNH DÀNH RIÊNG CHO ADMIN
+
+### 14.1. Mục Tiêu & Kiến Trúc Tổng Quan
+1. **Mục tiêu:**
+   - Admin truy cập trang Dashboard (`/admin`) có thể quan sát tức thì robot có sẵn sàng dẫn đường hay không, lý do chi tiết nếu chưa sẵn sàng, và xem nhật ký các sự kiện vận hành gần nhất để chẩn đoán sự cố mà không cần xem log console terminal.
+2. **Nguyên tắc an toàn & bảo mật:**
+   - **Tách biệt phân quyền:** Nhật ký vận hành và các thông số giám sát Admin chỉ phân phối qua endpoint bảo vệ `GET /api/robot/admin/events` và trường WebSocket `admin_data`. Hành khách (Passenger) tuyệt đối không nhận được thông tin này (nhận `403 Forbidden` khi cố truy cập).
+   - **Bảo mật dữ liệu cá nhân:** Tuyệt đối không ghi token xác thực, thông tin định danh hành khách (ID người dùng, tên hành khách) hoặc nội dung giọng nói vào nhật ký.
+   - **Chống rải dữ liệu giả:** Pin chỉ hiển thị khi có dữ liệu thật (`battery_percent !== null`), nếu không có cảm biến thì hiển thị rõ *"Chưa có cảm biến"*. Node giọng nói hiển thị rõ trạng thái kết nối hoặc offline.
+
+---
+
+### 14.2. Thẻ Giám Sát Sẵn Sàng & Hệ Thống Con (Subsystems Readiness)
+1. **Banner Tổng Thể Sẵn Sàng Dẫn Đường:**
+   - **Xanh (🟢 SẴN SÀNG):** Tất cả các điều kiện an toàn đều thỏa mãn (Gateway kết nối, ROS kết nối, có định vị AMCL, có bản đồ OccupancyGrid, robot ở chế độ AUTO, Nav2 rảnh rỗi).
+   - **Vàng (🟡 CHƯA SẴN SÀNG / CẦN THAO TÁC):** Đang ở chế độ MANUAL, đang có chuyến dẫn đường khác, đang chờ định vị AMCL, hoặc chưa chọn điểm đến.
+   - **Đỏ (🔴 LỖI KẾT NỐI):** Mất kết nối WebSocket tới Gateway, mất kết nối ROS 2, hoặc dữ liệu ROS bị gián đoạn (Stale).
+2. **Lưới Giám Sát 8 Hệ Thống Con:**
+   - **Gateway / WebSocket:** Trạng thái kết nối thời gian thực giữa Web và Backend.
+   - **Định vị AMCL:** Tọa độ $X, Y$ trong frame `map`, cảnh báo dữ liệu cũ hoặc đang chờ `/amcl_pose`.
+   - **Bản đồ ROS (/map):** Kích thước và độ phân giải bản đồ OccupancyGrid.
+   - **Nav2 Stack:** Trạng thái bộ điều hướng (`IDLE`, `NAVIGATING`, `PAUSED`, `FAILED`, v.v.).
+   - **Chế độ điều khiển:** `AUTO` (Tự động) hoặc `MANUAL` (Thủ công — kèm ID Admin đang giữ quyền và tình trạng consumer Gazebo).
+   - **Chuyến hiện tại:** Báo trạng thái rảnh hoặc đang có chuyến dẫn đường.
+   - **Pin Robot:** Giá trị % pin thực tế (hoặc *"Chưa có cảm biến"*).
+   - **Giọng nói ROS:** Sẵn sàng hoặc *"Node chưa kết nối"*.
+3. **Giải Thích Trực Quan Khóa Nút Dẫn Đường:**
+   - Tại bảng điều khiển Nav2, khi nút **[ BẮT ĐẦU DẪN ĐƯỜNG ]** bị mờ/khóa (`disabled`), một hộp ghi chú màu vàng hiển thị lý do chính xác (ví dụ: *"Chưa thể bắt đầu: Robot đang ở chế độ MANUAL"* hoặc *"Đang chờ vị trí định vị từ AMCL"*), giúp Admin biết ngay thao tác cần làm.
+
+---
+
+### 14.3. Nhật Ký Vận Hành Admin (Operational Event Log)
+1. **Bộ đệm vòng RAM (In-memory Circular Buffer):**
+   - Giới hạn lưu trữ đúng **100 sự kiện** gần nhất kể từ thời điểm Backend khởi động (`started_at`), tự động đẩy các sự kiện cũ nhất ra ngoài khi đầy (FIFO).
+   - Không yêu cầu cơ sở dữ liệu đĩa ở giai đoạn này, đảm bảo nhẹ và nhanh.
+   - Trên giao diện UI hiển thị rõ mốc thời gian Backend khởi động mà bộ đệm bắt đầu tính.
+2. **Cơ chế Chống Ghi Lặp (Deduplication ở tần số 5Hz):**
+   - Vòng lặp telemetry 5Hz kiểm tra trạng thái liên tục nhưng chỉ kích hoạt ghi sự kiện khi có chuyển biến trạng thái thực tế:
+     - Kết nối ROS: Mất kết nối (`False`) hoặc Phục hồi kết nối (`True`).
+     - Chế độ điều khiển: Đổi giữa `AUTO` $\leftrightarrow$ `MANUAL`.
+     - Vòng đời điều hướng: Bắt đầu chuyến (`NAVIGATING`), Tạm dừng (`PAUSED`), Tiếp tục (`NAVIGATING`), Đến đích (`SUCCEEDED`), Hủy chuyến (`CANCELED`), Thất bại (`FAILED`).
+3. **Đồng bộ thời gian thực qua WebSocket & Tải lại:**
+   - Khi Admin reload hoặc mở tab mới: Gọi `GET /api/robot/admin/events` để nạp danh sách sự kiện hiện có.
+   - Khi có sự kiện mới trong quá trình vận hành: Backend tự động phát qua trường `admin_data.events` trong WebSocket telemetry tới các Admin đang kết nối mà không gửi lặp lại ở 5Hz khi không có thay đổi.
+   - Có nút **[ 🔄 Làm mới ]** để tải lại thủ công bất cứ lúc nào.
+
+---
+
+### 14.4. Kết Quả Kiểm Thử Tự Động (Pytest & Frontend Build)
+1. **Bộ kiểm thử Backend (Pytest):**
+   - Chạy toàn bộ 27 test case trong container `airport_guide_backend`: **27 / 27 PASSED (100%)**.
+   - Bài test bổ sung: `test_operational_event_logger_and_admin_monitoring_lifecycle[asyncio]`:
+     - Kiểm tra bộ đệm vòng 100 sự kiện: nạp 125 sự kiện $\rightarrow$ giữ đúng 100 sự kiện mới nhất.
+     - Kiểm tra chống ghi lặp: gọi 10 lần `track_connection` và `track_control_mode` $\rightarrow$ chỉ ghi đúng 1 sự kiện.
+     - Kiểm tra an toàn dữ liệu: không chứa token, không chứa ID hành khách, không chứa giọng nói.
+     - Kiểm tra phân quyền: Hành khách gọi API $\rightarrow$ `403 Forbidden`, Chưa đăng nhập $\rightarrow$ `401 Unauthorized`, Admin $\rightarrow$ `200 OK`.
+     - Kiểm tra phân tách WebSocket: Hành khách không nhận `admin_data`, Admin nhận `events`.
+     - Kiểm tra `readiness`: `ready = False` khi chuyển sang MANUAL và có thông báo lý do rõ ràng.
+2. **Biên dịch Frontend:**
+   - Biên dịch hoàn tất 100% không có lỗi TypeScript: `docker compose build frontend`.
+   - Khởi động container frontend thành công: `docker compose up -d --no-deps frontend`.
+
+---
+
+## 15. PHẦN 15 — KIỂM TRA CHẠY TRÊN HAI MÁY TRONG MẠNG LAN (PROMPT 7 GIAI ĐOẠN C)
+
+### 15.1. Mục Tiêu & Cơ Chế Hoạt Động Đa Thiết Bị
+1. **Mục tiêu:**
+   - Web chạy trên máy ThinkPad Ubuntu (Server & Robot Gateway).
+   - Laptop thứ hai (hoặc điện thoại/máy tính bảng) trong cùng mạng Wi-Fi/LAN mở trình duyệt truy cập và sử dụng bình thường.
+   - Thiết bị thứ hai **hoàn toàn không cần cài đặt ROS 2, Docker hay Node.js**.
+2. **Cơ chế Same-Origin Reverse Proxy:**
+   - Cả container backend và frontend đều chạy ở chế độ `network_mode: host`.
+   - Frontend Nginx lắng nghe tại `0.0.0.0:5173`, phục vụ SPA tĩnh đồng thời proxy ngược:
+     - `/api/` $\rightarrow$ `http://127.0.0.1:8000/api/` (REST API).
+     - `/ws` $\rightarrow$ `http://127.0.0.1:8000/ws` (WebSocket Telemetry).
+   - Trình duyệt từ xa kết nối tới `http://<IP_THINKPAD>:5173`. Toàn bộ REST API và WebSocket đều dùng chung Origin này nên **tránh hoàn toàn lỗi CORS và lỗi Security Mixed Content**.
+3. **Rà soát Hardcoded Hostname trong Client Code:**
+   - Đã rà soát toàn bộ thư mục `frontend/src/`: **0 lỗi trỏ cứng `localhost` hoặc `127.0.0.1`**.
+   - `frontend/src/api/client.ts`: Sử dụng đường dẫn tương đối `/api/...`.
+   - `frontend/src/api/wsClient.ts`: Tự động nhận diện `window.location.protocol` và `window.location.host` (`ws://${window.location.host}/ws`).
+   - `frontend/src/contexts/RobotContext.tsx` & `MapView.tsx`: Sử dụng URL tương đối `/api/robot/map/image?v=...`.
+   - `frontend/nginx.conf`: Đã chuẩn hóa `server_name _ localhost;` để tiếp nhận chính xác mọi IP và hostname trong mạng LAN.
+
+---
+
+### 15.2. Kết Quả Xác Minh Bằng Lệnh & Bằng Chứng Kỹ Thuật
+1. **Địa chỉ IP LAN của máy chủ ThinkPad:**
+   - `hostname -I` $\rightarrow$ `192.168.0.108` (kèm bridge `172.17.0.1`).
+2. **Kiểm tra truy cập HTTP qua IP LAN:**
+   - `curl -I -H "Host: 192.168.0.108:5173" http://127.0.0.1:5173/` $\rightarrow$ `HTTP/1.1 200 OK`.
+   - `curl -s http://192.168.0.108:5173/api/health` $\rightarrow$ Trả về JSON `healthy`, `robot_connected: true`, `active_ws_clients: 2`.
+   - `curl -s http://192.168.0.108:5173/api/robot/map` $\rightarrow$ Trả về metadata bản đồ `384x384`, `resolution: 0.05`.
+   - `curl -s "http://192.168.0.108:5173/api/robot/map/image?v=..."` $\rightarrow$ `HTTP 200 image/png 1297 bytes`.
+3. **Kiểm tra truyền phát WebSocket qua IP LAN:**
+   - Mở kết nối trực tiếp tới `ws://192.168.0.108:5173/ws`.
+   - Kết quả: Nâng cấp kết nối thành công (`101 Switching Protocols`), nhận đều đặn các gói tin telemetry tần số 5Hz chứa tọa độ robot $x \approx 0.47, y \approx 0.43$, `navigation_state: IDLE`, `map_version` khớp với server.
+
+---
+
+### 15.3. Checklist Tự Kiểm Thử Trên Máy Thứ Hai (User Verification Checklist)
+
+> [!NOTE]
+> Các mục được đánh dấu **[Đã xác minh qua lệnh]** đã được kiểm tra tự động và đạt kết quả tốt trên máy chủ ThinkPad.  
+> Các mục được đánh dấu **[Cần hai máy thật]** yêu cầu người dùng mở laptop thứ hai để kiểm chứng trải nghiệm thực tế.
+
+#### A. Chuẩn bị mạng
+- [x] **[Đã xác minh qua lệnh]** Máy chủ ThinkPad đang chạy container frontend (:5173) và backend (:8000) với `network_mode: host`.
+- [ ] **[Cần hai máy thật]** Kết nối laptop thứ hai vào **cùng một mạng Wi-Fi hoặc mạng LAN** với máy ThinkPad.
+- [ ] **[Cần hai máy thật]** (Tùy chọn) Trên laptop thứ hai, mở Terminal/PowerShell và ping thử máy chủ: `ping 192.168.0.108` (đảm bảo không bị chặn bởi router Isolation).
+
+#### B. Kiểm thử Màn hình Hành khách (Passenger View)
+- [ ] **[Cần hai máy thật]** Mở trình duyệt web trên laptop thứ hai (Chrome, Edge, Firefox hoặc Safari).
+- [ ] **[Cần hai máy thật]** Truy cập: `http://192.168.0.108:5173` (thay bằng IP máy ThinkPad nếu IP thay đổi sau khi kết nối mạng khác).
+- [ ] **[Cần hai máy thật]** Kiểm tra Header: Hai huy hiệu kết nối hiển thị màu xanh: **`Gateway: OK`** và **`Robot: OK`**.
+- [ ] **[Cần hai máy thật]** Kiểm tra Bản đồ: Tải đầy đủ ảnh sơ đồ hành khách và hiển thị marker xe robot tại vị trí định vị AMCL thực tế.
+- [ ] **[Cần hai máy thật]** Thử chọn một điểm đến trong danh sách (ví dụ: *Gate 1*) và kiểm tra đường dẫn hoặc điểm ghim xuất hiện.
+
+#### C. Kiểm thử Màn hình Quản trị viên (Admin Dashboard)
+- [ ] **[Cần hai máy thật]** Mở một tab mới trên laptop thứ hai: `http://192.168.0.108:5173/admin`.
+- [ ] **[Cần hai máy thật]** Trang tự động chuyển hướng đến màn hình Đăng nhập (`/login`).
+- [ ] **[Cần hai máy thật]** Đăng nhập bằng tài khoản: `admin` / `admin123`.
+- [ ] **[Cần hai máy thật]** Đăng nhập thành công, chuyển hướng vào Dashboard quản trị:
+  - Thẻ giám sát sẵn sàng: Hiển thị trạng thái các hệ thống con (Gateway, AMCL, Map, Nav2, Mode AUTO).
+  - Bảng nhật ký vận hành (Event Log): Tải được danh sách sự kiện gần nhất từ backend.
+  - Tab Bản đồ ROS: Hiển thị lưới bản đồ OccupancyGrid 384x384 pixel từ `/map`.
+
+#### D. Kiểm thử Đồng bộ Trạng thái Giữa Hai Máy (Multi-client Sync)
+- [ ] **[Cần hai máy thật]** Mở song song màn hình ThinkPad và màn hình Laptop thứ hai.
+- [ ] **[Cần hai máy thật]** Khi robot di chuyển trên Gazebo hoặc có sự kiện thay đổi trạng thái (ví dụ Admin chọn điểm dẫn đường hoặc chuyển sang chế độ thủ công), quan sát marker và trạng thái trên cả hai máy cùng cập nhật đồng thời qua WebSocket mà không cần bấm tải lại trang (F5).
+
+
 

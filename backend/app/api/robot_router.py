@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional
+import time
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from ..auth.models import User, UserRole
@@ -9,6 +10,10 @@ router = APIRouter(prefix="/api/robot", tags=["Robot Operations"])
 
 class NavigateRequest(BaseModel):
     destination_id: str
+
+class VoiceConfirmRequest(BaseModel):
+    proposal_id: str
+    destination_id: Optional[str] = None
 
 class DestinationUpsertRequest(BaseModel):
     id: str
@@ -159,13 +164,72 @@ async def resume_navigation(
 async def start_voice_session(current_user: User = Depends(get_current_user)):
     """
     Kích hoạt microphone trên phần cứng robot thông qua ROS Service Trigger /airport/voice/start.
-    Web không tự thu âm, chỉ yêu cầu ROS bắt đầu phiên tương tác.
+    Web không tự thu âm, chỉ yêu cầu ROS bắt đầu phiên tương tác gắn với phiên hành khách hiện tại.
     """
     adapter = get_robot_adapter()
-    res = adapter.start_voice_session()
+    res = adapter.start_voice_session(requester_id=current_user.id)
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res
+
+@router.post("/voice/confirm")
+async def confirm_voice_proposal(
+    req: VoiceConfirmRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Xác nhận đề xuất điểm đến từ nhận dạng giọng nói và bắt đầu điều hướng.
+    Chỉ phiên hành khách đã bấm microphone (hoặc Admin) mới được quyền xác nhận.
+    Chặn xác nhận lặp và kiểm tra thời hạn đề xuất.
+    """
+    adapter = get_robot_adapter()
+    if not hasattr(adapter, "get_voice_proposal"):
+        raise HTTPException(status_code=400, detail="Adapter không hỗ trợ đề xuất giọng nói.")
+
+    proposal = adapter.get_voice_proposal()
+    if not proposal:
+        raise HTTPException(status_code=400, detail="Không có đề xuất điểm đến giọng nói nào đang chờ xác nhận hoặc đề xuất đã hết hạn.")
+
+    if proposal.get("proposal_id") != req.proposal_id:
+        raise HTTPException(status_code=400, detail="Mã đề xuất không khớp hoặc đã bị thay thế bởi yêu cầu mới.")
+
+    if proposal.get("confirmed", False):
+        raise HTTPException(status_code=400, detail="Đề xuất điểm đến này đã được xác nhận trước đó.")
+
+    # Kiểm tra quyền: Chỉ phiên đã yêu cầu (hoặc Admin) mới được xác nhận
+    if proposal.get("requester_id") != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Bạn không có quyền xác nhận đề xuất của hành khách khác.")
+
+    now_ms = int(time.time() * 1000)
+    if now_ms > proposal.get("expires_at", 0):
+        adapter.clear_voice_proposal()
+        raise HTTPException(status_code=400, detail="Đề xuất điểm đến đã hết hạn, vui lòng thực hiện lại.")
+
+    target_dest_id = req.destination_id or proposal.get("destination_id")
+    if not target_dest_id:
+        raise HTTPException(status_code=400, detail="Không xác định được điểm đến hợp lệ để điều hướng.")
+
+    # Đánh dấu proposal đã xác nhận và dọn dẹp để chặn xác nhận lặp
+    proposal["confirmed"] = True
+    adapter.clear_voice_proposal()
+
+    # Điều hướng tới điểm đến thông qua luồng Start Navigation chuẩn
+    res = adapter.start_navigation(destination_id=target_dest_id, owner_id=current_user.id)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
+
+@router.post("/voice/dismiss")
+async def dismiss_voice_proposal(current_user: User = Depends(get_current_user)):
+    """
+    Bỏ qua đề xuất điểm đến từ giọng nói hiện tại.
+    """
+    adapter = get_robot_adapter()
+    if hasattr(adapter, "get_voice_proposal"):
+        proposal = adapter.get_voice_proposal()
+        if proposal and (proposal.get("requester_id") == current_user.id or current_user.role == UserRole.ADMIN):
+            adapter.clear_voice_proposal()
+    return {"success": True, "message": "Đã bỏ qua đề xuất điểm đến."}
 
 @router.post("/control/manual")
 async def set_manual_control(
@@ -176,7 +240,7 @@ async def set_manual_control(
     Chuyển đổi giữa chế độ AUTO và MANUAL qua ROS Service SetBool (Admin only).
     """
     adapter = get_robot_adapter()
-    res = adapter.set_manual_control(req.enable)
+    res = adapter.set_manual_control(req.enable, operator_id=current_user.id)
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res
@@ -190,11 +254,11 @@ async def send_manual_velocity(
     Gửi lệnh vận tốc TwistStamped vào topic /airport/cmd_vel_manual (Admin only).
     """
     adapter = get_robot_adapter()
-    success = adapter.send_manual_velocity(req.linear_x, req.angular_z)
-    if not success:
+    res = adapter.send_manual_velocity(req.linear_x, req.angular_z, operator_id=current_user.id)
+    if not res.get("success"):
         raise HTTPException(
             status_code=400,
-            detail="Không thể gửi lệnh: Robot không ở chế độ MANUAL hoặc topic chưa sẵn sàng."
+            detail=res.get("message") or "Không thể gửi lệnh: Robot không ở chế độ MANUAL hoặc topic chưa sẵn sàng."
         )
     return {"success": True}
 
@@ -203,6 +267,26 @@ async def get_alerts(current_user: User = Depends(require_role(UserRole.ADMIN)))
     """Lấy danh sách cảnh báo chẩn đoán từ /airport/alerts (Admin only)"""
     adapter = get_robot_adapter()
     return adapter.get_alerts()
+
+@router.get("/admin/events")
+async def get_operational_events(
+    limit: int = Query(100, ge=1, le=100),
+    current_user: User = Depends(require_role(UserRole.ADMIN))
+):
+    """
+    Lấy danh sách nhật ký sự kiện vận hành (Admin only).
+    Chỉ lưu trong bộ nhớ backend (tối đa 100 sự kiện) kể từ lúc backend khởi động.
+    """
+    adapter = get_robot_adapter()
+    events = adapter.get_operational_events(limit=limit) if hasattr(adapter, "get_operational_events") else []
+    started_at = adapter.get_events_started_at() if hasattr(adapter, "get_events_started_at") else 0
+    version = adapter.get_events_version() if hasattr(adapter, "get_events_version") else 0
+    return {
+        "events": events,
+        "started_at": started_at,
+        "version": version,
+        "total": len(events)
+    }
 
 @router.get("/path")
 async def get_navigation_path(current_user: User = Depends(get_current_user)):

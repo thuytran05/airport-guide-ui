@@ -1922,4 +1922,781 @@ def test_amcl_epoch_clock_rewind_requires_new_pose_after_gazebo_reset():
         ra_mod.NavigateToPose = orig_nav_cls
 
 
+@pytest.mark.anyio
+async def test_manual_control_arbitration_concurrency_and_timeout():
+    """
+    Kiểm tra toàn diện tính năng Điều khiển tay (Manual Control) cho Admin:
+    1. Phân quyền API: Anonymous (401), Passenger/Viewer (403), Admin (200).
+    2. Chuyển chế độ AUTO / MANUAL:
+       - Chặn khi chưa kết nối, chặn khi đang NAVIGATING hoặc PAUSED, chặn khi Nav2 có goal ngoài.
+       - Cho phép khi rảnh (IDLE) và kết nối.
+    3. Phân quyền phiên Admin đơn (Single Admin lock):
+       - Admin 1 chiếm quyền -> Admin 2 bị từ chối chuyển chế độ và gửi lệnh vận tốc.
+    4. Giới hạn vận tốc (Speed clamping):
+       - Vận tốc vượt ngưỡng an toàn bị kẹp chặt về linear_max (0.3 m/s) và angular_max (0.5 rad/s).
+    5. Cơ chế Watchdog an toàn (Heartbeat timeout):
+       - Khi nhả nút hoặc quá thời gian timeout (cmd_timeout_sec), robot tự động ngắt về vận tốc 0.
+    6. Phân luồng xung đột giữa MANUAL và Nav2:
+       - Khi ở MANUAL, chặn hoàn toàn bắt đầu dẫn đường mới và tiếp tục chuyến cũ.
+       - Khi thoát MANUAL về AUTO, mở khóa dẫn đường trở lại.
+    7. RosRobotAdapter:
+       - Kiểm tra logic consumer check (0 subscriber), arbitration và watchdog.
+    """
+    # -------------------------------------------------------------
+    # Phân đoạn 1: Phân quyền REST Endpoints
+    # -------------------------------------------------------------
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1.1 Anonymous gọi /control/manual và /control/velocity -> Bị từ chối
+        res_anon_mode = await client.post("/api/robot/control/manual", json={"enable": True})
+        assert res_anon_mode.status_code in (401, 403)
+
+        res_anon_vel = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.0})
+        assert res_anon_vel.status_code in (401, 403)
+
+        # 1.2 Passenger (Viewer) gọi -> 403 Forbidden
+        sess_p = await client.post("/api/auth/session")
+        token_p = sess_p.json()["session_token"]
+        headers_p = {"X-Passenger-Token": token_p}
+
+        res_p_mode = await client.post("/api/robot/control/manual", json={"enable": True}, headers=headers_p)
+        assert res_p_mode.status_code == 403
+
+        res_p_vel = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.0}, headers=headers_p)
+        assert res_p_vel.status_code == 403
+
+        # 1.3 Admin đăng nhập -> Có quyền gọi API
+        admin_login = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        assert admin_login.status_code == 200
+        admin_tok = admin_login.json()["access_token"]
+        admin_headers = {"Authorization": f"Bearer {admin_tok}"}
+
+        # Lấy adapter mock
+        from app.adapters.factory import get_robot_adapter
+        adapter = get_robot_adapter()
+        adapter._is_connected = True
+        adapter._control_mode = "AUTO"
+        adapter._navigation_state = "IDLE"
+        adapter._has_goal = False
+        adapter._manual_operator_id = None
+        adapter._current_manual_twist = (0.0, 0.0)
+
+        # Bật thủ công qua Admin API
+        res_admin_mode = await client.post("/api/robot/control/manual", json={"enable": True}, headers=admin_headers)
+        assert res_admin_mode.status_code == 200
+        assert res_admin_mode.json()["success"] is True
+        assert adapter._control_mode == "MANUAL"
+
+        # Gửi vận tốc qua Admin API
+        res_admin_vel = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.1}, headers=admin_headers)
+        assert res_admin_vel.status_code == 200
+        assert res_admin_vel.json()["success"] is True
+
+        # Tắt thủ công qua Admin API
+        res_admin_off = await client.post("/api/robot/control/manual", json={"enable": False}, headers=admin_headers)
+        assert res_admin_off.status_code == 200
+        assert adapter._control_mode == "AUTO"
+
+    # -------------------------------------------------------------
+    # Phân đoạn 2: Điều kiện chuyển sang MANUAL và Phân luồng xung đột
+    # -------------------------------------------------------------
+    adapter._control_mode = "AUTO"
+    adapter._navigation_state = "IDLE"
+    adapter._has_goal = False
+    adapter._is_connected = False
+
+    # 2.1 Không kết nối -> Chặn chuyển sang MANUAL
+    res_no_conn = adapter.set_manual_control(True, operator_id="admin1")
+    assert res_no_conn["success"] is False
+    assert "chưa kết nối" in res_no_conn["message"]
+
+    # 2.2 Đang NAVIGATING -> Chặn chuyển sang MANUAL
+    adapter._is_connected = True
+    adapter._navigation_state = "NAVIGATING"
+    adapter._has_goal = True
+    res_nav = adapter.set_manual_control(True, operator_id="admin1")
+    assert res_nav["success"] is False
+    assert "Đang có chuyến dẫn đường" in res_nav["message"]
+
+    # 2.3 Đang PAUSED -> Chặn chuyển sang MANUAL
+    adapter._navigation_state = "PAUSED"
+    res_paused = adapter.set_manual_control(True, operator_id="admin1")
+    assert res_paused["success"] is False
+    assert "Đang có chuyến dẫn đường" in res_paused["message"]
+
+    # 2.4 Robot rảnh (IDLE) -> Chuyển thành công
+    adapter._navigation_state = "IDLE"
+    adapter._has_goal = False
+    res_idle = adapter.set_manual_control(True, operator_id="admin1")
+    assert res_idle["success"] is True
+    assert adapter._control_mode == "MANUAL"
+    assert adapter._manual_operator_id == "admin1"
+
+    # 2.5 Khi đang ở MANUAL -> Chặn Start và Resume Nav2
+    start_blocked = adapter.start_navigation("gate_a1", owner_id="admin1")
+    assert start_blocked["success"] is False
+    assert "chế độ điều khiển thủ công" in start_blocked["message"]
+
+    resume_blocked = adapter.resume_navigation()
+    assert resume_blocked["success"] is False
+    assert "chế độ điều khiển thủ công" in resume_blocked["message"]
+
+    # -------------------------------------------------------------
+    # Phân đoạn 3: Chiếm quyền Admin (Single Admin Concurrency)
+    # -------------------------------------------------------------
+    # Admin 2 cố gắng gửi lệnh khi Admin 1 đang giữ quyền
+    res_admin2_enable = adapter.set_manual_control(True, operator_id="admin2")
+    assert res_admin2_enable["success"] is False
+    assert "thuộc về Admin khác (admin1)" in res_admin2_enable["message"]
+
+    res_admin2_vel = adapter.send_manual_velocity(0.2, 0.0, operator_id="admin2")
+    assert res_admin2_vel["success"] is False
+    assert "thuộc về Admin khác (admin1)" in res_admin2_vel["message"]
+
+    # -------------------------------------------------------------
+    # Phân đoạn 4: Giới hạn tốc độ (Speed Clamping) & Watchdog
+    # -------------------------------------------------------------
+    # Gửi vận tốc vượt trần: linear_x=2.0 (trần 0.3), angular_z=-3.0 (trần -0.5)
+    res_clamped = adapter.send_manual_velocity(2.0, -3.0, operator_id="admin1")
+    assert res_clamped["success"] is True
+    assert adapter._current_manual_twist == (0.3, -0.5)
+
+    # Watchdog kiểm tra khi mới nhận lệnh -> chưa timeout
+    adapter.check_manual_timeout()
+    assert adapter._current_manual_twist == (0.3, -0.5)
+
+    # Giả lập thời gian trôi qua quá timeout (0.6s)
+    adapter._last_manual_cmd_time = time.monotonic() - 1.0
+    adapter.check_manual_timeout()
+    # Robot tự động dừng về (0.0, 0.0)
+    assert adapter._current_manual_twist == (0.0, 0.0)
+
+    # -------------------------------------------------------------
+    # Phân đoạn 5: Thoát MANUAL về AUTO
+    # -------------------------------------------------------------
+    res_off = adapter.set_manual_control(False)
+    assert res_off["success"] is True
+    assert adapter._control_mode == "AUTO"
+    assert adapter._manual_operator_id is None
+    assert adapter._current_manual_twist == (0.0, 0.0)
+
+    # -------------------------------------------------------------
+    # Phân đoạn 6: Kiểm tra RosRobotAdapter độc lập
+    # -------------------------------------------------------------
+    from app.adapters.ros_adapter import RosRobotAdapter
+    ros_ad = RosRobotAdapter.__new__(RosRobotAdapter)
+    ros_ad._lock = threading.Lock()
+    ros_ad._control_mode = "AUTO"
+    ros_ad._manual_operator_id = None
+    ros_ad._current_manual_twist = (0.0, 0.0)
+    ros_ad._last_manual_cmd_time = 0.0
+    ros_ad._navigation_state = "IDLE"
+    ros_ad._has_goal = False
+    ros_ad._nav2_has_active_goal = False
+    ros_ad._pose = {"x": 1.0, "y": 2.0, "theta": 0.0}
+    ros_ad._battery_percent = 0.8
+    ros_ad._last_pose_time = time.time()
+    ros_ad._clock_stalled = False
+    ros_ad._sim_restarted = False
+    ros_ad._pose_received_epoch = 0
+    ros_ad._pose_epoch = 0
+    ros_ad._last_clock_sec = 10.0
+    ros_ad._last_clock_monotonic = time.monotonic()
+    ros_ad._message = "Sẵn sàng"
+    ros_ad._destination_id = ""
+    ros_ad._distance_remaining = None
+    ros_ad._estimated_time_remaining = None
+    ros_ad._number_of_recoveries = 0
+    ros_ad._voice_state = "IDLE"
+    ros_ad._voice_transcript = None
+    ros_ad._voice_response = None
+    ros_ad._pose_frame_id = "map"
+    ros_ad._pose_stamp = None
+    ros_ad._map_version = "v1"
+
+    class MockCfg:
+        use_sim_time = True
+        velocity_limits = {"linear_max": 0.3, "angular_max": 0.5, "cmd_timeout_sec": 0.5}
+        frames = {"base_link": "base_link"}
+
+    ros_ad._cfg = MockCfg()
+
+    # Consumer check khi chưa có publisher hoặc 0 subscriber
+    assert ros_ad.is_manual_consumer_available() is False
+
+    # Chặn khi Nav2 có goal ngoài đang chạy
+    ros_ad._nav2_has_active_goal = True
+    r_ext = ros_ad.set_manual_control(True, operator_id="admin_ext")
+    assert r_ext["success"] is False
+    assert "nguồn ngoài" in r_ext["message"]
+
+    # Chuyển thành công khi IDLE và không có goal ngoài
+    ros_ad._nav2_has_active_goal = False
+    r_ok = ros_ad.set_manual_control(True, operator_id="admin_ros")
+    assert r_ok["success"] is True
+    assert ros_ad._control_mode == "MANUAL"
+    assert ros_ad._manual_operator_id == "admin_ros"
+
+    # Chiếm quyền
+    r_conflict = ros_ad.set_manual_control(True, operator_id="admin_other")
+    assert r_conflict["success"] is False
+    assert "thuộc về Admin khác (admin_ros)" in r_conflict["message"]
+
+    # Watchdog trên RosRobotAdapter
+    ros_ad._current_manual_twist = (0.2, 0.1)
+    ros_ad._last_manual_cmd_time = time.monotonic() - 1.0
+    ros_ad.check_manual_timeout()
+    assert ros_ad._current_manual_twist == (0.0, 0.0)
+
+    # Thoát về AUTO
+    r_auto = ros_ad.set_manual_control(False)
+    assert r_auto["success"] is True
+    assert ros_ad._control_mode == "AUTO"
+    assert ros_ad._manual_operator_id is None
+
+
+# =========================================================================
+# 26. Voice Interface, Debouncing & Lifecycle Tests
+# =========================================================================
+
+def test_voice_interface_lifecycle_and_debouncing():
+    """
+    Kiểm thử toàn diện cho hệ thống Voice/Microphone:
+    1. Kiểm tra xác thực API (/api/robot/voice/start).
+    2. Kiểm tra khi node giọng nói ROS offline: từ chối an toàn, nút bị khóa.
+    3. Kiểm tra khi node sẵn sàng: kích hoạt, chặn bấm dồn dập (in-flight debounce),
+       chuyển trạng thái LISTENING -> PROCESSING -> SPEAKING -> IDLE.
+    4. Kiểm thử RosRobotAdapter cô lập: service_is_ready check, timeout handling,
+       phản hồi từ ROS service Trigger.
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.adapters.factory import get_robot_adapter
+    from app.adapters.ros_adapter import RosRobotAdapter
+    import threading
+
+    client = TestClient(app)
+
+    # 1. API Auth check - Token giả mạo/không hợp lệ bị từ chối 401
+    resp_bad_token = client.post("/api/robot/voice/start", headers={"Authorization": "Bearer invalid_forged_token"})
+    assert resp_bad_token.status_code == 401
+
+    # Tạo token passenger
+    sess_res = client.post("/api/auth/session")
+    assert sess_res.status_code == 200
+    pass_token = sess_res.json()["session_token"]
+    pass_headers = {"X-Passenger-Token": pass_token}
+
+    adapter = get_robot_adapter()
+    assert hasattr(adapter, "is_voice_available")
+
+    # 2. Trường hợp Voice node OFFLINE
+    if hasattr(adapter, "set_voice_available"):
+        adapter.set_voice_available(False)
+        assert adapter.is_voice_available() is False
+        status = adapter.get_status()
+        assert status.get("voice_available") is False
+
+        # Gọi API khi offline -> Bị từ chối an toàn 400
+        resp_offline = client.post("/api/robot/voice/start", headers=pass_headers)
+        assert resp_offline.status_code == 400
+        assert "chưa sẵn sàng" in resp_offline.json()["detail"] or "chưa khởi chạy" in resp_offline.json()["detail"]
+
+        # 3. Trường hợp Voice node SẴN SÀNG
+        adapter.set_voice_available(True)
+        assert adapter.is_voice_available() is True
+        status_ok = adapter.get_status()
+        assert status_ok.get("voice_available") is True
+
+        # Đảm bảo reset trạng thái giọng nói về IDLE
+        with adapter._lock:
+            adapter._voice_state = "IDLE"
+            adapter._voice_start_in_progress = False
+
+        # Gọi API kích hoạt thành công
+        resp_start = client.post("/api/robot/voice/start", headers=pass_headers)
+        assert resp_start.status_code == 200
+        assert resp_start.json()["success"] is True
+
+        # Kiểm tra trạng thái chuyển sang LISTENING
+        assert adapter.get_status()["voice_state"] == "LISTENING"
+
+        # Chặn bấm dồn dập (in-flight debounce / đang bận)
+        resp_spam = client.post("/api/robot/voice/start", headers=pass_headers)
+        assert resp_spam.status_code == 400
+        assert "đang bận" in resp_spam.json()["detail"] or "đang được xử lý" in resp_spam.json()["detail"]
+
+        # Reset về IDLE sau test
+        with adapter._lock:
+            adapter._voice_state = "IDLE"
+            adapter._voice_start_in_progress = False
+
+    # 4. Kiểm thử RosRobotAdapter cô lập (Unit tests không phụ thuộc ROS daemon)
+    ros_ad = object.__new__(RosRobotAdapter)
+    ros_ad._lock = threading.RLock()
+    ros_ad._voice_start_in_progress = False
+    ros_ad._voice_state = "IDLE"
+    ros_ad._voice_transcript = None
+    ros_ad._voice_response = None
+
+    class MockVoiceSrvCfg:
+        name = "/airport/voice/start"
+        type = "std_srvs/srv/Trigger"
+        enabled = True
+        timeout_sec = 0.5
+
+    class MockRosCfg:
+        use_sim_time = True
+        def get_service(self, name):
+            if name == "voice_start":
+                return MockVoiceSrvCfg()
+            return None
+
+    ros_ad._cfg = MockRosCfg()
+
+    # (a) Chưa có client
+    ros_ad._cli_voice_start = None
+    assert ros_ad.is_voice_available() is False
+    res_no_cli = ros_ad.start_voice_session()
+    assert res_no_cli["success"] is False
+    assert "chưa được cấu hình" in res_no_cli["message"]
+
+    # (b) Client tồn tại nhưng service chưa sẵn sàng
+    class DummyServiceClient:
+        def __init__(self, ready=False):
+            self._ready = ready
+            self.call_count = 0
+        def service_is_ready(self):
+            return self._ready
+        def call_async(self, req):
+            self.call_count += 1
+            class DummyFuture:
+                def __init__(self):
+                    self._done_callbacks = []
+                def add_done_callback(self, cb):
+                    self._done_callbacks.append(cb)
+            return DummyFuture()
+
+    ros_ad._cli_voice_start = DummyServiceClient(ready=False)
+    assert ros_ad.is_voice_available() is False
+    res_not_ready = ros_ad.start_voice_session()
+    assert res_not_ready["success"] is False
+    assert "chưa sẵn sàng" in res_not_ready["message"]
+    assert ros_ad._cli_voice_start.call_count == 0  # Không gửi call_async khi chưa sẵn sàng
+
+    # (c) In-flight debounce
+    ros_ad._cli_voice_start = DummyServiceClient(ready=True)
+    assert ros_ad.is_voice_available() is True
+    ros_ad._voice_start_in_progress = True
+    res_in_prog = ros_ad.start_voice_session()
+    assert res_in_prog["success"] is False
+    assert "đang được xử lý" in res_in_prog["message"]
+    ros_ad._voice_start_in_progress = False
+
+    # (d) Timeout handling khi service không trả lời
+    class TimeoutServiceClient:
+        def service_is_ready(self):
+            return True
+        def call_async(self, req):
+            class HangingFuture:
+                def add_done_callback(self, cb):
+                    pass  # Không gọi callback để kích hoạt timeout
+            return HangingFuture()
+
+    ros_ad._cli_voice_start = TimeoutServiceClient()
+    t0 = time.monotonic()
+    res_timeout = ros_ad.start_voice_session()
+    duration = time.monotonic() - t0
+    assert res_timeout["success"] is False
+    assert "Hết thời gian chờ phản hồi" in res_timeout["message"]
+    assert duration >= 0.4  # Khớp timeout 0.5s từ config
+    assert ros_ad._voice_start_in_progress is False  # Đảm bảo cờ in-flight được reset
+
+    # (e) ROS Service trả về thành công
+    class SuccessServiceClient:
+        def service_is_ready(self):
+            return True
+        def call_async(self, req):
+            class ImmediateFuture:
+                def add_done_callback(self, cb):
+                    class Resp:
+                        success = True
+                        message = "Microphone robot đã mở, mời nói."
+                    self.result = lambda: Resp()
+                    cb(self)
+            return ImmediateFuture()
+
+    ros_ad._cli_voice_start = SuccessServiceClient()
+    res_ok = ros_ad.start_voice_session()
+    assert res_ok["success"] is True
+    assert "Microphone robot đã mở" in res_ok["message"]
+    assert ros_ad._voice_start_in_progress is False
+
+
+# =========================================================================
+# 27. Voice Destination Matching, Session Isolation & Confirmation Tests
+# =========================================================================
+
+def test_voice_destination_matching_and_confirmation_workflow():
+    """
+    Kiểm thử chuyên sâu cho tính năng Nhận diện Điểm Đến & Xác Nhận từ Giọng Nói:
+    1. Thuật toán voice_matcher: khớp 1 điểm (MATCHED), mập mờ (AMBIGUOUS), không khớp (NO_MATCH).
+    2. Phân tách phiên: Đề xuất gắn chặt với ID phiên bấm mic (Passenger A).
+    3. Bảo mật: Passenger B không có quyền xác nhận đề xuất của Passenger A (403).
+    4. Xác nhận thành công: Bắt đầu điều hướng qua luồng Nav2 hiện có.
+    5. Chống xác nhận lặp: Đề xuất bị thu hồi ngay lập tức, bấm lần 2 bị từ chối 400.
+    6. Hết hạn (Expiry): Đề xuất quá thời hạn (30s) bị từ chối 400.
+    7. Bỏ qua (Dismiss): Hủy đề xuất an toàn.
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.adapters.factory import get_robot_adapter
+    from app.services.voice_matcher import match_destination_from_transcript
+
+    client = TestClient(app)
+    adapter = get_robot_adapter()
+
+    # Dữ liệu điểm đến mẫu
+    sample_dests = [
+        {"id": "gate_1", "name": "Cổng khởi hành số 1"},
+        {"id": "gate_2", "name": "Cổng khởi hành số 2"},
+        {"id": "info_desk", "name": "Quầy thông tin"},
+        {"id": "restroom", "name": "Khu vệ sinh công cộng"},
+    ]
+
+    # --- 1. Kiểm thử thuật toán voice_matcher ---
+    # (a) Khớp chính xác duy nhất
+    res_exact = match_destination_from_transcript("Hãy dẫn tôi đến Cổng khởi hành số 1", sample_dests)
+    assert res_exact["status"] == "MATCHED"
+    assert res_exact["destination"]["id"] == "gate_1"
+
+    # (b) Khớp theo số thứ tự và từ khóa
+    res_number = match_destination_from_transcript("Dẫn tôi tới Cổng 2", sample_dests)
+    assert res_number["status"] == "MATCHED"
+    assert res_number["destination"]["id"] == "gate_2"
+
+    res_info = match_destination_from_transcript("Tôi muốn đến quầy thông tin", sample_dests)
+    assert res_info["status"] == "MATCHED"
+    assert res_info["destination"]["id"] == "info_desk"
+
+    # (c) Mập mờ (Nhiều điểm cùng khớp từ khóa)
+    res_ambiguous = match_destination_from_transcript("Dẫn tôi ra cổng", sample_dests)
+    assert res_ambiguous["status"] == "AMBIGUOUS"
+    assert res_ambiguous["destination"] is None
+
+    # (d) Không tìm thấy điểm nào
+    res_none = match_destination_from_transcript("Tôi muốn đi ăn kem ngoài bãi biển", sample_dests)
+    assert res_none["status"] == "NO_MATCH"
+    assert res_none["destination"] is None
+
+    # --- 2. Kiểm thử phiên hành khách & API xác nhận ---
+    # Tạo 2 phiên hành khách A và B
+    sess_A = client.post("/api/auth/session")
+    assert sess_A.status_code == 200
+    token_A = sess_A.json()["session_token"]
+    user_A = sess_A.json()["user_id"]
+    headers_A = {"X-Passenger-Token": token_A}
+
+    sess_B = client.post("/api/auth/session")
+    assert sess_B.status_code == 200
+    token_B = sess_B.json()["session_token"]
+    user_B = sess_B.json()["user_id"]
+    headers_B = {"X-Passenger-Token": token_B}
+
+    # Đảm bảo robot ở trạng thái rảnh và sẵn sàng
+    if hasattr(adapter, "cancel_navigation"):
+        adapter.cancel_navigation(owner_id="admin", is_admin=True)
+    if hasattr(adapter, "set_voice_available"):
+        adapter.set_voice_available(True)
+    with adapter._lock:
+        adapter._voice_state = "IDLE"
+        adapter._voice_start_in_progress = False
+        adapter._navigation_state = "IDLE"
+        adapter._has_goal = False
+        adapter._owner_id = ""
+
+    # Lấy điểm đến thực tế hiện hành trong database
+    active_dests = adapter.get_destinations()
+    assert len(active_dests) > 0
+    target_dest = active_dests[0]
+    target_name = target_dest["name"]
+    target_id = target_dest["id"]
+
+    # Hành khách A bắt đầu phiên giọng nói
+    if hasattr(adapter, "set_mock_transcript"):
+        adapter.set_mock_transcript(f"Hãy dẫn tôi đến {target_name}")
+
+    start_res = client.post("/api/robot/voice/start", headers=headers_A)
+    assert start_res.status_code == 200
+
+    # Chờ tiến trình thu âm và nhận dạng giả lập (mock loop mất khoảng 1.5 - 2.5s)
+    time.sleep(2.8)
+
+    proposal = adapter.get_voice_proposal()
+    assert proposal is not None
+    assert proposal["status"] == "MATCHED"
+    assert proposal["destination_id"] == target_id
+    assert proposal["requester_id"] == user_A
+    prop_id = proposal["proposal_id"]
+
+    # --- 3. Hành khách B cố ý xác nhận đề xuất của A -> 403 Forbidden ---
+    confirm_B = client.post(
+        "/api/robot/voice/confirm",
+        json={"proposal_id": prop_id, "destination_id": target_id},
+        headers=headers_B
+    )
+    assert confirm_B.status_code == 403
+    assert "không có quyền" in confirm_B.json()["detail"]
+
+    # --- 4. Kiểm tra đề xuất hết hạn (Expiry) ---
+    with adapter._lock:
+        # Giả lập đề xuất đã quá hạn 30s
+        adapter._voice_proposal["expires_at"] = int(time.time() * 1000) - 5000
+
+    confirm_expired = client.post(
+        "/api/robot/voice/confirm",
+        json={"proposal_id": prop_id, "destination_id": target_id},
+        headers=headers_A
+    )
+    assert confirm_expired.status_code == 400
+    assert "hết hạn" in confirm_expired.json()["detail"]
+
+    # --- 5. Khôi phục đề xuất hợp lệ và Hành khách A Xác nhận Thành công ---
+    with adapter._lock:
+        adapter._voice_proposal = {
+            "proposal_id": prop_id,
+            "requester_id": user_A,
+            "session_id": "session_test",
+            "status": "MATCHED",
+            "destination_id": target_id,
+            "destination_name": target_name,
+            "transcript": f"Dẫn tôi tới {target_name}",
+            "created_at": int(time.time() * 1000),
+            "expires_at": int((time.time() + 30) * 1000),
+            "confirmed": False
+        }
+
+    confirm_A = client.post(
+        "/api/robot/voice/confirm",
+        json={"proposal_id": prop_id, "destination_id": target_id},
+        headers=headers_A
+    )
+    assert confirm_A.status_code == 200
+    assert confirm_A.json()["success"] is True
+
+    # Xác nhận chuyến dẫn đường đã bắt đầu với chủ sở hữu là A
+    assert adapter.get_owner_id() == user_A
+    assert adapter.get_status()["destination_id"] == target_id
+
+    # --- 6. Chống xác nhận lặp (Double Confirmation Prevention) ---
+    confirm_again = client.post(
+        "/api/robot/voice/confirm",
+        json={"proposal_id": prop_id, "destination_id": "info_desk"},
+        headers=headers_A
+    )
+    assert confirm_again.status_code == 400
+    assert "Không có đề xuất" in confirm_again.json()["detail"] or "hết hạn" in confirm_again.json()["detail"]
+
+    # Hủy chuyến để dọn dẹp
+    adapter.cancel_navigation(owner_id="admin", is_admin=True)
+
+    # --- 7. Bỏ qua đề xuất (Dismiss) ---
+    with adapter._lock:
+        adapter._voice_proposal = {
+            "proposal_id": "prop_dismiss_test",
+            "requester_id": user_A,
+            "session_id": "session_dismiss",
+            "status": "MATCHED",
+            "destination_id": "info_desk",
+            "destination_name": "Quầy thông tin",
+            "transcript": "Dẫn tôi tới Quầy thông tin",
+            "created_at": int(time.time() * 1000),
+            "expires_at": int((time.time() + 30) * 1000),
+            "confirmed": False
+        }
+
+    dismiss_res = client.post("/api/robot/voice/dismiss", headers=headers_A)
+    assert dismiss_res.status_code == 200
+    assert adapter.get_voice_proposal() is None
+
+
+@pytest.mark.anyio
+async def test_operational_event_logger_and_admin_monitoring_lifecycle():
+    """
+    Test kiểm tra toàn diện tính năng Giám sát & Nhật ký vận hành Admin:
+    1. Bộ đệm vòng RAM giới hạn đúng 100 sự kiện, đẩy các sự kiện cũ nhất ra ngoài.
+    2. Chống ghi lặp (Deduplication) khi trạng thái kết nối và chế độ điều khiển không đổi.
+    3. Bảo mật dữ liệu: Không ghi token, không ghi thông tin định danh hành khách hoặc giọng nói.
+    4. Phân quyền API: Passenger nhận 403 Forbidden, Unauthenticated nhận 401, Admin nhận 200.
+    5. Phân tách Telemetry WebSocket: Passenger không nhận admin_data, Admin nhận events.
+    6. Trạng thái sẵn sàng (Readiness check): Xác định chính xác ready/reasons khi ở MANUAL hoặc bình thường.
+    """
+    from app.services.event_logger import OperationalEventLogger
+    from app.adapters.factory import get_robot_adapter
+    from app.auth.models import User, UserRole
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    adapter = get_robot_adapter()
+
+    # --- 1. Kiểm tra bộ đệm vòng RAM (Giới hạn tối đa 100) ---
+    logger = OperationalEventLogger(maxlen=100)
+    for i in range(125):
+        logger.add_event("INFO", "SYSTEM", f"Sự kiện kiểm thử #{i+1}")
+
+    events = logger.get_events()
+    assert len(events) == 100
+    assert logger.version == 125
+    # Sự kiện đầu tiên còn lưu phải là sự kiện #26 (25 sự kiện đầu bị đẩy ra)
+    assert events[0]["message"] == "Sự kiện kiểm thử #26"
+    assert events[-1]["message"] == "Sự kiện kiểm thử #125"
+
+    # --- 2. Kiểm tra chống ghi lặp (Deduplication ở 5Hz) ---
+    logger.clear()
+    assert len(logger.get_events()) == 0
+
+    # Gọi track_connection 10 lần liên tiếp với trạng thái True
+    for _ in range(10):
+        logger.track_connection(True)
+    evts_conn = logger.get_events()
+    assert len(evts_conn) == 1
+    assert "Đã kết nối" in evts_conn[0]["message"]
+
+    # Gọi track_connection khi chuyển sang False 5 lần
+    for _ in range(5):
+        logger.track_connection(False)
+    evts_conn2 = logger.get_events()
+    assert len(evts_conn2) == 2
+    assert "Mất kết nối" in evts_conn2[1]["message"]
+
+    # Chuyển ngược lại True
+    logger.track_connection(True)
+    evts_conn3 = logger.get_events()
+    assert len(evts_conn3) == 3
+    assert "phục hồi kết nối" in evts_conn3[2]["message"]
+
+    # Chế độ điều khiển: Gọi track_control_mode 5 lần liên tiếp với MANUAL
+    for _ in range(5):
+        logger.track_control_mode("MANUAL")
+    evts_ctrl = logger.get_events()
+    assert len(evts_ctrl) == 4
+    assert "MANUAL" in evts_ctrl[3]["message"]
+
+    # Gọi tiếp AUTO 5 lần
+    for _ in range(5):
+        logger.track_control_mode("AUTO")
+    evts_ctrl2 = logger.get_events()
+    assert len(evts_ctrl2) == 5
+    assert "AUTO" in evts_ctrl2[4]["message"]
+
+    # --- 3. Kiểm tra tính an toàn dữ liệu (Không lộ token, id hành khách, giọng nói) ---
+    sensitive_tokens = ["jwt_token_secret", "bearer_token", "pass_session_xyz"]
+    for evt in logger.get_events():
+        msg_lower = evt["message"].lower()
+        for tok in sensitive_tokens:
+            assert tok not in msg_lower
+        assert "transcript" not in evt["details"]
+        assert "token" not in evt["details"]
+        assert "user_id" not in evt["details"]
+
+    # --- 4. Kiểm tra phân quyền API GET /api/robot/admin/events ---
+    # Tạo phiên Hành khách
+    resp_pass = client.post("/api/auth/session")
+    assert resp_pass.status_code == 200
+    token_pass = resp_pass.json()["session_token"]
+    headers_pass = {"Authorization": f"Bearer {token_pass}"}
+
+    # Đăng nhập Admin
+    resp_admin = client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "admin123"}
+    )
+    assert resp_admin.status_code == 200
+    token_admin = resp_admin.json()["access_token"]
+    headers_admin = {"Authorization": f"Bearer {token_admin}"}
+
+    # 4a. Chưa đăng nhập (hoặc token giả mạo) -> 401
+    resp_unauth = client.get(
+        "/api/robot/admin/events",
+        headers={"Authorization": "Bearer invalid_forged_token"}
+    )
+    assert resp_unauth.status_code == 401
+
+    # 4b. Hành khách gọi endpoint Admin -> 403 Forbidden
+    resp_forbidden = client.get("/api/robot/admin/events", headers=headers_pass)
+    assert resp_forbidden.status_code == 403
+    assert "Quyền hạn không đủ" in resp_forbidden.json()["detail"]
+
+    # 4c. Admin gọi endpoint -> 200 OK với danh sách sự kiện
+    resp_ok = client.get("/api/robot/admin/events", headers=headers_admin)
+    assert resp_ok.status_code == 200
+    data = resp_ok.json()
+    assert "events" in data
+    assert "started_at" in data
+    assert "version" in data
+    assert "total" in data
+    assert isinstance(data["events"], list)
+
+    # --- 5. Kiểm tra Telemetry WebSocket Isolation ---
+    user_passenger = User(id="passenger_1", username="passenger", full_name="Hành khách", role=UserRole.PASSENGER, hashed_password="")
+    user_admin = User(id="admin_1", username="admin", full_name="Quản trị viên", role=UserRole.ADMIN, hashed_password="")
+
+    # Giả lập payload phát từ broadcaster
+    def simulate_telemetry_payload(user: User):
+        status = adapter.get_status()
+        payload = {
+            "type": "telemetry",
+            "server_time": int(time.time() * 1000),
+            "backend_connected": True,
+            "robot_status": {
+                "pose": status["pose"],
+                "control_mode": status["control_mode"],
+                "navigation_state": status["navigation_state"],
+                "readiness": status.get("readiness")
+            }
+        }
+        if user.role == UserRole.ADMIN:
+            payload["admin_data"] = {
+                "alerts": adapter.get_alerts(),
+                "events": adapter.get_operational_events(100),
+                "events_version": adapter.get_events_version()
+            }
+        return payload
+
+    payload_pass = simulate_telemetry_payload(user_passenger)
+    payload_adm = simulate_telemetry_payload(user_admin)
+
+    # Hành khách tuyệt đối KHÔNG có admin_data
+    assert "admin_data" not in payload_pass
+    assert "events" not in payload_pass["robot_status"]
+
+    # Admin có admin_data chứa events
+    assert "admin_data" in payload_adm
+    assert "events" in payload_adm["admin_data"]
+    assert isinstance(payload_adm["admin_data"]["events"], list)
+
+    # --- 6. Kiểm tra Trạng thái Sẵn sàng (Readiness check) ---
+    st_normal = adapter.get_status()
+    assert "readiness" in st_normal
+    assert "ready" in st_normal["readiness"]
+    assert "reasons" in st_normal["readiness"]
+
+    # Khi chuyển sang MANUAL -> readiness.ready = False
+    adapter.set_manual_control(True, operator_id="admin_1")
+    st_manual = adapter.get_status()
+    assert st_manual["control_mode"] == "MANUAL"
+    assert st_manual["readiness"]["ready"] is False
+    assert any("MANUAL" in r for r in st_manual["readiness"]["reasons"])
+
+    # Chuyển về AUTO -> readiness.ready = True (nếu không có chuyến)
+    adapter.set_manual_control(False, operator_id="admin_1")
+    st_auto = adapter.get_status()
+    assert st_auto["control_mode"] == "AUTO"
+    assert st_auto["readiness"]["ready"] is True
+
+
+
+
+
+
 

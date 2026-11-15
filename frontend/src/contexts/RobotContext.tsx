@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef, ReactNode } from 'react';
-import { RobotStatus, Destination, AlertItem, PathPoint, MapData } from '../types';
+import { RobotStatus, Destination, AlertItem, PathPoint, MapData, OperationalEvent } from '../types';
 import { apiClient } from '../api/client';
 import { wsClient } from '../api/wsClient';
 import { useAuth } from './AuthContext';
@@ -8,6 +8,8 @@ interface RobotContextType {
   status: RobotStatus;
   destinations: Destination[];
   alerts: AlertItem[];
+  events: OperationalEvent[];
+  eventsStartedAt: number | null;
   path: PathPoint[] | null;
   isBackendConnected: boolean;
   mapData: MapData | null;
@@ -15,11 +17,14 @@ interface RobotContextType {
   mapError: string | null;
   refreshMap: () => Promise<void>;
   refreshDestinations: () => Promise<void>;
+  refreshEvents: () => Promise<void>;
   startNavigation: (destinationId: string) => Promise<{ success: boolean; message?: string }>;
   cancelNavigation: () => Promise<{ success: boolean; message?: string }>;
   pauseNavigation: () => Promise<{ success: boolean; message?: string }>;
   resumeNavigation: () => Promise<{ success: boolean; message?: string }>;
   startVoiceSession: () => Promise<{ success: boolean; message?: string }>;
+  confirmVoiceProposal: (proposalId: string, destinationId?: string) => Promise<{ success: boolean; message?: string }>;
+  dismissVoiceProposal: () => Promise<{ success: boolean; message?: string }>;
   setManualControl: (enable: boolean) => Promise<{ success: boolean; message?: string }>;
   sendManualVelocity: (linear_x: number, angular_z: number) => Promise<boolean>;
   upsertDestination: (dest: Destination) => Promise<{ success: boolean; message?: string }>;
@@ -48,17 +53,24 @@ const DEFAULT_STATUS: RobotStatus = {
   voiceState: 'IDLE',
   voiceTranscript: null,
   voiceResponse: null,
+  voiceAvailable: false,
+  voiceProposal: null,
   message: 'Đang kết nối tới máy chủ...',
+  manualConsumerAvailable: false,
+  manualOperatorId: null,
+  readiness: null,
   lastUpdated: 0,
 };
 
 const RobotContext = createContext<RobotContextType | undefined>(undefined);
 
 export function RobotProvider({ children }: { children: ReactNode }) {
-  const { token } = useAuth();
+  const { token, currentUser } = useAuth();
   const [status, setStatus] = useState<RobotStatus>(DEFAULT_STATUS);
   const [destinations, setDestinations] = useState<Destination[]>([]);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [events, setEvents] = useState<OperationalEvent[]>([]);
+  const [eventsStartedAt, setEventsStartedAt] = useState<number | null>(null);
   const [path, setPath] = useState<PathPoint[] | null>(null);
   const [isBackendConnected, setIsBackendConnected] = useState<boolean>(false);
 
@@ -165,6 +177,20 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     await fetchMapData();
   }, [fetchMapData]);
 
+  const refreshEvents = useCallback(async () => {
+    try {
+      const res = await apiClient.get<{ events: OperationalEvent[]; started_at: number; version: number }>('/api/robot/admin/events');
+      if (res && res.events) {
+        setEvents(res.events);
+        if (res.started_at) {
+          setEventsStartedAt(res.started_at);
+        }
+      }
+    } catch {
+      // ignore if not admin
+    }
+  }, []);
+
   // 3. Kết nối WebSocket khi khởi động
   useEffect(() => {
     activeMapVersionRef.current = null;
@@ -211,7 +237,12 @@ export function RobotProvider({ children }: { children: ReactNode }) {
             voiceState: rob.voice_state || 'IDLE',
             voiceTranscript: rob.voice_transcript,
             voiceResponse: rob.voice_response,
+            voiceAvailable: rob.voice_available ?? false,
+            voiceProposal: rob.voice_proposal || null,
             message: rob.message || '',
+            manualConsumerAvailable: rob.manual_consumer_available ?? false,
+            manualOperatorId: rob.manual_operator_id ?? null,
+            readiness: rob.readiness ?? null,
             lastUpdated: rob.last_updated || Date.now(),
           });
 
@@ -243,20 +274,31 @@ export function RobotProvider({ children }: { children: ReactNode }) {
           setPath(null);
         }
 
-        if (payload.admin_data && payload.admin_data.alerts) {
-          setAlerts(payload.admin_data.alerts);
+        if (payload.admin_data) {
+          if (payload.admin_data.alerts) {
+            setAlerts(payload.admin_data.alerts);
+          }
+          if (payload.admin_data.events) {
+            setEvents(payload.admin_data.events);
+          }
+          if (payload.admin_data.events_started_at) {
+            setEventsStartedAt(payload.admin_data.events_started_at);
+          }
         }
       }
     });
 
     refreshDestinations();
     fetchMapData();
+    if (currentUser?.role === 'admin') {
+      refreshEvents();
+    }
 
     return () => {
       unsubStatus();
       unsubTelemetry();
     };
-  }, [token, refreshDestinations, fetchMapData]);
+  }, [token, currentUser?.role, refreshDestinations, fetchMapData, refreshEvents]);
 
   // 4. Các hàm nghiệp vụ (REST calls)
   const startNavigation = async (destinationId: string) => {
@@ -302,6 +344,31 @@ export function RobotProvider({ children }: { children: ReactNode }) {
       const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/voice/start');
       return res;
     } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  };
+
+  const confirmVoiceProposal = async (proposalId: string, destinationId?: string) => {
+    try {
+      const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/voice/confirm', {
+        proposal_id: proposalId,
+        destination_id: destinationId,
+      });
+      // Khi đã xác nhận thành công, dọn dẹp proposal trên local state để chặn bấm xác nhận lần 2
+      setStatus((prev) => ({ ...prev, voiceProposal: null }));
+      return res;
+    } catch (err: any) {
+      return { success: false, message: err.message };
+    }
+  };
+
+  const dismissVoiceProposal = async () => {
+    try {
+      const res = await apiClient.post<{ success: boolean; message?: string }>('/api/robot/voice/dismiss');
+      setStatus((prev) => ({ ...prev, voiceProposal: null }));
+      return res;
+    } catch (err: any) {
+      setStatus((prev) => ({ ...prev, voiceProposal: null }));
       return { success: false, message: err.message };
     }
   };
@@ -352,6 +419,8 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         status,
         destinations,
         alerts,
+        events,
+        eventsStartedAt,
         path,
         isBackendConnected,
         mapData,
@@ -359,11 +428,14 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         mapError,
         refreshMap,
         refreshDestinations,
+        refreshEvents,
         startNavigation,
         cancelNavigation,
         pauseNavigation,
         resumeNavigation,
         startVoiceSession,
+        confirmVoiceProposal,
+        dismissVoiceProposal,
         setManualControl,
         sendManualVelocity,
         upsertDestination,

@@ -14,6 +14,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from .base import BaseRobotAdapter
 from ..ros_config import get_ros_config
 from ..coordinate.transform import MapMetadata, quaternion_to_yaw
+from ..services.voice_matcher import match_destination_from_transcript
+from ..services.event_logger import event_logger
 
 logger = logging.getLogger("ros_adapter")
 
@@ -51,6 +53,18 @@ except ImportError:
         STATUS_ABORTED = 6
     class GoalStatusArray:
         pass
+    class Trigger:
+        class Request:
+            pass
+        class Response:
+            success = False
+            message = ""
+    class SetBool:
+        class Request:
+            data = False
+        class Response:
+            success = False
+            message = ""
 
 # Kiểm tra package custom airport_robot_interfaces
 try:
@@ -113,6 +127,9 @@ class RosRobotAdapter(BaseRobotAdapter):
         self._last_state_time: float = 0.0
         self._is_connected = False
         self._control_mode = "AUTO"
+        self._manual_operator_id: Optional[str] = None
+        self._current_manual_twist = (0.0, 0.0)
+        self._last_manual_cmd_time: float = 0.0
         self._navigation_state = "IDLE"
         self._has_goal = False
         self._goal_id = ""
@@ -121,6 +138,10 @@ class RosRobotAdapter(BaseRobotAdapter):
         self._voice_state = "IDLE"
         self._voice_transcript: Optional[str] = None
         self._voice_response: Optional[str] = None
+        self._voice_start_in_progress: bool = False
+        self._voice_proposal: Optional[Dict[str, Any]] = None
+        self._voice_requester_id: str = ""
+        self._voice_session_id: str = ""
         self._message = "Đang kết nối tới các topic ROS..."
 
         self._destinations_file = pathlib.Path(self._cfg.destinations_storage_path)
@@ -302,7 +323,7 @@ class RosRobotAdapter(BaseRobotAdapter):
         transcript_cfg = self._cfg.get_topic("voice_transcript")
         if transcript_cfg and transcript_cfg.enabled:
             self._sub_transcript = self._node.create_subscription(
-                String, transcript_cfg.name, lambda m: setattr(self, "_voice_transcript", m.data), 1
+                String, transcript_cfg.name, self._on_voice_transcript, 1
             )
         response_cfg = self._cfg.get_topic("voice_response")
         if response_cfg and response_cfg.enabled:
@@ -581,6 +602,53 @@ class RosRobotAdapter(BaseRobotAdapter):
         with self._lock:
             self._voice_state = msg.data
 
+    def _on_voice_transcript(self, msg: String):
+        with self._lock:
+            self._voice_transcript = msg.data
+            if getattr(self, "_voice_requester_id", ""):
+                match_res = match_destination_from_transcript(msg.data, self.get_destinations())
+                now_ms = int(time.time() * 1000)
+                if match_res["status"] == "MATCHED":
+                    dest = match_res["destination"]
+                    self._voice_proposal = {
+                        "proposal_id": str(uuid.uuid4()),
+                        "requester_id": self._voice_requester_id,
+                        "session_id": getattr(self, "_voice_session_id", ""),
+                        "status": "MATCHED",
+                        "destination_id": dest["id"],
+                        "destination_name": dest["name"],
+                        "transcript": msg.data,
+                        "created_at": now_ms,
+                        "expires_at": now_ms + 30000,
+                        "confirmed": False,
+                    }
+                elif match_res["status"] == "AMBIGUOUS":
+                    self._voice_proposal = {
+                        "proposal_id": str(uuid.uuid4()),
+                        "requester_id": self._voice_requester_id,
+                        "session_id": getattr(self, "_voice_session_id", ""),
+                        "status": "AMBIGUOUS",
+                        "destination_id": None,
+                        "destination_name": None,
+                        "transcript": msg.data,
+                        "created_at": now_ms,
+                        "expires_at": now_ms + 30000,
+                        "confirmed": False,
+                    }
+                else:
+                    self._voice_proposal = {
+                        "proposal_id": str(uuid.uuid4()),
+                        "requester_id": self._voice_requester_id,
+                        "session_id": getattr(self, "_voice_session_id", ""),
+                        "status": "NO_MATCH",
+                        "destination_id": None,
+                        "destination_name": None,
+                        "transcript": msg.data,
+                        "created_at": now_ms,
+                        "expires_at": now_ms + 30000,
+                        "confirmed": False,
+                    }
+
     def _on_alerts(self, msg: DiagnosticArray):
         with self._lock:
             self._alerts = [
@@ -714,6 +782,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 "voice_state": self._voice_state,
                 "voice_transcript": self._voice_transcript,
                 "voice_response": self._voice_response,
+                "voice_available": self.is_voice_available(),
                 "message": status_message,
                 "last_updated": int(now * 1000),
                 "frame_id": self._pose_frame_id,
@@ -724,6 +793,31 @@ class RosRobotAdapter(BaseRobotAdapter):
                 "last_clock_time": self._last_clock_monotonic,
                 "last_pose_time": self._last_pose_time,
                 "last_map_time": getattr(self, "_last_map_time", 0.0),
+                "manual_consumer_available": self.is_manual_consumer_available(),
+                "manual_operator_id": getattr(self, "_manual_operator_id", None),
+            }
+
+            reasons = []
+            if not is_conn:
+                reasons.append("Chưa kết nối với hệ thống ROS 2 hoặc robot đang offline.")
+            elif is_stale:
+                reasons.append("Dữ liệu ROS bị gián đoạn hoặc quá cũ (stale data).")
+            if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False):
+                reasons.append("Mô phỏng Gazebo đang tạm dừng (clock không tiến).")
+            if not self._pose:
+                reasons.append("Chưa có vị trí định vị robot từ AMCL (/amcl_pose).")
+            if not getattr(self, "_map_version", None) or not getattr(self, "_map_png", None):
+                reasons.append("Chưa nhận được bản đồ OccupancyGrid từ ROS (/map).")
+            if self._control_mode == "MANUAL":
+                reasons.append("Robot đang ở chế độ MANUAL (Cần chuyển sang AUTO).")
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
+                reasons.append(f"Robot đang có chuyến dẫn đường hoạt động ({self._navigation_state}).")
+            if getattr(self, "_nav2_has_active_goal", False) and not self._current_goal_handle:
+                reasons.append("Nav2 đang bận thực hiện mục tiêu ngoại vi (từ RViz hoặc phiên trước).")
+
+            result["readiness"] = {
+                "ready": len(reasons) == 0,
+                "reasons": reasons
             }
 
             # Thông tin bổ sung cho sim profile
@@ -1202,6 +1296,10 @@ class RosRobotAdapter(BaseRobotAdapter):
             else:
                 self._navigation_state = "NAVIGATING"
                 self._message = f"Nav2 đang tiếp tục dẫn đường tới: {dest_name}." if is_resume else f"Nav2 đang dẫn đường tới: {dest_name}."
+                if is_resume:
+                    event_logger.add_event("INFO", "NAVIGATION", f"Tiếp tục chuyến dẫn đường tới điểm: {dest_name}")
+                else:
+                    event_logger.add_event("INFO", "NAVIGATION", f"Bắt đầu chuyến dẫn đường tới điểm: {dest_name}")
 
             # Đăng ký nhận kết quả hoàn thành (Result callback)
             result_future = goal_handle.get_result_async()
@@ -1260,6 +1358,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 self._navigation_state = "SUCCEEDED"
                 self._message = f"Đã dẫn đường đến '{dest_name}' thành công!"
                 logger.info(f"Trip {trip_id} (Goal {req_id}) SUCCEEDED!")
+                event_logger.add_event("SUCCESS", "NAVIGATION", f"Robot đã đến điểm đích thành công: {dest_name}")
                 self._has_goal = False
                 self._current_goal_handle = None
                 self._current_target_pose = None
@@ -1279,6 +1378,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                     self._navigation_state = "PAUSED"
                     self._message = f"Chuyến dẫn đường tới '{dest_name}' đã tạm dừng. Sẵn sàng tiếp tục khi có lệnh."
                     logger.info(f"Trip {trip_id} (Goal {req_id}) PAUSED successfully!")
+                    event_logger.add_event("WARN", "NAVIGATION", f"Chuyến dẫn đường tới '{dest_name}' đã tạm dừng an toàn")
                     self._has_goal = False
                     self._current_goal_handle = None
                     # Giữ nguyên self._owner_id, self._trip_id, self._destination_id, self._current_target_pose cho Resume
@@ -1291,6 +1391,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                     self._navigation_state = "CANCELED"
                     self._message = f"Chuyến dẫn đường tới '{dest_name}' đã được hủy."
                     logger.info(f"Trip {trip_id} (Goal {req_id}) CANCELED!")
+                    event_logger.add_event("WARN", "NAVIGATION", f"Chuyến dẫn đường tới '{dest_name}' đã bị hủy")
                     self._has_goal = False
                     self._current_goal_handle = None
                     self._current_target_pose = None
@@ -1310,6 +1411,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 err_code = getattr(result_obj, "error_code", 0)
                 self._message = f"Dẫn đường thất bại (mã {err_code}): {err_msg or 'Nav2 không thể đến đích'}."
                 logger.warning(f"Trip {trip_id} (Goal {req_id}) FAILED with status {status}, code {err_code}: {err_msg}")
+                event_logger.add_event("ERROR", "NAVIGATION", f"Chuyến dẫn đường tới '{dest_name}' thất bại")
                 self._has_goal = False
                 self._current_goal_handle = None
                 self._current_target_pose = None
@@ -1621,47 +1723,257 @@ class RosRobotAdapter(BaseRobotAdapter):
             except Exception as e:
                 logger.error(f"Lỗi trong _on_cancel_response: {e}")
 
-    def start_voice_session(self) -> Dict[str, Any]:
-        if not hasattr(self, "_cli_voice_start") or not self._cli_voice_start:
-            return {"success": False, "message": "Service trigger giọng nói chưa được cấu hình."}
-
-        if not self._cli_voice_start.wait_for_service(timeout_sec=2.0):
-            return {"success": False, "message": "ROS Service /airport/voice/start không phản hồi."}
-
-        req = Trigger.Request()
-        future = self._cli_voice_start.call_async(req)
-        return {"success": True, "message": "Đã gửi tín hiệu kích hoạt microphone tới ROS."}
-
-    def set_manual_control(self, enable: bool) -> Dict[str, Any]:
-        if not hasattr(self, "_cli_set_manual") or not self._cli_set_manual:
-            return {"success": False, "message": "Service chuyển chế độ thủ công chưa được cấu hình."}
-
-        if not self._cli_set_manual.wait_for_service(timeout_sec=2.0):
-            return {"success": False, "message": "ROS Service /airport/control/set_manual không phản hồi."}
-
-        req = SetBool.Request()
-        req.data = enable
-        self._cli_set_manual.call_async(req)
-        return {"success": True, "message": f"Đã gửi yêu cầu chuyển sang chế độ {'MANUAL' if enable else 'AUTO'}."}
-
-    def send_manual_velocity(self, linear_x: float, angular_z: float) -> bool:
-        if not self._pub_cmd_vel:
+    def is_voice_available(self) -> bool:
+        """Kiểm tra xem ROS Service /airport/voice/start đã sẵn sàng hay chưa"""
+        if not hasattr(self, "_cli_voice_start") or self._cli_voice_start is None:
+            return False
+        try:
+            return bool(self._cli_voice_start.service_is_ready())
+        except Exception:
             return False
 
-        limits = self._cfg.velocity_limits
-        lin_max = limits.get("linear_max", 0.3)
-        ang_max = limits.get("angular_max", 0.5)
+    def get_voice_proposal(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if not getattr(self, "_voice_proposal", None):
+                return None
+            now_ms = int(time.time() * 1000)
+            if now_ms > self._voice_proposal.get("expires_at", 0):
+                self._voice_proposal = None
+                return None
+            return dict(self._voice_proposal)
 
-        linear_x = max(-lin_max, min(lin_max, linear_x))
-        angular_z = max(-ang_max, min(ang_max, angular_z))
+    def clear_voice_proposal(self) -> None:
+        with self._lock:
+            self._voice_proposal = None
 
-        msg = TwistStamped()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.header.frame_id = self._cfg.frames.get("base_link", "base_link")
-        msg.twist.linear.x = float(linear_x)
-        msg.twist.angular.z = float(angular_z)
-        self._pub_cmd_vel.publish(msg)
-        return True
+    def start_voice_session(self, requester_id: str = "") -> Dict[str, Any]:
+        """
+        Kích hoạt microphone trên phần cứng robot thông qua ROS Service Trigger /airport/voice/start.
+        Có in-flight debounce, non-blocking check, timeout an toàn và liên kết phiên hành khách.
+        """
+        with self._lock:
+            if getattr(self, "_voice_start_in_progress", False):
+                return {
+                    "success": False,
+                    "message": "Yêu cầu kích hoạt microphone đang được xử lý, vui lòng chờ."
+                }
+
+            if not hasattr(self, "_cli_voice_start") or not self._cli_voice_start:
+                return {
+                    "success": False,
+                    "message": "Service trigger giọng nói chưa được cấu hình."
+                }
+
+            if not self._cli_voice_start.service_is_ready():
+                return {
+                    "success": False,
+                    "message": "ROS Service /airport/voice/start chưa sẵn sàng (node giọng nói chưa khởi chạy)."
+                }
+
+            self._voice_start_in_progress = True
+            self._voice_requester_id = requester_id
+            self._voice_session_id = str(uuid.uuid4())
+            self._voice_proposal = None
+
+        timeout_sec = 3.0
+        voice_srv_cfg = self._cfg.get_service("voice_start")
+        if voice_srv_cfg and hasattr(voice_srv_cfg, "timeout_sec") and voice_srv_cfg.timeout_sec:
+            try:
+                timeout_sec = float(voice_srv_cfg.timeout_sec)
+            except (ValueError, TypeError):
+                timeout_sec = 3.0
+
+        req = Trigger.Request()
+        event = threading.Event()
+        res_container: Dict[str, Any] = {}
+
+        def _on_done(fut):
+            try:
+                res_container["resp"] = fut.result()
+            except Exception as ex:
+                res_container["error"] = ex
+            finally:
+                event.set()
+
+        try:
+            future = self._cli_voice_start.call_async(req)
+            future.add_done_callback(_on_done)
+            finished = event.wait(timeout=timeout_sec)
+            if not finished:
+                logger.warning(f"Timeout ({timeout_sec}s) khi chờ phản hồi từ /airport/voice/start")
+                return {
+                    "success": False,
+                    "message": f"Hết thời gian chờ phản hồi từ ROS Service /airport/voice/start (timeout {timeout_sec}s)."
+                }
+            if "error" in res_container:
+                logger.error(f"Lỗi khi gọi ROS Service /airport/voice/start: {res_container['error']}")
+                return {
+                    "success": False,
+                    "message": f"Lỗi khi gọi service giọng nói ROS: {res_container['error']}"
+                }
+            resp = res_container.get("resp")
+            if resp is None or not getattr(resp, "success", False):
+                err_msg = getattr(resp, "message", "") or "ROS từ chối kích hoạt microphone."
+                return {"success": False, "message": err_msg}
+
+            return {
+                "success": True,
+                "message": getattr(resp, "message", "") or "Đã kích hoạt microphone trên robot thành công."
+            }
+        except Exception as e:
+            logger.error(f"Lỗi không xác định khi gọi /airport/voice/start: {e}")
+            return {"success": False, "message": f"Không thể gửi yêu cầu tới ROS: {e}"}
+        finally:
+            with self._lock:
+                self._voice_start_in_progress = False
+
+    def is_manual_consumer_available(self) -> bool:
+        if hasattr(self, "_pub_cmd_vel") and self._pub_cmd_vel:
+            try:
+                return self._pub_cmd_vel.get_subscription_count() > 0
+            except Exception:
+                return False
+        return False
+
+    def _publish_zero_velocity(self) -> None:
+        if hasattr(self, "_pub_cmd_vel") and self._pub_cmd_vel:
+            try:
+                msg = TwistStamped()
+                msg.header.stamp = self._node.get_clock().now().to_msg()
+                frame = self._cfg.frames.get("base_link", "base_link") if hasattr(self, "_cfg") and hasattr(self._cfg, "frames") else "base_link"
+                msg.header.frame_id = frame
+                msg.twist.linear.x = 0.0
+                msg.twist.angular.z = 0.0
+                self._pub_cmd_vel.publish(msg)
+            except Exception as e:
+                logger.error(f"Lỗi khi gửi vận tốc zero: {e}")
+
+    def check_manual_timeout(self) -> None:
+        with self._lock:
+            if getattr(self, "_control_mode", "AUTO") != "MANUAL":
+                return
+            current_twist = getattr(self, "_current_manual_twist", (0.0, 0.0))
+            if current_twist != (0.0, 0.0):
+                timeout_sec = 0.5
+                if hasattr(self, "_cfg") and hasattr(self._cfg, "velocity_limits"):
+                    timeout_sec = self._cfg.velocity_limits.get("cmd_timeout_sec", 0.5)
+                now = time.monotonic()
+                last_time = getattr(self, "_last_manual_cmd_time", 0.0)
+                if (now - last_time) >= timeout_sec:
+                    op_id = getattr(self, "_manual_operator_id", None) or "Admin"
+                    logger.warning(
+                        f"Watchdog timeout ({timeout_sec}s): Không nhận được lệnh điều khiển tay từ {op_id}. Dừng robot an toàn."
+                    )
+                    self._publish_zero_velocity()
+                    self._current_manual_twist = (0.0, 0.0)
+
+    def set_manual_control(self, enable: bool, operator_id: str = "") -> Dict[str, Any]:
+        with self._lock:
+            if enable:
+                # 1. Kiểm tra kết nối robot và clock stalled
+                has_pose = bool(getattr(self, "_pose", None) is not None)
+                clock_stalled = getattr(self, "_clock_stalled", False) if (hasattr(self, "_cfg") and self._cfg and self._cfg.use_sim_time) else False
+                if not has_pose or clock_stalled:
+                    return {
+                        "success": False,
+                        "message": "Không thể chuyển sang MANUAL: Robot chưa kết nối hoặc mô phỏng tạm dừng."
+                    }
+
+                # 2. Kiểm tra chuyến dẫn đường đang chạy hoặc tạm dừng
+                nav_state = getattr(self, "_navigation_state", "IDLE")
+                if nav_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") or getattr(self, "_has_goal", False):
+                    return {
+                        "success": False,
+                        "message": f"Không thể chuyển sang MANUAL: Đang có chuyến dẫn đường ({nav_state}). Hãy hoàn thành hoặc hủy chuyến trước."
+                    }
+
+                # 3. Kiểm tra mục tiêu ngoài từ Nav2
+                if getattr(self, "_nav2_has_active_goal", False):
+                    return {
+                        "success": False,
+                        "message": "Không thể chuyển sang MANUAL: Nav2 đang có mục tiêu điều hướng đang chạy từ nguồn ngoài."
+                    }
+
+                # 4. Kiểm tra quyền phiên Admin (Single Admin control)
+                current_op = getattr(self, "_manual_operator_id", None)
+                if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id:
+                    return {
+                        "success": False,
+                        "message": f"Quyền điều khiển thủ công đang thuộc về Admin khác ({current_op})."
+                    }
+
+                self._control_mode = "MANUAL"
+                self._manual_operator_id = operator_id
+                self._last_manual_cmd_time = time.monotonic()
+                self._current_manual_twist = (0.0, 0.0)
+                self._message = f"Chế độ điều khiển thủ công (MANUAL) được kích hoạt bởi {operator_id or 'Admin'}."
+
+                # Gọi ROS service nếu có và đã sẵn sàng (không block nếu chưa có server trong Gazebo)
+                if hasattr(self, "_cli_set_manual") and self._cli_set_manual:
+                    try:
+                        if self._cli_set_manual.service_is_ready():
+                            req = SetBool.Request()
+                            req.data = True
+                            self._cli_set_manual.call_async(req)
+                    except Exception as e:
+                        logger.warning(f"Không thể gọi service /airport/control/set_manual: {e}")
+
+                event_logger.track_control_mode("MANUAL")
+                return {"success": True, "message": "Đã chuyển sang chế độ điều khiển thủ công (MANUAL)."}
+            else:
+                self._control_mode = "AUTO"
+                self._manual_operator_id = None
+                self._publish_zero_velocity()
+                self._current_manual_twist = (0.0, 0.0)
+                self._last_manual_cmd_time = 0.0
+                self._message = "Chế độ tự động (AUTO) sẵn sàng."
+
+                if hasattr(self, "_cli_set_manual") and self._cli_set_manual:
+                    try:
+                        if self._cli_set_manual.service_is_ready():
+                            req = SetBool.Request()
+                            req.data = False
+                            self._cli_set_manual.call_async(req)
+                    except Exception as e:
+                        logger.warning(f"Không thể gọi service /airport/control/set_manual: {e}")
+
+                event_logger.track_control_mode("AUTO")
+                return {"success": True, "message": "Đã chuyển về chế độ tự động (AUTO)."}
+
+    def send_manual_velocity(self, linear_x: float, angular_z: float, operator_id: str = "") -> Dict[str, Any]:
+        with self._lock:
+            if getattr(self, "_control_mode", "AUTO") != "MANUAL":
+                return {"success": False, "message": "Robot không ở chế độ điều khiển thủ công (MANUAL)."}
+
+            current_op = getattr(self, "_manual_operator_id", None)
+            if current_op and operator_id and current_op != operator_id:
+                return {"success": False, "message": f"Quyền điều khiển đang thuộc về Admin khác ({current_op})."}
+
+            if not hasattr(self, "_pub_cmd_vel") or not self._pub_cmd_vel:
+                return {"success": False, "message": "Topic vận tốc chưa được khởi tạo."}
+
+            limits = self._cfg.velocity_limits if hasattr(self, "_cfg") and hasattr(self._cfg, "velocity_limits") else {}
+            lin_max = limits.get("linear_max", 0.3)
+            ang_max = limits.get("angular_max", 0.5)
+
+            clamped_x = max(-lin_max, min(lin_max, float(linear_x)))
+            clamped_z = max(-ang_max, min(ang_max, float(angular_z)))
+
+            try:
+                msg = TwistStamped()
+                msg.header.stamp = self._node.get_clock().now().to_msg()
+                frame = self._cfg.frames.get("base_link", "base_link") if hasattr(self, "_cfg") and hasattr(self._cfg, "frames") else "base_link"
+                msg.header.frame_id = frame
+                msg.twist.linear.x = float(clamped_x)
+                msg.twist.angular.z = float(clamped_z)
+                self._pub_cmd_vel.publish(msg)
+            except Exception as e:
+                logger.error(f"Lỗi publish cmd_vel_manual: {e}")
+                return {"success": False, "message": f"Lỗi publish lệnh vận tốc: {e}"}
+
+            self._last_manual_cmd_time = time.monotonic()
+            self._current_manual_twist = (clamped_x, clamped_z)
+            return {"success": True, "message": "Đã gửi lệnh vận tốc thành công."}
 
     def get_alerts(self) -> List[Dict[str, Any]]:
         with self._lock:

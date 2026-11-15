@@ -66,17 +66,32 @@ class BaseRobotAdapter(ABC):
         pass
 
     @abstractmethod
-    def start_voice_session(self) -> Dict[str, Any]:
-        """Gọi service Trigger /airport/voice/start trên robot"""
+    def start_voice_session(self, requester_id: str = "") -> Dict[str, Any]:
+        """Gọi service Trigger /airport/voice/start trên robot và liên kết phiên hành khách"""
         pass
 
     @abstractmethod
-    def set_manual_control(self, enable: bool) -> Dict[str, Any]:
+    def is_voice_available(self) -> bool:
+        """Kiểm tra xem node giọng nói (service trigger / topic) có sẵn sàng phục vụ hay không"""
+        pass
+
+    @abstractmethod
+    def get_voice_proposal(self) -> Optional[Dict[str, Any]]:
+        """Lấy đề xuất điểm đến nhận dạng được từ giọng nói hiện tại (nếu có)"""
+        pass
+
+    @abstractmethod
+    def clear_voice_proposal(self) -> None:
+        """Xóa đề xuất điểm đến giọng nói sau khi xác nhận, bỏ qua hoặc hết hạn"""
+        pass
+
+    @abstractmethod
+    def set_manual_control(self, enable: bool, operator_id: str = "") -> Dict[str, Any]:
         """Gọi service SetBool /airport/control/set_manual"""
         pass
 
     @abstractmethod
-    def send_manual_velocity(self, linear_x: float, angular_z: float) -> bool:
+    def send_manual_velocity(self, linear_x: float, angular_z: float, operator_id: str = "") -> Dict[str, Any]:
         """Gửi lệnh vận tốc TwistStamped vào /airport/cmd_vel_manual"""
         pass
 
@@ -108,6 +123,21 @@ class BaseRobotAdapter(ABC):
     def get_map_image(self, version: str) -> Optional[bytes]:
         """Lấy dữ liệu bytes PNG của đúng phiên bản bản đồ được yêu cầu"""
         pass
+
+    def get_operational_events(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Lấy danh sách nhật ký sự kiện vận hành gần nhất (dành riêng cho Admin)"""
+        from ..services.event_logger import event_logger
+        return event_logger.get_events(limit=limit)
+
+    def get_events_version(self) -> int:
+        """Trả về phiên bản của bộ đệm sự kiện vận hành"""
+        from ..services.event_logger import event_logger
+        return event_logger.version
+
+    def get_events_started_at(self) -> int:
+        """Trả về thời điểm bắt đầu ghi nhận sự kiện (ms timestamp)"""
+        from ..services.event_logger import event_logger
+        return event_logger.started_at
 
     @abstractmethod
     def dispose(self) -> None:

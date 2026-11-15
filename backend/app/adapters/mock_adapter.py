@@ -3,16 +3,21 @@ import math
 import uuid
 import os
 import threading
+import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 import yaml
 
 from .base import BaseRobotAdapter
 from ..ros_config import get_ros_config
+from ..services.voice_matcher import match_destination_from_transcript
+from ..services.event_logger import event_logger
+
+logger = logging.getLogger("mock_adapter")
 
 class MockRobotAdapter(BaseRobotAdapter):
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._ros_config = get_ros_config()
         self._destinations_file = Path(self._ros_config.destinations_storage_path)
         self._destinations_seed_file = Path(self._ros_config.destinations_seed_path)
@@ -25,6 +30,10 @@ class MockRobotAdapter(BaseRobotAdapter):
         self._is_connected = True
         self._is_data_stale = False
         self._control_mode = "AUTO"  # AUTO | MANUAL | TRANSITION | FAULT
+        self._manual_operator_id: Optional[str] = None
+        self._current_manual_twist = (0.0, 0.0)
+        self._last_manual_cmd_time: float = 0.0
+        self._manual_consumer_available: bool = True
         self._navigation_state = "IDLE"  # IDLE, ACCEPTED, NAVIGATING, PAUSING, PAUSED, CANCELING, SUCCEEDED, CANCELED, FAILED
         self._has_goal = False
         self._goal_id = ""
@@ -41,6 +50,12 @@ class MockRobotAdapter(BaseRobotAdapter):
         self._voice_state = "IDLE"  # IDLE | LISTENING | PROCESSING | SPEAKING | ERROR
         self._voice_transcript: Optional[str] = None
         self._voice_response: Optional[str] = None
+        self._voice_available: bool = True
+        self._voice_start_in_progress: bool = False
+        self._voice_proposal: Optional[Dict[str, Any]] = None
+        self._voice_requester_id: str = ""
+        self._voice_session_id: str = ""
+        self._mock_custom_transcript: Optional[str] = None
 
         # Alerts chẩn đoán
         self._alerts: List[Dict[str, Any]] = [
@@ -62,6 +77,8 @@ class MockRobotAdapter(BaseRobotAdapter):
         self._running = True
         self._timer_thread = threading.Thread(target=self._background_loop, daemon=True)
         self._timer_thread.start()
+        event_logger.add_event("INFO", "SYSTEM", "Hệ thống Mock Adapter đã khởi tạo")
+        event_logger.track_connection(True)
 
     def _load_destinations(self) -> List[Dict[str, Any]]:
         # 1. Thử đọc từ tệp lưu trữ bền vững (nếu tệp đã tồn tại)
@@ -135,12 +152,15 @@ class MockRobotAdapter(BaseRobotAdapter):
 
                     if dist < 0.2:
                         # Đã đến đích thành công
+                        dest = next((d for d in self._destinations if d.get("id") == self._destination_id), None)
+                        dest_name = dest.get("name", self._destination_id) if dest else self._destination_id
                         self._navigation_state = "SUCCEEDED"
-                        self._message = "Đã dẫn đường đến đích thành công"
+                        self._message = f"Đã dẫn đường đến '{dest_name}' thành công"
                         self._has_goal = False
                         self._path = []
                         self._path_version += 1
                         self._owner_id = ""
+                        event_logger.add_event("SUCCESS", "NAVIGATION", f"Robot đã đến điểm đích: {dest_name}")
                     else:
                         speed = 0.05  # m / tick (0.5 m/s)
                         nx = dx / dist
@@ -159,6 +179,23 @@ class MockRobotAdapter(BaseRobotAdapter):
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
+            reasons = []
+            if not self._is_connected:
+                reasons.append("Chưa kết nối với hệ thống hoặc robot đang offline.")
+            elif self._is_data_stale:
+                reasons.append("Dữ liệu vị trí robot bị gián đoạn (stale data).")
+            if not self._pose:
+                reasons.append("Chưa có vị trí định vị của robot.")
+            if self._control_mode == "MANUAL":
+                reasons.append("Robot đang ở chế độ MANUAL (Cần chuyển sang AUTO).")
+            if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
+                reasons.append(f"Robot đang có chuyến dẫn đường hoạt động ({self._navigation_state}).")
+
+            readiness = {
+                "ready": len(reasons) == 0,
+                "reasons": reasons
+            }
+
             return {
                 "pose": dict(self._pose),
                 "battery_percent": self._battery,
@@ -174,8 +211,12 @@ class MockRobotAdapter(BaseRobotAdapter):
                 "voice_state": self._voice_state,
                 "voice_transcript": self._voice_transcript,
                 "voice_response": self._voice_response,
+                "voice_available": getattr(self, "_voice_available", True),
                 "message": self._message,
                 "destinations_version": self._destinations_version,
+                "manual_consumer_available": getattr(self, "_manual_consumer_available", True),
+                "manual_operator_id": getattr(self, "_manual_operator_id", None),
+                "readiness": readiness,
                 "last_updated": self._last_updated
             }
 
@@ -269,6 +310,8 @@ class MockRobotAdapter(BaseRobotAdapter):
             self._has_goal = True
             self._navigation_state = "NAVIGATING"
             self._message = f"Đang dẫn đường tới: {dest.get('name')}"
+            dest_name = dest.get('name', destination_id)
+            event_logger.add_event("INFO", "NAVIGATION", f"Bắt đầu chuyến dẫn đường tới điểm: {dest_name}")
             return {"success": True, "goal_id": self._goal_id, "trip_id": self._trip_id, "message": self._message}
 
     def pause_navigation(self) -> Dict[str, Any]:
@@ -287,10 +330,13 @@ class MockRobotAdapter(BaseRobotAdapter):
             self._path = []
             self._path_version += 1
             self._message = f"Chuyến dẫn đường tới '{dest_name}' đã tạm dừng. Sẵn sàng tiếp tục khi có lệnh."
+            event_logger.add_event("WARN", "NAVIGATION", f"Tạm dừng chuyến dẫn đường tới {dest_name}")
             return {"success": True, "message": "Đã tạm dừng chuyến dẫn đường thành công."}
 
     def resume_navigation(self) -> Dict[str, Any]:
         with self._lock:
+            if getattr(self, "_control_mode", "AUTO") == "MANUAL":
+                return {"success": False, "message": "Robot đang ở chế độ điều khiển thủ công (MANUAL). Hãy chuyển sang AUTO trước khi tiếp tục."}
             if self._navigation_state in ("NAVIGATING", "ACCEPTED", "PENDING"):
                 return {"success": False, "message": "Robot đang trong quá trình dẫn đường, không cần tiếp tục."}
             if self._navigation_state == "PAUSING":
@@ -307,6 +353,7 @@ class MockRobotAdapter(BaseRobotAdapter):
             self._goal_id = uuid.uuid4().hex
             dest_name = dest.get("name", self._destination_id)
             self._message = f"Đang tiếp tục dẫn đường tới: {dest_name}"
+            event_logger.add_event("INFO", "NAVIGATION", f"Tiếp tục chuyến dẫn đường tới điểm: {dest_name}")
             return {"success": True, "message": self._message}
 
     def cancel_navigation(self, owner_id: str, is_admin: bool = False) -> Dict[str, Any]:
@@ -327,6 +374,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                 self._destination_id = ""
                 self._goal_pose = None
                 self._message = f"Chuyến dẫn đường tới '{dest_name}' đã được hủy."
+                event_logger.add_event("WARN", "NAVIGATION", f"Chuyến dẫn đường tới '{dest_name}' đã bị hủy")
                 return {"success": True, "message": f"Chuyến dẫn đường tới '{dest_name}' đã được hủy thành công."}
 
             if self._navigation_state not in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING"):
@@ -349,74 +397,223 @@ class MockRobotAdapter(BaseRobotAdapter):
                     self._trip_id = ""
                     self._destination_id = ""
                     self._goal_pose = None
+                    event_logger.add_event("WARN", "NAVIGATION", "Chuyến dẫn đường đã bị hủy")
                     self._message = "Chuyến dẫn đường đã bị hủy"
 
             threading.Thread(target=_finish_cancel, daemon=True).start()
             return {"success": True, "message": "Yêu cầu hủy chuyến đã được tiếp nhận"}
 
-    def start_voice_session(self) -> Dict[str, Any]:
-        with self._lock:
-            if self._voice_state in ("LISTENING", "PROCESSING", "SPEAKING"):
-                return {"success": False, "message": "Hệ thống giọng nói đang bận xử lý lượt trước."}
+    def is_voice_available(self) -> bool:
+        return getattr(self, "_voice_available", True)
 
+    def set_voice_available(self, available: bool) -> None:
+        """Hỗ trợ kiểm thử trạng thái sẵn sàng của giọng nói"""
+        with self._lock:
+            self._voice_available = bool(available)
+
+    def set_mock_transcript(self, transcript: Optional[str]) -> None:
+        """Hỗ trợ kiểm thử các tình huống nhận dạng giọng nói khác nhau (khớp, không khớp, mập mờ)"""
+        with self._lock:
+            self._mock_custom_transcript = transcript
+
+    def get_voice_proposal(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if not self._voice_proposal:
+                return None
+            now_ms = int(time.time() * 1000)
+            if now_ms > self._voice_proposal.get("expires_at", 0):
+                self._voice_proposal = None
+                return None
+            return dict(self._voice_proposal)
+
+    def clear_voice_proposal(self) -> None:
+        with self._lock:
+            self._voice_proposal = None
+
+    def start_voice_session(self, requester_id: str = "") -> Dict[str, Any]:
+        with self._lock:
+            if not getattr(self, "_voice_available", True):
+                return {
+                    "success": False,
+                    "message": "ROS Service /airport/voice/start chưa sẵn sàng (node giọng nói chưa khởi chạy)."
+                }
+            if getattr(self, "_voice_start_in_progress", False):
+                return {
+                    "success": False,
+                    "message": "Yêu cầu kích hoạt microphone đang được xử lý, vui lòng chờ."
+                }
+            if self._voice_state in ("LISTENING", "PROCESSING", "SPEAKING"):
+                return {
+                    "success": False,
+                    "message": "Hệ thống giọng nói đang bận xử lý lượt trước."
+                }
+
+            self._voice_start_in_progress = True
             self._voice_state = "LISTENING"
             self._voice_transcript = None
             self._voice_response = None
+            self._voice_proposal = None
+            self._voice_requester_id = requester_id
+            self._voice_session_id = str(uuid.uuid4())
 
             def _voice_flow():
-                # Thu âm trong 2.5s
-                time.sleep(2.5)
-                with self._lock:
-                    self._voice_state = "PROCESSING"
-                    self._voice_transcript = "Hãy dẫn tôi đến Cổng số 1"
-                
-                # Xử lý 1.5s
-                time.sleep(1.5)
-                with self._lock:
-                    self._voice_state = "SPEAKING"
-                    self._voice_response = "Vâng, xin mời bạn đi theo tôi tới Cổng khởi hành số 1."
-                
-                # Nói trong 2.5s
-                time.sleep(2.5)
-                with self._lock:
-                    self._voice_state = "IDLE"
+                try:
+                    # Thu âm trong 1.5s
+                    time.sleep(1.5)
+                    with self._lock:
+                        self._voice_state = "PROCESSING"
+                        transcript = self._mock_custom_transcript or "Hãy dẫn tôi đến Cổng khởi hành số 1"
+                        self._voice_transcript = transcript
+
+                        # Đối chiếu điểm đến từ transcript
+                        dests = self.get_destinations()
+                        match_res = match_destination_from_transcript(transcript, dests)
+                        now_ms = int(time.time() * 1000)
+
+                        if match_res["status"] == "MATCHED":
+                            dest = match_res["destination"]
+                            self._voice_proposal = {
+                                "proposal_id": str(uuid.uuid4()),
+                                "requester_id": self._voice_requester_id,
+                                "session_id": self._voice_session_id,
+                                "status": "MATCHED",
+                                "destination_id": dest["id"],
+                                "destination_name": dest["name"],
+                                "transcript": transcript,
+                                "created_at": now_ms,
+                                "expires_at": now_ms + 30000,
+                                "confirmed": False,
+                            }
+                            response_text = f"Tôi đã nhận diện được điểm đến: {dest['name']}. Vui lòng xác nhận trên màn hình để tôi dẫn đường."
+                        elif match_res["status"] == "AMBIGUOUS":
+                            self._voice_proposal = {
+                                "proposal_id": str(uuid.uuid4()),
+                                "requester_id": self._voice_requester_id,
+                                "session_id": self._voice_session_id,
+                                "status": "AMBIGUOUS",
+                                "destination_id": None,
+                                "destination_name": None,
+                                "transcript": transcript,
+                                "created_at": now_ms,
+                                "expires_at": now_ms + 30000,
+                                "confirmed": False,
+                            }
+                            response_text = "Tôi tìm thấy nhiều điểm đến trùng khớp. Xin vui lòng chọn trực tiếp trên danh sách."
+                        else:
+                            self._voice_proposal = {
+                                "proposal_id": str(uuid.uuid4()),
+                                "requester_id": self._voice_requester_id,
+                                "session_id": self._voice_session_id,
+                                "status": "NO_MATCH",
+                                "destination_id": None,
+                                "destination_name": None,
+                                "transcript": transcript,
+                                "created_at": now_ms,
+                                "expires_at": now_ms + 30000,
+                                "confirmed": False,
+                            }
+                            response_text = "Xin lỗi, tôi chưa tìm thấy điểm đến này trong sân bay. Vui lòng chọn từ danh sách."
+
+                    # Xử lý 1.0s
+                    time.sleep(1.0)
+                    with self._lock:
+                        self._voice_state = "SPEAKING"
+                        self._voice_response = response_text
+
+                    # Nói trong 1.5s
+                    time.sleep(1.5)
+                    with self._lock:
+                        self._voice_state = "IDLE"
+                finally:
+                    with self._lock:
+                        self._voice_start_in_progress = False
 
             threading.Thread(target=_voice_flow, daemon=True).start()
             return {"success": True, "message": "Đã kích hoạt microphone robot thành công"}
 
-    def set_manual_control(self, enable: bool) -> Dict[str, Any]:
+    def is_manual_consumer_available(self) -> bool:
+        return getattr(self, "_manual_consumer_available", True)
+
+    def _publish_zero_velocity(self) -> None:
+        self._current_manual_twist = (0.0, 0.0)
+
+    def check_manual_timeout(self) -> None:
+        with self._lock:
+            if getattr(self, "_control_mode", "AUTO") != "MANUAL":
+                return
+            current_twist = getattr(self, "_current_manual_twist", (0.0, 0.0))
+            if current_twist != (0.0, 0.0):
+                timeout_sec = 0.5
+                if hasattr(self, "_ros_config") and hasattr(self._ros_config, "velocity_limits"):
+                    timeout_sec = self._ros_config.velocity_limits.get("cmd_timeout_sec", 0.5)
+                now = time.monotonic()
+                last_time = getattr(self, "_last_manual_cmd_time", 0.0)
+                if (now - last_time) >= timeout_sec:
+                    op_id = getattr(self, "_manual_operator_id", None) or "Admin"
+                    logger.warning(
+                        f"Watchdog timeout ({timeout_sec}s): Không nhận được lệnh điều khiển tay từ {op_id}. Dừng robot an toàn."
+                    )
+                    self._publish_zero_velocity()
+                    self._current_manual_twist = (0.0, 0.0)
+
+    def set_manual_control(self, enable: bool, operator_id: str = "") -> Dict[str, Any]:
         with self._lock:
             if enable:
-                if self._navigation_state == "NAVIGATING":
-                    self._navigation_state = "CANCELED"
-                    self._has_goal = False
-                    self._path = []
+                if not getattr(self, "_is_connected", True):
+                    return {"success": False, "message": "Không thể chuyển sang MANUAL: Robot chưa kết nối."}
+                nav_state = getattr(self, "_navigation_state", "IDLE")
+                if nav_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") or getattr(self, "_has_goal", False):
+                    return {
+                        "success": False,
+                        "message": f"Không thể chuyển sang MANUAL: Đang có chuyến dẫn đường ({nav_state}). Hãy hoàn thành hoặc hủy chuyến trước."
+                    }
+                current_op = getattr(self, "_manual_operator_id", None)
+                if getattr(self, "_control_mode", "AUTO") == "MANUAL" and current_op and operator_id and current_op != operator_id:
+                    return {
+                        "success": False,
+                        "message": f"Quyền điều khiển thủ công đang thuộc về Admin khác ({current_op})."
+                    }
                 self._control_mode = "MANUAL"
-                self._message = "Chế độ điều khiển thủ công (MANUAL) được kích hoạt"
+                self._manual_operator_id = operator_id
+                self._last_manual_cmd_time = time.monotonic()
+                self._current_manual_twist = (0.0, 0.0)
+                self._message = f"Chế độ điều khiển thủ công (MANUAL) được kích hoạt bởi {operator_id or 'Admin'}."
+                event_logger.track_control_mode("MANUAL")
                 return {"success": True, "message": "Đã chuyển sang MANUAL"}
             else:
                 self._control_mode = "AUTO"
+                self._manual_operator_id = None
+                self._publish_zero_velocity()
+                self._current_manual_twist = (0.0, 0.0)
+                self._last_manual_cmd_time = 0.0
                 self._message = "Chế độ tự động (AUTO) sẵn sàng"
+                event_logger.track_control_mode("AUTO")
                 return {"success": True, "message": "Đã chuyển sang AUTO"}
 
-    def send_manual_velocity(self, linear_x: float, angular_z: float) -> bool:
+    def send_manual_velocity(self, linear_x: float, angular_z: float, operator_id: str = "") -> Dict[str, Any]:
         with self._lock:
-            if self._control_mode != "MANUAL":
-                return False
-            
-            limits = self._ros_config.velocity_limits
+            if getattr(self, "_control_mode", "AUTO") != "MANUAL":
+                return {"success": False, "message": "Robot không ở chế độ điều khiển thủ công (MANUAL)."}
+
+            current_op = getattr(self, "_manual_operator_id", None)
+            if current_op and operator_id and current_op != operator_id:
+                return {"success": False, "message": f"Quyền điều khiển đang thuộc về Admin khác ({current_op})."}
+
+            limits = self._ros_config.velocity_limits if hasattr(self, "_ros_config") and hasattr(self._ros_config, "velocity_limits") else {}
             lin_max = limits.get("linear_max", 0.3)
             ang_max = limits.get("angular_max", 0.5)
 
-            # Clamp vận tốc
-            linear_x = max(-lin_max, min(lin_max, linear_x))
-            angular_z = max(-ang_max, min(ang_max, angular_z))
+            clamped_x = max(-lin_max, min(lin_max, float(linear_x)))
+            clamped_z = max(-ang_max, min(ang_max, float(angular_z)))
 
             dt = 0.1
-            self._pose["theta"] += angular_z * dt
-            self._pose["x"] += linear_x * math.cos(self._pose["theta"]) * dt
-            self._pose["y"] += linear_x * math.sin(self._pose["theta"]) * dt
-            return True
+            self._pose["theta"] += clamped_z * dt
+            self._pose["x"] += clamped_x * math.cos(self._pose["theta"]) * dt
+            self._pose["y"] += clamped_x * math.sin(self._pose["theta"]) * dt
+
+            self._last_manual_cmd_time = time.monotonic()
+            self._current_manual_twist = (clamped_x, clamped_z)
+            return {"success": True, "message": "Đã gửi lệnh vận tốc thành công."}
 
     def get_alerts(self) -> List[Dict[str, Any]]:
         with self._lock:

@@ -9,7 +9,7 @@
 2. [Yêu Cầu Hệ Thống & Chuẩn Bị Môi Trường](#2-yêu-cầu-hệ-thống--chuẩn-bị-môi-trường)
 3. [Kiến Trúc Hai Thành Phần Độc Lập](#3-kiến-trúc-hai-thành-phần-độc-lập)
 4. [Hướng Dẫn Cài Đặt & Khởi Chạy Lần Đầu](#4-hướng-dẫn-cài-đặt--khởi-chạy-lần-đầu)
-5. [Kiểm Tra Kết Nối 3 Tầng & Đăng Nhập](#5-kiểm-tra-kết-nối-3-tầng--đăng-nhập)
+5. [Kiểm Tra Kết Nối 3 Tầng, Đăng Nhập & Truy Cập LAN](#5-kiểm-tra-kết-nối-3-tầng--đăng-nhập)
 6. [Hướng Dẫn Thao Tác Trên Giao Diện](#6-hướng-dẫn-thao-tác-trên-giao-diện)
 7. [Quản Lý Dữ Liệu Điểm Đến & Ảnh Sơ Đồ](#7-quản-lý-dữ-liệu-điểm-đến--ảnh-sơ-đồ)
 8. [Vận Hành Thường Nhật & Tài Liệu Tham Khảo](#8-vận-hành-thường-nhật--tài-liệu-tham-khảo)
@@ -200,6 +200,32 @@ Kết quả trả về chuẩn:
 - **Màn hình Quản trị viên:** Mở `http://localhost:5173/admin`.
   - **Tài khoản mặc định:** `admin`
   - **Mật khẩu mặc định:** `admin123`
+
+### Bước 5.4: Truy cập từ Laptop thứ hai trong cùng mạng LAN (Multi-machine Access)
+
+Hệ thống được thiết kế theo kiến trúc **Same-Origin Reverse Proxy**, cho phép bất kỳ laptop, máy tính bảng hoặc điện thoại nào trong cùng mạng Wi-Fi/LAN truy cập và điều khiển robot mà **hoàn toàn không cần cài đặt ROS 2, Docker hay Node.js** trên thiết bị đó.
+
+#### 1. Lấy địa chỉ IP mạng LAN của máy chủ ThinkPad
+Trên máy chủ ThinkPad (nơi chạy Docker/Gazebo), mở terminal và chạy:
+```bash
+hostname -I
+```
+> Kết quả thường hiển thị danh sách IP (ví dụ: `192.168.0.108 172.17.0.1`). Hãy chọn địa chỉ IP thuộc mạng Wi-Fi/LAN gia đình hoặc văn phòng (thường bắt đầu bằng `192.168.x.x` hoặc `10.x.x.x`, bỏ qua dải `172.17.x.x` của Docker bridge).
+
+#### 2. Mở trình duyệt trên Laptop thứ hai
+Trên laptop thứ hai (Windows, macOS hoặc Linux), mở trình duyệt web hiện đại (Google Chrome, Microsoft Edge, Mozilla Firefox hoặc Safari) và truy cập:
+- **Màn hình Hành khách:** `http://<IP_THINKPAD>:5173` (ví dụ: `http://192.168.0.108:5173`)
+- **Màn hình Quản trị viên:** `http://<IP_THINKPAD>:5173/admin`
+  - Tài khoản: `admin`
+  - Mật khẩu: `admin123`
+
+#### 3. Nguyên lý hoạt động & Tính bảo đảm mạng
+- **Không lỗi CORS:** Nginx chạy tại cổng `5173` tiếp nhận toàn bộ truy vấn của trình duyệt khách, đồng thời proxy ngược các route `/api/` và kết nối WebSocket `/ws` về backend FastAPI nội bộ (`127.0.0.1:8000`). Trình duyệt chỉ giao tiếp với một Origin duy nhất (`http://<IP_THINKPAD>:5173`), hoàn toàn không bị chặn CORS hay lỗi Security Mixed Content.
+- **WebSocket tự động nhận diện Host:** Bộ kết nối `wsClient.ts` tự động phát hiện `window.location.host` để mở kết nối `ws://<IP_THINKPAD>:5173/ws`, bảo đảm cập nhật tọa độ robot real-time 5Hz đồng bộ trên mọi thiết bị kết nối.
+- **Tường lửa (UFW Firewall):** Nếu laptop thứ hai không tải được trang, hãy kiểm tra tường lửa trên máy chủ ThinkPad bằng lệnh `sudo ufw status`. Nếu UFW đang hoạt động (`active`), hãy mở cổng 5173 bằng lệnh:
+  ```bash
+  sudo ufw allow 5173/tcp
+  ```
 
 ---
 

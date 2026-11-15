@@ -56,6 +56,15 @@ export type NavigationState =
 
 export type VoiceState = 'IDLE' | 'LISTENING' | 'PROCESSING' | 'SPEAKING' | 'ERROR';
 
+export interface VoiceProposal {
+  proposal_id: string;
+  destination_id?: string | null;
+  destination_name?: string | null;
+  status: 'MATCHED' | 'NO_MATCH' | 'AMBIGUOUS';
+  transcript?: string | null;
+  created_at: number;
+}
+
 export interface RobotStatus {
   pose: RobotPose | null;
   frame_id?: string;
@@ -81,12 +90,30 @@ export interface RobotStatus {
   voiceState: VoiceState;
   voiceTranscript: string | null;
   voiceResponse: string | null;
+  voiceAvailable?: boolean;
+  voiceProposal?: VoiceProposal | null;
   message: string;
   destinationsVersion?: number;
+  manualConsumerAvailable?: boolean;
+  manualOperatorId?: string | null;
+  readiness?: {
+    ready: boolean;
+    reasons: string[];
+  } | null;
   lastUpdated: number;
 }
 
-// 4. Cảnh báo chẩn đoán từ /airport/alerts (Khớp DiagnosticStatus.msg)
+// 4. Sự kiện vận hành dành cho Admin (Bộ đệm RAM tối đa 100 sự kiện)
+export interface OperationalEvent {
+  id: string;
+  timestamp: number;
+  level: 'INFO' | 'WARN' | 'ERROR' | 'SUCCESS';
+  category: 'SYSTEM' | 'CONNECTION' | 'NAVIGATION' | 'CONTROL';
+  message: string;
+  details?: Record<string, any>;
+}
+
+// 5. Cảnh báo chẩn đoán từ /airport/alerts (Khớp DiagnosticStatus.msg)
 export interface AlertItem {
   name: string;
   level: number; // 0=OK, 1=WARN, 2=ERROR, 3=STALE

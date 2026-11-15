@@ -55,6 +55,12 @@
   color: #B91C1C;
 }
 
+.stateBadge.offline {
+  background: #F1F5F9;
+  color: #94A3B8;
+  border: 1px solid #CBD5E1;
+}
+
 .micSection {
   display: flex;
   flex-direction: column;
@@ -99,6 +105,17 @@
   text-align: center;
   margin: 0;
   min-height: 18px;
+}
+
+.offlineBanner {
+  background: #FFFBEB;
+  border: 1px solid #FDE68A;
+  color: #92400E;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  text-align: center;
+  line-height: 1.4;
 }
 
 .errorMessage {
@@ -151,4 +168,141 @@
   100% {
     box-shadow: 0 0 0 0 rgba(22, 163, 74, 0);
   }
+}
+
+.proposalCard {
+  background: #F0FDF4;
+  border: 1px solid #86EFAC;
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 2px 4px rgba(22, 163, 74, 0.1);
+  animation: fadeIn 0.2s ease-in-out;
+}
+
+.proposalHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.proposalIcon {
+  font-size: 16px;
+}
+
+.proposalTitle {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #166534;
+  letter-spacing: 0.5px;
+}
+
+.proposalQuestion {
+  font-size: 14px;
+  color: #14532D;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.proposalActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.confirmBtn {
+  flex: 1;
+  background: #16A34A;
+  color: #FFFFFF;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.confirmBtn:hover:not(:disabled) {
+  background: #15803D;
+  transform: translateY(-1px);
+}
+
+.confirmBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.dismissBtn {
+  background: #E2E8F0;
+  color: #475569;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.dismissBtn:hover:not(:disabled) {
+  background: #CBD5E1;
+}
+
+.dismissBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.proposalNotice {
+  background: #FFFBEB;
+  border: 1px solid #FDE68A;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: fadeIn 0.2s ease-in-out;
+}
+
+.proposalNoticeText {
+  font-size: 13px;
+  color: #92400E;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.dismissSmallBtn {
+  align-self: flex-end;
+  background: #FEF3C7;
+  color: #78350F;
+  border: 1px solid #FCD34D;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dismissSmallBtn:hover {
+  background: #FDE68A;
+}
+
+.confirmErrorMessage {
+  background: #FEF2F2;
+  border: 1px solid #F87171;
+  color: #991B1B;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  text-align: center;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
