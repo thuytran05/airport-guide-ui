@@ -3601,6 +3601,7 @@ def test_destinations_concurrency_transactions_and_isolation(tmp_path):
         ad_mock._last_manual_seq = 0
         ad_mock._current_manual_twist = (0.0, 0.0)
         ad_mock._last_manual_cmd_time = 0.0
+        ad_mock._pending_dest_modifications = set()
 
         ad_ros = object.__new__(RosRobotAdapter)
         ad_ros._lock = threading.Lock()
@@ -3618,6 +3619,7 @@ def test_destinations_concurrency_transactions_and_isolation(tmp_path):
         ad_ros._last_manual_seq = 0
         ad_ros._current_manual_twist = (0.0, 0.0)
         ad_ros._last_manual_cmd_time = 0.0
+        ad_ros._pending_dest_modifications = set()
         ad_ros._pub_cmd_vel = None
         ad_ros._map_meta = MapMetadata(width=200, height=200, resolution=0.05, origin_x=0.0, origin_y=0.0, origin_yaw=0.0)
         ad_ros._occupancy_grid_data = [0] * 40000
@@ -3812,6 +3814,273 @@ def test_destinations_concurrency_transactions_and_isolation(tmp_path):
         event_allow_write_finish.set()
         t_save.join(timeout=5.0)
         assert len(adapter.get_destinations()) == 1
+
+
+# =========================================================================
+# 12. Concurrency Race & Linearization between Navigation and Destinations
+# =========================================================================
+
+def test_destinations_navigation_race_and_linearization(tmp_path):
+    """
+    Kiểm thử đồng thời có kiểm soát giữa start_navigation và upsert/delete điểm đến:
+    - Chiều 1: Điểm D1 đang chuẩn bị ghi cập nhật hoặc xóa (đang chờ I/O) thì start_navigation(D1) tới:
+      -> Bị từ chối an toàn với thông báo 'đang trong quá trình cập nhật hoặc lưu trữ'.
+      -> Watchdog điều khiển tay không bị nghẽn (< 0.1s).
+      -> Sau khi I/O hoàn tất (hoặc thất bại), memory và disk đồng nhất, cờ bận được dọn dẹp sạch sẽ.
+    - Chiều 2: Robot đang thực hiện chuyến tới D1 (NAVIGATING / PENDING / PAUSED) thì có yêu cầu sửa/xóa D1:
+      -> Bị từ chối an toàn, không làm hỏng chuyến đi.
+    - Tình huống lỗi: Ghi file ném Exception: Dữ liệu hợp lệ được bảo toàn, cờ pending được dọn trong finally.
+    Kiểm thử trên cả MockRobotAdapter và RosRobotAdapter cô lập (không gửi Nav2 goal thật).
+    """
+    from collections import OrderedDict
+    from app.adapters.ros_adapter import RosRobotAdapter
+    from app.adapters.mock_adapter import MockRobotAdapter
+    from app.coordinate.transform import MapMetadata
+
+    def create_test_adapters(base_dir, name):
+        f_mock = base_dir / f"{name}_mock_dest.yaml"
+        f_ros = base_dir / f"{name}_ros_dest.yaml"
+
+        ad_mock = MockRobotAdapter()
+        ad_mock._destinations = []
+        ad_mock._destinations_version = 0
+        ad_mock._destinations_file = f_mock
+        ad_mock._navigation_state = "IDLE"
+        ad_mock._destination_id = None
+        ad_mock._control_mode = "AUTO"
+        ad_mock._manual_operator_id = None
+        ad_mock._active_hold_id = None
+        ad_mock._released_hold_ids = OrderedDict()
+        ad_mock._last_manual_seq = 0
+        ad_mock._current_manual_twist = (0.0, 0.0)
+        ad_mock._last_manual_cmd_time = 0.0
+        ad_mock._pending_dest_modifications = set()
+
+        ad_ros = object.__new__(RosRobotAdapter)
+        ad_ros._lock = threading.Lock()
+        ad_ros._io_lock = threading.Lock()
+        ad_ros._cfg = get_ros_config()
+        ad_ros._destinations = []
+        ad_ros._destinations_version = 0
+        ad_ros._destinations_file = f_ros
+        ad_ros._navigation_state = "IDLE"
+        ad_ros._destination_id = None
+        ad_ros._control_mode = "AUTO"
+        ad_ros._manual_operator_id = None
+        ad_ros._active_hold_id = None
+        ad_ros._released_hold_ids = OrderedDict()
+        ad_ros._last_manual_seq = 0
+        ad_ros._current_manual_twist = (0.0, 0.0)
+        ad_ros._last_manual_cmd_time = 0.0
+        ad_ros._pub_cmd_vel = None
+        ad_ros._pending_dest_modifications = set()
+        ad_ros._map_meta = MapMetadata(width=200, height=200, resolution=0.05, origin_x=0.0, origin_y=0.0, origin_yaw=0.0)
+        ad_ros._occupancy_grid_data = [0] * 40000
+
+        return [("MockAdapter", ad_mock, f_mock), ("RosAdapter", ad_ros, f_ros)]
+
+    # -----------------------------------------------------------------
+    # TÌNH HUỐNG 1: UPSERT I/O ĐANG CHẠY -> START_NAVIGATION(D1) TỚI
+    # -----------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_test_adapters(tmp_path, "race_upsert"):
+        # Khởi tạo điểm D1 ban đầu
+        initial_d1 = {
+            "id": "gate_race_1",
+            "name": "Cổng G1 Gốc",
+            "pose": {"position": {"x": 2.0, "y": 3.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+        res_init = adapter.upsert_destination(initial_d1)
+        assert res_init["success"] is True
+
+        # Hook hàm ghi file để tạm dừng trong pha I/O (ngoài self._lock)
+        orig_write = adapter._write_destinations_file
+        event_write_entered = threading.Event()
+        event_allow_write_finish = threading.Event()
+
+        def slow_write(dest_list):
+            event_write_entered.set()
+            assert event_allow_write_finish.wait(timeout=5.0), "Timeout chờ hoàn thành ghi file"
+            return orig_write(dest_list)
+
+        adapter._write_destinations_file = slow_write
+
+        # Cập nhật tọa độ mới cho gate_race_1
+        updated_d1 = {
+            "id": "gate_race_1",
+            "name": "Cổng G1 Mới",
+            "pose": {"position": {"x": 5.0, "y": 6.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+
+        t_upsert = threading.Thread(target=lambda: adapter.upsert_destination(updated_d1))
+        t_upsert.start()
+
+        # Đợi thread ghi file vào trong hàm slow_write (đã nhả self._lock)
+        assert event_write_entered.wait(timeout=5.0)
+
+        # 1. Kiểm tra watchdog điều khiển tay không bị nghẽn (dưới 0.1s)
+        t_wd_start = time.monotonic()
+        adapter.check_manual_timeout()
+        elapsed_wd = time.monotonic() - t_wd_start
+        assert elapsed_wd < 0.1, f"[{adapter_name}] Watchdog bị chặn bởi I/O: {elapsed_wd}s"
+
+        # 2. Yêu cầu start_navigation tới gate_race_1 trong lúc I/O đang diễn ra
+        res_nav = adapter.start_navigation("gate_race_1", "user_test")
+        assert res_nav["success"] is False, f"[{adapter_name}] start_navigation phải bị từ chối khi đang ghi cập nhật: {res_nav}"
+        assert "đang trong quá trình cập nhật hoặc lưu trữ" in res_nav["message"], f"[{adapter_name}] Thông báo từ chối không đúng: {res_nav['message']}"
+
+        # 3. Cho phép ghi file hoàn thành
+        event_allow_write_finish.set()
+        t_upsert.join(timeout=5.0)
+
+        # 4. Kiểm tra trạng thái bộ nhớ và file khớp hoàn toàn
+        dests_mem = adapter.get_destinations()
+        assert len(dests_mem) == 1
+        assert dests_mem[0]["name"] == "Cổng G1 Mới"
+        assert dests_mem[0]["pose"]["position"]["x"] == 5.0
+
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data = yaml.safe_load(f)
+        dests_disk = disk_data.get("destinations", [])
+        assert len(dests_disk) == 1
+        assert dests_disk[0]["name"] == "Cổng G1 Mới"
+        assert dests_disk[0]["pose"]["position"]["x"] == 5.0
+
+        # Cờ pending phải được xóa sạch
+        assert len(adapter._pending_dest_modifications) == 0
+
+    # -----------------------------------------------------------------
+    # TÌNH HUỐNG 2: DELETE I/O ĐANG CHẠY -> START_NAVIGATION(D1) TỚI
+    # -----------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_test_adapters(tmp_path, "race_delete"):
+        # Khởi tạo điểm D1 ban đầu
+        initial_d1 = {
+            "id": "gate_del_1",
+            "name": "Cổng Cần Xóa",
+            "pose": {"position": {"x": 2.0, "y": 3.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+        res_init = adapter.upsert_destination(initial_d1)
+        assert res_init["success"] is True
+
+        orig_write = adapter._write_destinations_file
+        event_del_write_entered = threading.Event()
+        event_del_allow_finish = threading.Event()
+
+        def slow_del_write(dest_list):
+            event_del_write_entered.set()
+            assert event_del_allow_finish.wait(timeout=5.0), "Timeout chờ xóa file"
+            return orig_write(dest_list)
+
+        adapter._write_destinations_file = slow_del_write
+
+        t_delete = threading.Thread(target=lambda: adapter.delete_destination("gate_del_1"))
+        t_delete.start()
+
+        assert event_del_write_entered.wait(timeout=5.0)
+
+        # Trong lúc I/O xóa đang chạy, start_navigation tới gate_del_1 phải bị từ chối
+        res_nav = adapter.start_navigation("gate_del_1", "user_test")
+        assert res_nav["success"] is False
+        assert "đang trong quá trình cập nhật hoặc lưu trữ" in res_nav["message"]
+
+        # Cho phép hoàn tất xóa
+        event_del_allow_finish.set()
+        t_delete.join(timeout=5.0)
+
+        # Điểm đã bị xóa sạch khỏi cả memory và disk
+        assert len(adapter.get_destinations()) == 0
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data = yaml.safe_load(f)
+        assert len(disk_data.get("destinations", [])) == 0
+        assert len(adapter._pending_dest_modifications) == 0
+
+    # -----------------------------------------------------------------
+    # TÌNH HUỐNG 3: I/O GHI FILE THẤT BẠI TRONG LÚC RACE
+    # -----------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_test_adapters(tmp_path, "race_fail"):
+        initial_d1 = {
+            "id": "gate_fail_1",
+            "name": "Cổng Bền Vững",
+            "pose": {"position": {"x": 1.0, "y": 1.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+        res_init = adapter.upsert_destination(initial_d1)
+        assert res_init["success"] is True
+
+        event_fail_entered = threading.Event()
+        event_fail_allow = threading.Event()
+
+        def failing_write(dest_list):
+            event_fail_entered.set()
+            assert event_fail_allow.wait(timeout=5.0)
+            if adapter_name == "RosAdapter":
+                return False, "Lỗi I/O giả lập: Read-only filesystem"
+            return False
+
+        adapter._write_destinations_file = failing_write
+
+        bad_update = {
+            "id": "gate_fail_1",
+            "name": "Tên Bị Hỏng",
+            "pose": {"position": {"x": 9.9, "y": 9.9, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+
+        t_bad = threading.Thread(target=lambda: adapter.upsert_destination(bad_update))
+        t_bad.start()
+
+        assert event_fail_entered.wait(timeout=5.0)
+
+        # Trong lúc I/O thất bại đang treo, start_navigation bị từ chối
+        res_nav = adapter.start_navigation("gate_fail_1", "user_test")
+        assert res_nav["success"] is False
+        assert "đang trong quá trình cập nhật hoặc lưu trữ" in res_nav["message"]
+
+        # Cho phép hàm write trả về lỗi
+        event_fail_allow.set()
+        t_bad.join(timeout=5.0)
+
+        # Dữ liệu gốc KHÔNG bị mất hoặc thay đổi
+        dests_mem = adapter.get_destinations()
+        assert len(dests_mem) == 1
+        assert dests_mem[0]["name"] == "Cổng Bền Vững"
+        assert dests_mem[0]["pose"]["position"]["x"] == 1.0
+
+        # Cờ pending phải được giải phóng qua khối finally
+        assert len(adapter._pending_dest_modifications) == 0
+
+    # -----------------------------------------------------------------
+    # TÌNH HUỐNG 4: CHIỀU 2 - ROBOT ĐÃ BẮT ĐẦU CHUYẾN -> UPSERT/DELETE BỊ CHẶN
+    # -----------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_test_adapters(tmp_path, "race_dir2"):
+        dest_active = {
+            "id": "gate_active_1",
+            "name": "Cổng Đang Dẫn Đường",
+            "pose": {"position": {"x": 3.0, "y": 4.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+        adapter.upsert_destination(dest_active)
+
+        # Đặt robot vào trạng thái đang dẫn đường tới gate_active_1
+        for nav_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSED", "CANCELING"):
+            adapter._navigation_state = nav_state
+            adapter._destination_id = "gate_active_1"
+
+            # 1. Thử sửa tọa độ cổng đang đi -> Bị chặn
+            res_up = adapter.upsert_destination({
+                "id": "gate_active_1",
+                "name": "Sửa Tên Trong Khi Đi",
+                "pose": {"position": {"x": 8.0, "y": 8.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+            })
+            assert res_up["success"] is False, f"[{adapter_name}] Sửa điểm đang đi phải bị từ chối ở state {nav_state}"
+            assert "Không thể cập nhật điểm đến 'gate_active_1'" in res_up["message"]
+
+            # 2. Thử xóa cổng đang đi -> Bị chặn
+            res_del = adapter.delete_destination("gate_active_1")
+            assert res_del["success"] is False, f"[{adapter_name}] Xóa điểm đang đi phải bị từ chối ở state {nav_state}"
+            assert "Không thể xóa điểm đến 'gate_active_1'" in res_del["message"]
+
+            # Kiểm tra trạng thái chuyến và điểm đến không bị ảnh hưởng
+            assert adapter._navigation_state == nav_state
+            assert adapter._destination_id == "gate_active_1"
+            assert len(adapter.get_destinations()) == 1
+
 
 
 

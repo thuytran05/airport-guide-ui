@@ -6,7 +6,7 @@ import threading
 import logging
 import collections
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 import yaml
 
 from .base import BaseRobotAdapter
@@ -23,6 +23,7 @@ class MockRobotAdapter(BaseRobotAdapter):
         self._destinations_file = Path(self._ros_config.destinations_storage_path)
         self._destinations_seed_file = Path(self._ros_config.destinations_seed_path)
         self._destinations_version: int = 0
+        self._pending_dest_modifications: Set[str] = set()
         self._destinations = self._load_destinations()
 
         # Tọa độ trong hệ quy chiếu map (mét)
@@ -267,6 +268,11 @@ class MockRobotAdapter(BaseRobotAdapter):
                 if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                     return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' khi đang có chuyến dẫn đường tới điểm này (trạng thái: {self._navigation_state})"}
 
+                # Đánh dấu điểm đến đang trong transaction sửa/ghi file
+                if not hasattr(self, "_pending_dest_modifications"):
+                    self._pending_dest_modifications = set()
+                self._pending_dest_modifications.add(dest_id)
+
                 # Xây dựng danh sách mới mà không làm thay đổi self._destinations trong bộ nhớ trước khi ghi file
                 new_destinations = [dict(d) for d in self._destinations]
                 found = False
@@ -280,12 +286,21 @@ class MockRobotAdapter(BaseRobotAdapter):
 
                 snapshot = list(new_destinations)
 
-            saved = self._write_destinations_file(snapshot)
+            saved = False
+            try:
+                saved = self._write_destinations_file(snapshot)
+            finally:
+                with self._lock:
+                    self._pending_dest_modifications.discard(dest_id)
 
             with self._lock:
                 if not saved:
                     # Ghi file thất bại: Bộ nhớ hoàn toàn không bị ảnh hưởng, không cần rollback
                     return {"success": False, "message": "Không thể lưu điểm đến"}
+
+                # Kiểm tra lại trạng thái dẫn đường nếu có race
+                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
+                    return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"}
 
                 self._destinations = new_destinations
                 self._destinations_version += 1
@@ -310,18 +325,35 @@ class MockRobotAdapter(BaseRobotAdapter):
                 if existing_idx is None:
                     return {"success": False, "message": f"Không tìm thấy điểm đến có ID '{dest_id}'"}
 
+                # Đánh dấu điểm đến đang trong transaction xóa/ghi file
+                if not hasattr(self, "_pending_dest_modifications"):
+                    self._pending_dest_modifications = set()
+                self._pending_dest_modifications.add(dest_id)
+
                 # Xây dựng danh sách mới mà không làm thay đổi self._destinations trong bộ nhớ trước khi ghi file
                 new_destinations = [dict(d) for d in self._destinations]
                 deleted_dest = new_destinations.pop(existing_idx)
                 deleted_name = deleted_dest.get("name") or dest_id
                 snapshot = list(new_destinations)
 
-            saved = self._write_destinations_file(snapshot)
+            saved = False
+            try:
+                saved = self._write_destinations_file(snapshot)
+            finally:
+                with self._lock:
+                    self._pending_dest_modifications.discard(dest_id)
 
             with self._lock:
                 if not saved:
                     # Ghi file thất bại: Bộ nhớ không đổi
                     return {"success": False, "message": "Không thể lưu điểm đến sau khi xóa"}
+
+                # Kiểm tra lại trạng thái dẫn đường nếu có race
+                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
+                    return {
+                        "success": False,
+                        "message": f"Không thể xóa điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"
+                    }
 
                 self._destinations = new_destinations
                 self._destinations_version += 1
@@ -330,6 +362,14 @@ class MockRobotAdapter(BaseRobotAdapter):
 
     def start_navigation(self, destination_id: str, owner_id: str) -> Dict[str, Any]:
         with self._lock:
+            # Tuyến tính hóa: Kiểm tra xem điểm đến có đang trong quá trình cập nhật hoặc lưu trữ file hay không
+            pending_mods = getattr(self, "_pending_dest_modifications", set())
+            if destination_id in pending_mods:
+                return {
+                    "success": False,
+                    "message": f"Điểm đến '{destination_id}' đang trong quá trình cập nhật hoặc lưu trữ. Vui lòng thử lại sau giây lát."
+                }
+
             if getattr(self, "_control_mode", "AUTO") == "MANUAL" or getattr(self, "_active_hold_id", None) is not None:
                 return {"success": False, "message": "Không thể bắt đầu dẫn đường: Robot đang trong chế độ điều khiển thủ công (MANUAL) hoặc lượt điều khiển tay."}
             if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):

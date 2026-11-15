@@ -542,6 +542,9 @@ export default function AdminDashboard() {
         setDestId('');
         setDestName('');
       }
+      if (selectedNavDestId === destToDelete.id) {
+        setSelectedNavDestId('');
+      }
       setDestToDelete(null);
     } else {
       setDeleteModalError(`❌ ${res.message || 'Lỗi khi xóa điểm đến.'}`);
@@ -781,11 +784,15 @@ export default function AdminDashboard() {
                 backgroundMode={mapMode}
                 robotPose={status.pose}
                 destinations={destinations}
+                selectedDestinationId={selectedNavDestId}
                 path={path}
                 isSelectingCoordinate={isPickingCoord}
                 onCoordinateSelect={handleCoordinateSelect}
                 onPickingGuide={(msg) => setDestMsg(`ℹ️ ${msg}`)}
                 previewPoint={previewPoint}
+                onDestinationSelect={(id) => {
+                  if (!isNavigating) setSelectedNavDestId(id);
+                }}
               />
 
               {/* D-pad 5 nút phủ góc dưới phải bản đồ (Nền trong suốt, nút 36px) */}
@@ -1101,7 +1108,7 @@ export default function AdminDashboard() {
                       onChange={(e) => setSelectedNavDestId(e.target.value)}
                       disabled={isNavigating || isManual}
                     >
-                      <option value="" disabled>-- Vui lòng chọn một điểm đến --</option>
+                      <option value="">-- Vui lòng chọn một điểm đến --</option>
                       {destinations.map((d) => (
                         <option key={d.id} value={d.id}>
                           {d.name} ({d.id}) — [{d.pose.position.x.toFixed(1)}, {d.pose.position.y.toFixed(1)}]

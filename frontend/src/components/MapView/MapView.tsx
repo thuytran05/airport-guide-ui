@@ -452,6 +452,19 @@ export const MapView: React.FC<MapViewProps> = ({
     });
   }, [activeMap, destinations]);
 
+  // Sắp xếp các điểm đến sao cho điểm được chọn (selectedDestinationId) được vẽ sau cùng trong nhóm điểm đến
+  // Nhờ đó vòng hào quang xanh lá không bị che khuất bởi các điểm xanh lam lân cận,
+  // nhưng vẫn nằm dưới điểm Preview và Marker Robot (vẽ ở các khối SVG tiếp theo).
+  const sortedDestinations = useMemo(() => {
+    if (!projectedDestinations || projectedDestinations.length === 0) return [];
+    if (!selectedDestinationId) return projectedDestinations;
+    return [...projectedDestinations].sort((a, b) => {
+      if (a.id === selectedDestinationId) return 1;
+      if (b.id === selectedDestinationId) return -1;
+      return 0;
+    });
+  }, [projectedDestinations, selectedDestinationId]);
+
   // 4. Tính polyline cho đường dẫn Nav2 (Path)
   const pathPolylinePoints = useMemo(() => {
     if (!activeMap || !currentPath || currentPath.length === 0) return '';
@@ -666,7 +679,7 @@ export const MapView: React.FC<MapViewProps> = ({
 
         {/* Các điểm đến (Destinations) */}
         {(!isPassengerMode || passengerMapStatus === 'available') &&
-          projectedDestinations.map((dest) => {
+          sortedDestinations.map((dest) => {
             const isSelected = dest.id === selectedDestinationId;
             return (
               <g

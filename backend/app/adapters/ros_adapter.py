@@ -10,7 +10,7 @@ import logging
 import pathlib
 import collections
 import yaml
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 from .base import BaseRobotAdapter
 from ..ros_config import get_ros_config
@@ -162,6 +162,7 @@ class RosRobotAdapter(BaseRobotAdapter):
         self._destinations_file = pathlib.Path(self._cfg.destinations_storage_path)
         self._destinations_seed_file = pathlib.Path(self._cfg.destinations_seed_path)
         self._destinations_version: int = 0
+        self._pending_dest_modifications: Set[str] = set()
         self._destinations: List[Dict[str, Any]] = self._load_destinations()
         self._occupancy_grid_data: Optional[List[int]] = None
         self._alerts: List[Dict[str, Any]] = []
@@ -1115,6 +1116,11 @@ class RosRobotAdapter(BaseRobotAdapter):
                 if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                     return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' khi đang có chuyến dẫn đường tới điểm này (trạng thái: {self._navigation_state})"}
 
+                # Đánh dấu điểm đến đang trong quá trình cập nhật / lưu trữ file (tuyến tính hóa với start_navigation)
+                if not hasattr(self, "_pending_dest_modifications"):
+                    self._pending_dest_modifications = set()
+                self._pending_dest_modifications.add(dest_id)
+
                 # Xây dựng bản sao mới mà KHÔNG làm thay đổi self._destinations trong bộ nhớ trước khi ghi file
                 new_destinations = [dict(d) for d in self._destinations]
                 found = False
@@ -1128,13 +1134,23 @@ class RosRobotAdapter(BaseRobotAdapter):
 
                 snapshot = list(new_destinations)
 
-            # Lưu file bền vững ngoài self._lock (dưới self._io_lock) để không chặn watchdog hay lệnh vận tốc
-            saved, save_err = self._write_destinations_file(snapshot)
+            saved = False
+            save_err = ""
+            try:
+                # Lưu file bền vững ngoài self._lock (dưới self._io_lock) để không chặn watchdog hay lệnh vận tốc
+                saved, save_err = self._write_destinations_file(snapshot)
+            finally:
+                with self._lock:
+                    self._pending_dest_modifications.discard(dest_id)
 
             with self._lock:
                 if not saved:
                     # Ghi file thất bại: Bộ nhớ hoàn toàn không bị ảnh hưởng, không cần rollback
                     return {"success": False, "message": f"Không thể lưu điểm đến: {save_err}"}
+
+                # Kiểm tra lại trạng thái dẫn đường: nếu có race lọt qua, từ chối commit an toàn
+                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
+                    return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"}
 
                 # Ghi file thành công: Commit vào bộ nhớ và tăng version
                 self._destinations = new_destinations
@@ -1172,19 +1188,37 @@ class RosRobotAdapter(BaseRobotAdapter):
                 if existing_idx is None:
                     return {"success": False, "message": f"Không tìm thấy điểm đến có ID '{dest_id}'"}
 
+                # Đánh dấu điểm đến đang trong quá trình xóa / lưu trữ file (tuyến tính hóa với start_navigation)
+                if not hasattr(self, "_pending_dest_modifications"):
+                    self._pending_dest_modifications = set()
+                self._pending_dest_modifications.add(dest_id)
+
                 # Xây dựng danh sách mới mà KHÔNG làm thay đổi self._destinations trong bộ nhớ
                 new_destinations = [dict(d) for d in self._destinations]
                 deleted_dest = new_destinations.pop(existing_idx)
                 deleted_name = deleted_dest.get("name") or dest_id
                 snapshot = list(new_destinations)
 
-            # Lưu bền vững ra tệp YAML ngoài self._lock (dưới self._io_lock)
-            saved_ok, save_err = self._write_destinations_file(snapshot)
+            saved_ok = False
+            save_err = ""
+            try:
+                # Lưu bền vững ra tệp YAML ngoài self._lock (dưới self._io_lock)
+                saved_ok, save_err = self._write_destinations_file(snapshot)
+            finally:
+                with self._lock:
+                    self._pending_dest_modifications.discard(dest_id)
 
             with self._lock:
                 if not saved_ok:
                     # Ghi file thất bại: Bộ nhớ không đổi
                     return {"success": False, "message": f"Không thể lưu điểm đến sau khi xóa: {save_err}"}
+
+                # Kiểm tra lại trạng thái dẫn đường: nếu có race lọt qua, từ chối commit an toàn
+                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
+                    return {
+                        "success": False,
+                        "message": f"Không thể xóa điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"
+                    }
 
                 # Ghi file thành công: Commit bộ nhớ
                 self._destinations = new_destinations
@@ -1202,6 +1236,14 @@ class RosRobotAdapter(BaseRobotAdapter):
 
     def start_navigation(self, destination_id: str, owner_id: str) -> Dict[str, Any]:
         with self._lock:
+            # 0. Tuyến tính hóa: Kiểm tra xem điểm đến có đang trong quá trình cập nhật hoặc lưu trữ file hay không
+            pending_mods = getattr(self, "_pending_dest_modifications", set())
+            if destination_id in pending_mods:
+                return {
+                    "success": False,
+                    "message": f"Điểm đến '{destination_id}' đang trong quá trình cập nhật hoặc lưu trữ. Vui lòng thử lại sau giây lát."
+                }
+
             # 1. Kiểm tra action client và ROS packages
             if not getattr(self, "_action_nav", None) or not HAS_NAV2_ACTION:
                 return {"success": False, "message": "Action client Nav2 chưa được khởi tạo."}
