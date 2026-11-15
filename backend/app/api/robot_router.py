@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional
 import time
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from ..auth.models import User, UserRole
@@ -91,7 +92,7 @@ async def get_robot_status(
         manual_lock_reason = "Dữ liệu định vị bị trễ (stale)"
     elif not st.get("manual_consumer_available", False):
         can_manual_control = False
-        manual_lock_reason = "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận"
+        manual_lock_reason = "Đường lệnh điều khiển tay ROS chưa có consumer tiếp nhận"
     elif current_manual_op and not is_manual_controller:
         can_manual_control = False
         manual_lock_reason = f"Quyền điều khiển đang thuộc về phiên Admin khác ({current_manual_op})"
@@ -159,7 +160,7 @@ async def upsert_destination(
     adapter: BaseRobotAdapter = Depends(get_robot_adapter)
 ):
     """Thêm hoặc cập nhật điểm đến (chỉ dành cho Admin đã đăng nhập)"""
-    res = adapter.upsert_destination(req.model_dump())
+    res = await anyio.to_thread.run_sync(adapter.upsert_destination, req.model_dump())
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res
@@ -171,7 +172,7 @@ async def delete_destination(
     adapter: BaseRobotAdapter = Depends(get_robot_adapter)
 ):
     """Xóa điểm đến theo ID (chỉ dành cho Admin đã đăng nhập)"""
-    res = adapter.delete_destination(destination_id)
+    res = await anyio.to_thread.run_sync(adapter.delete_destination, destination_id)
     if not res.get("success"):
         raise HTTPException(status_code=400, detail=res.get("message"))
     return res

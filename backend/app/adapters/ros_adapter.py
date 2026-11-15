@@ -29,7 +29,7 @@ try:
     from rclpy.executors import ExternalShutdownException, ShutdownException
     from rclpy.signals import SignalHandlerOptions
     from action_msgs.msg import GoalStatus, GoalStatusArray
-    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped
+    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped, Twist
     from sensor_msgs.msg import BatteryState
     from nav_msgs.msg import OccupancyGrid, Path as NavPath
     from std_msgs.msg import String
@@ -54,6 +54,15 @@ except ImportError:
         STATUS_ABORTED = 6
     class GoalStatusArray:
         pass
+    class Twist:
+        class Vector3:
+            def __init__(self, x=0.0, y=0.0, z=0.0):
+                self.x = float(x)
+                self.y = float(y)
+                self.z = float(z)
+        def __init__(self):
+            self.linear = self.Vector3()
+            self.angular = self.Vector3()
     class Trigger:
         class Request:
             pass
@@ -114,6 +123,7 @@ class RosRobotAdapter(BaseRobotAdapter):
             )
 
         self._lock = threading.RLock()
+        self._io_lock = threading.Lock()
         self._cfg = get_ros_config()
         self._map_meta = MapMetadata()
         self._map_frame_id: str = "map"
@@ -133,6 +143,7 @@ class RosRobotAdapter(BaseRobotAdapter):
         self._last_manual_cmd_time: float = 0.0
         self._active_hold_id: Optional[str] = None
         self._last_manual_seq: int = 0
+        self._last_hold_timestamp_ms: int = 0
         self._released_hold_ids: collections.OrderedDict[str, float] = collections.OrderedDict()
         self._navigation_state = "IDLE"
         self._has_goal = False
@@ -339,10 +350,16 @@ class RosRobotAdapter(BaseRobotAdapter):
         cmd_cfg = self._cfg.get_topic("cmd_vel_manual")
         if cmd_cfg and cmd_cfg.enabled:
             qos = _build_qos(cmd_cfg.qos)
-            self._pub_cmd_vel = self._node.create_publisher(TwistStamped, cmd_cfg.name, qos)
-            logger.info(f"Created publisher cmd_vel_manual: {cmd_cfg.name}")
+            if getattr(cmd_cfg, "type", "") == "geometry_msgs/msg/Twist":
+                self._pub_cmd_vel = self._node.create_publisher(Twist, cmd_cfg.name, qos)
+                self._cmd_vel_is_twist = True
+            else:
+                self._pub_cmd_vel = self._node.create_publisher(TwistStamped, cmd_cfg.name, qos)
+                self._cmd_vel_is_twist = False
+            logger.info(f"Created publisher cmd_vel_manual: {cmd_cfg.name} (type: {cmd_cfg.type})")
         else:
             self._pub_cmd_vel = None
+            self._cmd_vel_is_twist = False
 
         # 11. Service Clients
         voice_srv_cfg = self._cfg.get_service("voice_start")
@@ -822,6 +839,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 "last_map_time": getattr(self, "_last_map_time", 0.0),
                 "manual_consumer_available": self.is_manual_consumer_available(),
                 "manual_operator_id": getattr(self, "_manual_operator_id", None),
+                "external_goal_active": getattr(self, "_nav2_has_active_goal", False),
             }
 
             result["readiness"] = self._get_readiness_locked()
@@ -909,12 +927,12 @@ class RosRobotAdapter(BaseRobotAdapter):
 
         return []
 
-    def _save_destinations(self) -> Tuple[bool, str]:
+    def _write_destinations_file(self, destinations_data: List[Dict[str, Any]]) -> Tuple[bool, str]:
         """
-        Lưu danh sách điểm đến bền vững ra tệp YAML:
+        Lưu danh sách điểm đến bền vững ra tệp YAML (I/O độc lập với self._lock).
         - Ghi an toàn thông qua tệp tạm (atomic write với os.replace).
         - Nếu có lỗi ghi giữa chừng, tệp gốc không bị mất hoặc hỏng.
-        - Xử lý đồng thời được bảo vệ bởi self._lock.
+        - Xử lý đồng thời I/O được bảo vệ bởi self._io_lock.
         """
         temp_file = None
         try:
@@ -929,14 +947,14 @@ class RosRobotAdapter(BaseRobotAdapter):
             with open(temp_file, "w", encoding="utf-8") as f:
                 yaml.dump({
                     "map_id": "airport_floor_1",
-                    "destinations": self._destinations
+                    "destinations": destinations_data
                 }, f, allow_unicode=True, sort_keys=False)
                 f.flush()
                 os.fsync(f.fileno())
 
             # Hoán đổi nguyên tử (atomic replace)
             os.replace(temp_file, target_file)
-            logger.info(f"Đã lưu an toàn {len(self._destinations)} điểm đến vào {target_file}")
+            logger.info(f"Đã lưu an toàn {len(destinations_data)} điểm đến vào {target_file}")
             return True, "Thành công"
         except OSError as e:
             if temp_file and temp_file.exists():
@@ -956,6 +974,14 @@ class RosRobotAdapter(BaseRobotAdapter):
             msg = f"Lỗi không xác định khi lưu điểm đến: {e}"
             logger.error(msg)
             return False, msg
+
+    def _save_destinations(self) -> Tuple[bool, str]:
+        if not hasattr(self, "_io_lock"):
+            self._io_lock = threading.Lock()
+        with self._lock:
+            snapshot = list(self._destinations)
+        with self._io_lock:
+            return self._write_destinations_file(snapshot)
 
     def validate_destination_coordinates(self, dest: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1056,33 +1082,33 @@ class RosRobotAdapter(BaseRobotAdapter):
         """
         Thêm mới hoặc cập nhật một điểm đến lưu bền vững (Admin).
         Nếu không thể lưu ra file YAML (ví dụ filesystem read-only), báo lỗi thực tế và không lưu vào bộ nhớ.
+        File I/O được thực hiện ngoài self._lock (dưới self._io_lock) để không chặn watchdog hay các lệnh vận tốc.
         """
+        dest_id = destination.get("id")
+        name = destination.get("name")
+        if not dest_id or not str(dest_id).strip():
+            return {"success": False, "message": "ID điểm đến không được để trống"}
+        if not name or not str(name).strip():
+            return {"success": False, "message": "Tên điểm đến không được để trống"}
+
+        dest_id = str(dest_id).strip()
+
+        # Xác thực tọa độ
+        val_res = self.validate_destination_coordinates(destination)
+        if not val_res.get("valid"):
+            return {"success": False, "message": val_res.get("message")}
+
+        clean_dest = {
+            "id": dest_id,
+            "name": str(name).strip(),
+            "map_id": destination.get("map_id", "airport_floor_1"),
+            "pose": destination.get("pose", {})
+        }
+
         with self._lock:
-            dest_id = destination.get("id")
-            name = destination.get("name")
-            if not dest_id or not str(dest_id).strip():
-                return {"success": False, "message": "ID điểm đến không được để trống"}
-            if not name or not str(name).strip():
-                return {"success": False, "message": "Tên điểm đến không được để trống"}
-
-            dest_id = str(dest_id).strip()
-
             # Kiểm tra xem có đang dẫn đường tới điểm này không (kể cả khi tạm dừng hoặc đang hủy)
             if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                 return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' khi đang có chuyến dẫn đường tới điểm này (trạng thái: {self._navigation_state})"}
-
-            # Xác thực tọa độ
-            val_res = self.validate_destination_coordinates(destination)
-            if not val_res.get("valid"):
-                return {"success": False, "message": val_res.get("message")}
-
-            # Chuẩn hóa cấu trúc
-            clean_dest = {
-                "id": dest_id,
-                "name": str(name).strip(),
-                "map_id": destination.get("map_id", "airport_floor_1"),
-                "pose": destination.get("pose", {})
-            }
 
             old_destinations = list(self._destinations)
 
@@ -1095,10 +1121,17 @@ class RosRobotAdapter(BaseRobotAdapter):
             if not found:
                 self._destinations.append(clean_dest)
 
-            # Thử lưu ra file bền vững
-            saved, save_err = self._save_destinations()
+            snapshot = list(self._destinations)
+
+        # Lưu file bền vững ngoài self._lock
+        if not hasattr(self, "_io_lock"):
+            self._io_lock = threading.Lock()
+        with self._io_lock:
+            saved, save_err = self._write_destinations_file(snapshot)
+
+        with self._lock:
             if not saved:
-                # Rollback bộ nhớ
+                # Rollback bộ nhớ nếu ghi file thất bại
                 self._destinations = old_destinations
                 return {"success": False, "message": f"Không thể lưu điểm đến: {save_err}"}
 
@@ -1111,17 +1144,14 @@ class RosRobotAdapter(BaseRobotAdapter):
         Xóa một điểm đến lưu bền vững (Admin).
         - Yêu cầu destination_id hợp lệ.
         - Chặn xóa điểm đang có chuyến dẫn đường chưa kết thúc (PENDING, ACCEPTED, NAVIGATING, CANCELING).
-        - Ghi an toàn bằng tệp tạm (atomic write với os.replace).
+        - File I/O ngoài self._lock dưới self._io_lock.
         - Nếu lưu tệp thất bại, khôi phục lại danh sách cũ trong bộ nhớ và trả thông báo lỗi thực tế.
-        - Khi xóa thành công, tăng _destinations_version để đồng bộ tức thì tới tất cả các client.
-        - Hỗ trợ xóa toàn bộ điểm đến: khi danh sách rỗng, lưu 'destinations: []' vào tệp dữ liệu lưu trữ
-          và giữ nguyên rỗng sau khi recreate backend mà không nạp lại seed file.
         """
-        with self._lock:
-            dest_id = str(destination_id).strip()
-            if not dest_id:
-                return {"success": False, "message": "ID điểm đến không được để trống"}
+        dest_id = str(destination_id).strip()
+        if not dest_id:
+            return {"success": False, "message": "ID điểm đến không được để trống"}
 
+        with self._lock:
             # Chặn xóa điểm đang dùng cho một chuyến chưa kết thúc (kể cả khi tạm dừng hoặc đang hủy)
             if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                 return {
@@ -1137,16 +1167,22 @@ class RosRobotAdapter(BaseRobotAdapter):
             # Sao lưu để rollback nếu ghi thất bại
             old_destinations = list(self._destinations)
             deleted_dest = self._destinations.pop(existing_idx)
+            deleted_name = deleted_dest.get("name") or dest_id
+            snapshot = list(self._destinations)
 
-            # Lưu bền vững ra tệp YAML
-            saved_ok, save_err = self._save_destinations()
+        # Lưu bền vững ra tệp YAML ngoài self._lock
+        if not hasattr(self, "_io_lock"):
+            self._io_lock = threading.Lock()
+        with self._io_lock:
+            saved_ok, save_err = self._write_destinations_file(snapshot)
+
+        with self._lock:
             if not saved_ok:
                 # Rollback
                 self._destinations = old_destinations
                 return {"success": False, "message": f"Không thể lưu điểm đến sau khi xóa: {save_err}"}
 
             self._destinations_version = getattr(self, "_destinations_version", 0) + 1
-            deleted_name = deleted_dest.get("name") or dest_id
             event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
             logger.info(
                 f"Đã xóa thành công điểm đến '{dest_id}' ({deleted_name}). "
@@ -1874,23 +1910,49 @@ class RosRobotAdapter(BaseRobotAdapter):
                 self._voice_start_in_progress = False
 
     def is_manual_consumer_available(self) -> bool:
-        if hasattr(self, "_pub_cmd_vel") and self._pub_cmd_vel:
-            try:
-                return self._pub_cmd_vel.get_subscription_count() > 0
-            except Exception:
+        if not (hasattr(self, "_pub_cmd_vel") and self._pub_cmd_vel):
+            return False
+        try:
+            count = self._pub_cmd_vel.get_subscription_count()
+            if count <= 0:
                 return False
-        return False
+            if hasattr(self, "_node") and self._node:
+                topic_name = self._pub_cmd_vel.topic_name
+                subs = self._node.get_subscriptions_info_by_topic(topic_name)
+                if subs:
+                    expected_nodes = {"ros_gz_bridge", "command_timeout", "twist_mux", "diffdrive_controller"}
+                    expected_type = "geometry_msgs/msg/Twist" if getattr(self, "_cmd_vel_is_twist", False) else "geometry_msgs/msg/TwistStamped"
+                    has_valid_consumer = any(
+                        getattr(s, "node_name", "") in expected_nodes and
+                        getattr(s, "topic_type", "") == expected_type
+                        for s in subs
+                    )
+                    return has_valid_consumer
+            return count > 0
+        except Exception as e:
+            logger.warning(f"Lỗi kiểm tra manual consumer: {e}")
+            return False
 
     def _publish_zero_velocity(self) -> None:
         if hasattr(self, "_pub_cmd_vel") and self._pub_cmd_vel:
             try:
-                msg = TwistStamped()
-                msg.header.stamp = self._node.get_clock().now().to_msg()
-                frame = self._cfg.frames.get("base_link", "base_link") if hasattr(self, "_cfg") and hasattr(self._cfg, "frames") else "base_link"
-                msg.header.frame_id = frame
-                msg.twist.linear.x = 0.0
-                msg.twist.angular.z = 0.0
-                self._pub_cmd_vel.publish(msg)
+                if getattr(self, "_cmd_vel_is_twist", False):
+                    msg = Twist()
+                    msg.linear.x = 0.0
+                    msg.linear.y = 0.0
+                    msg.linear.z = 0.0
+                    msg.angular.x = 0.0
+                    msg.angular.y = 0.0
+                    msg.angular.z = 0.0
+                    self._pub_cmd_vel.publish(msg)
+                else:
+                    msg = TwistStamped()
+                    msg.header.stamp = self._node.get_clock().now().to_msg()
+                    frame = self._cfg.frames.get("base_link", "base_link") if hasattr(self, "_cfg") and hasattr(self._cfg, "frames") else "base_link"
+                    msg.header.frame_id = frame
+                    msg.twist.linear.x = 0.0
+                    msg.twist.angular.z = 0.0
+                    self._pub_cmd_vel.publish(msg)
             except Exception as e:
                 logger.error(f"Lỗi khi gửi vận tốc zero: {e}")
 
@@ -1917,7 +1979,8 @@ class RosRobotAdapter(BaseRobotAdapter):
 
         # 5. Kiểm tra đường điều khiển đã được xác minh (consumer có sẵn) khi cần phát lệnh vận tốc
         if require_consumer and not self.is_manual_consumer_available():
-            return (False, "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận.")
+            topic_name = self._pub_cmd_vel.topic_name if (hasattr(self, "_pub_cmd_vel") and self._pub_cmd_vel) else "/cmd_vel"
+            return (False, f"Đường lệnh điều khiển tay ROS ({topic_name}) chưa có consumer tiếp nhận.")
 
         return (True, None)
 
@@ -2026,66 +2089,127 @@ class RosRobotAdapter(BaseRobotAdapter):
                 self._released_hold_ids = collections.OrderedDict()
 
             now = time.monotonic()
+
+            # Dọn dẹp cache hold đã giải phóng (> 60s và giữ tối đa 500 phần tử)
+            stale_keys = [k for k, t in self._released_hold_ids.items() if (now - t) > 60.0]
+            for k in stale_keys:
+                self._released_hold_ids.pop(k, None)
+            while len(self._released_hold_ids) > 500:
+                self._released_hold_ids.popitem(last=False)
+
             is_stop_cmd = (abs(linear_x) < 1e-4 and abs(angular_z) < 1e-4)
 
-            # 1. Lệnh Dừng (linear=0, angular=0): Bất kỳ Admin nào gọi cũng dừng an toàn
+            # 1. Xử lý Lệnh Dừng (Stop / Emergency Stop)
             if is_stop_cmd:
-                self._publish_zero_velocity()
-                self._current_manual_twist = (0.0, 0.0)
-                self._last_manual_cmd_time = now
-                if getattr(self, "_active_hold_id", None):
-                    self._released_hold_ids[self._active_hold_id] = now
-                    self._active_hold_id = None
-                if hold_id:
-                    self._released_hold_ids[hold_id] = now
-                while len(self._released_hold_ids) > 500:
-                    self._released_hold_ids.popitem(last=False)
-                if seq > getattr(self, "_last_manual_seq", 0):
-                    self._last_manual_seq = seq
-                was_manual = (getattr(self, "_control_mode", "AUTO") == "MANUAL")
-                self._control_mode = "AUTO"
-                self._manual_operator_id = None
-                self._message = "Chế độ tự động (AUTO) sẵn sàng."
-                if was_manual:
-                    event_logger.track_control_mode("AUTO")
-                return {"success": True, "message": "Đã gửi lệnh dừng robot an toàn."}
+                if not hold_id:
+                    # Lệnh Dừng khẩn cấp (Emergency Stop không gắn hold_id):
+                    # Bất kỳ Admin nào gọi cũng dừng xe ngay lập tức, hủy mọi active hold và đưa về AUTO.
+                    self._publish_zero_velocity()
+                    self._current_manual_twist = (0.0, 0.0)
+                    self._last_manual_cmd_time = now
+                    if getattr(self, "_active_hold_id", None):
+                        self._released_hold_ids[self._active_hold_id] = now
+                        self._active_hold_id = None
+                    was_manual = (getattr(self, "_control_mode", "AUTO") == "MANUAL")
+                    self._control_mode = "AUTO"
+                    self._manual_operator_id = None
+                    self._message = "Chế độ tự động (AUTO) sẵn sàng."
+                    if was_manual:
+                        event_logger.track_control_mode("AUTO")
+                    return {"success": True, "message": "Đã gửi lệnh dừng khẩn cấp (Emergency Stop) thành công."}
 
-            # 2. Kiểm tra điều kiện lái tay toàn diện và quyền Admin TRƯỚC TIÊN
+                # Lệnh Dừng giải phóng hold cụ thể (release specific hold)
+                self._released_hold_ids[hold_id] = now
+                active_id = getattr(self, "_active_hold_id", None)
+                if active_id == hold_id:
+                    self._active_hold_id = None
+                    self._publish_zero_velocity()
+                    self._current_manual_twist = (0.0, 0.0)
+                    self._last_manual_cmd_time = now
+                    if seq > getattr(self, "_last_manual_seq", 0):
+                        self._last_manual_seq = seq
+                    was_manual = (getattr(self, "_control_mode", "AUTO") == "MANUAL")
+                    self._control_mode = "AUTO"
+                    self._manual_operator_id = None
+                    self._message = "Chế độ tự động (AUTO) sẵn sàng."
+                    if was_manual:
+                        event_logger.track_control_mode("AUTO")
+                    return {"success": True, "message": "Đã giải phóng hold và dừng robot an toàn."}
+                else:
+                    # Hold cũ hoặc không khớp active hold -> Không dừng hay làm gián đoạn active hold mới
+                    return {"success": True, "ignored": True, "message": f"Hold '{hold_id}' không còn là active hold, bỏ qua dừng."}
+
+            # 2. Xử lý Lệnh Chuyển động (Vận tốc khác 0)
+            # BẮT BUỘC có hold_id và seq >= 1 (Loại bỏ hoàn toàn single-shot/legacy branch cho lệnh chuyển động)
+            if not hold_id or seq is None or seq < 1:
+                return {
+                    "success": False,
+                    "message": "Yêu cầu hold_id và seq (seq >= 1) hợp lệ cho lệnh vận tốc di chuyển."
+                }
+
+            # Kiểm tra hold đã giải phóng
+            if hold_id in self._released_hold_ids:
+                return {
+                    "success": True,
+                    "ignored": True,
+                    "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."
+                }
+
+            # Kiểm tra thứ tự và thời gian tạo hold (Tránh hold cũ đến muộn chiếm quyền hold mới)
+            hold_timestamp_ms = None
+            if hold_id.startswith("hold_"):
+                parts = hold_id.split("_")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    hold_timestamp_ms = int(parts[1])
+
+            if getattr(self, "_active_hold_id", None) == hold_id:
+                last_seq = getattr(self, "_last_manual_seq", 0)
+                if seq <= last_seq:
+                    return {
+                        "success": True,
+                        "ignored": True,
+                        "message": f"Bỏ qua lệnh vận tốc đến trễ hoặc lặp seq (seq {seq} <= {last_seq})."
+                    }
+                self._last_manual_seq = seq
+            else:
+                # Hold mới được khởi tạo
+                if hold_timestamp_ms is not None:
+                    last_hold_ts = getattr(self, "_last_hold_timestamp_ms", 0)
+                    if hold_timestamp_ms < last_hold_ts:
+                        logger.warning(
+                            f"Bỏ qua hold cũ đến trễ: {hold_id} (ts: {hold_timestamp_ms} < {last_hold_ts})"
+                        )
+                        return {
+                            "success": True,
+                            "ignored": True,
+                            "message": "Bỏ qua hold cũ đến trễ hơn hold đã xử lý."
+                        }
+                    self._last_hold_timestamp_ms = hold_timestamp_ms
+
+                # Nếu đang có hold hoạt động khác:
+                if getattr(self, "_active_hold_id", None) is not None:
+                    current_op = getattr(self, "_manual_operator_id", None)
+                    if current_op and operator_id and current_op != operator_id:
+                        return {
+                            "success": False,
+                            "message": f"Quyền điều khiển đang thuộc về phiên khác ({current_op})."
+                        }
+                    # Đưa hold cũ vào cache giải phóng
+                    self._released_hold_ids[self._active_hold_id] = now
+
+                self._active_hold_id = hold_id
+                self._last_manual_seq = seq
+
+            # 3. Kiểm tra điều kiện lái tay toàn diện và quyền Admin
             can_drive, reason = self._can_manual_control_locked(operator_id)
             if not can_drive:
                 return {"success": False, "message": reason or "Không đủ điều kiện điều khiển tay."}
 
-            # 3. Kiểm tra dữ liệu đầu vào hữu hạn
+            # 4. Kiểm tra dữ liệu đầu vào hữu hạn
             if not (math.isfinite(linear_x) and math.isfinite(angular_z)):
                 return {"success": False, "message": "Giá trị vận tốc không hợp lệ (NaN hoặc Inf)."}
 
-            # 4. Phân biệt có hold_id (direct press-and-hold) và không có hold_id (single-shot / legacy test)
-            if hold_id:
-                if seq is None or seq < 1:
-                    return {"success": False, "message": "Yêu cầu seq hợp lệ (seq >= 1) cho lượt giữ nút."}
-                if hold_id in self._released_hold_ids:
-                    return {"success": True, "ignored": True, "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."}
-                if getattr(self, "_active_hold_id", None) == hold_id:
-                    last_seq = getattr(self, "_last_manual_seq", 0)
-                    if seq <= last_seq:
-                        return {"success": True, "ignored": True, "message": f"Bỏ qua lệnh vận tốc đến trễ hoặc lặp seq (seq {seq} <= {last_seq})."}
-                    self._last_manual_seq = seq
-                else:
-                    if getattr(self, "_active_hold_id", None) is not None:
-                        current_op = getattr(self, "_manual_operator_id", None)
-                        if current_op and operator_id and current_op != operator_id:
-                            return {"success": False, "message": f"Quyền điều khiển đang thuộc về phiên khác ({current_op})."}
-                        self._released_hold_ids[self._active_hold_id] = now
-                        while len(self._released_hold_ids) > 500:
-                            self._released_hold_ids.popitem(last=False)
-                    self._active_hold_id = hold_id
-                    self._last_manual_seq = seq
-            elif seq and seq > 0:
-                return {"success": False, "message": "Yêu cầu hold_id hợp lệ cho gói lệnh tuần tự."}
-            else:
-                self._last_manual_seq = getattr(self, "_last_manual_seq", 0) + 1
-
-            # 7. Tự động lấy quyền MANUAL tạm thời cho lượt giữ này
+            # 5. Kích hoạt MANUAL
             was_auto = (getattr(self, "_control_mode", "AUTO") != "MANUAL")
             self._control_mode = "MANUAL"
             self._manual_operator_id = operator_id
@@ -2093,7 +2217,7 @@ class RosRobotAdapter(BaseRobotAdapter):
             if was_auto:
                 event_logger.track_control_mode("MANUAL")
 
-            # 8. Giới hạn vận tốc và publish
+            # 6. Giới hạn vận tốc và publish
             if not hasattr(self, "_pub_cmd_vel") or not self._pub_cmd_vel:
                 return {"success": False, "message": "Topic vận tốc chưa được khởi tạo."}
 
@@ -2105,13 +2229,23 @@ class RosRobotAdapter(BaseRobotAdapter):
             clamped_z = max(-ang_max, min(ang_max, float(angular_z)))
 
             try:
-                msg = TwistStamped()
-                msg.header.stamp = self._node.get_clock().now().to_msg()
-                frame = self._cfg.frames.get("base_link", "base_link") if hasattr(self, "_cfg") and hasattr(self._cfg, "frames") else "base_link"
-                msg.header.frame_id = frame
-                msg.twist.linear.x = float(clamped_x)
-                msg.twist.angular.z = float(clamped_z)
-                self._pub_cmd_vel.publish(msg)
+                if getattr(self, "_cmd_vel_is_twist", False):
+                    msg = Twist()
+                    msg.linear.x = float(clamped_x)
+                    msg.linear.y = 0.0
+                    msg.linear.z = 0.0
+                    msg.angular.x = 0.0
+                    msg.angular.y = 0.0
+                    msg.angular.z = float(clamped_z)
+                    self._pub_cmd_vel.publish(msg)
+                else:
+                    msg = TwistStamped()
+                    msg.header.stamp = self._node.get_clock().now().to_msg()
+                    frame = self._cfg.frames.get("base_link", "base_link") if hasattr(self, "_cfg") and hasattr(self._cfg, "frames") else "base_link"
+                    msg.header.frame_id = frame
+                    msg.twist.linear.x = float(clamped_x)
+                    msg.twist.angular.z = float(clamped_z)
+                    self._pub_cmd_vel.publish(msg)
             except Exception as e:
                 logger.error(f"Lỗi publish cmd_vel_manual: {e}")
                 return {"success": False, "message": f"Lỗi publish lệnh vận tốc: {e}"}

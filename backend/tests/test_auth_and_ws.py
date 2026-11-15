@@ -55,7 +55,7 @@ async def test_passenger_and_admin_permissions():
         # 7. Admin gửi vận tốc cmd_vel_manual -> 200 OK
         res = await client.post(
             "/api/robot/control/velocity",
-            json={"linear_x": 0.2, "angular_z": 0.1},
+            json={"linear_x": 0.2, "angular_z": 0.1, "seq": 1, "hold_id": "hold_test_adm1"},
             headers=admin_headers
         )
         assert res.status_code == 200

@@ -37,6 +37,9 @@ class MockRobotAdapter(BaseRobotAdapter):
         self._manual_consumer_available: bool = True
         self._active_hold_id: Optional[str] = None
         self._last_manual_seq: int = 0
+        self._last_hold_timestamp_ms: int = 0
+        self._io_lock = threading.Lock()
+        self._nav2_has_active_goal: bool = False
         self._released_hold_ids: collections.OrderedDict = collections.OrderedDict()
         self._navigation_state = "IDLE"  # IDLE, ACCEPTED, NAVIGATING, PAUSING, PAUSED, CANCELING, SUCCEEDED, CANCELED, FAILED
         self._has_goal = False
@@ -112,7 +115,7 @@ class MockRobotAdapter(BaseRobotAdapter):
 
         return []
 
-    def _save_destinations(self) -> bool:
+    def _write_destinations_file(self, destinations_data: List[Dict[str, Any]]) -> bool:
         temp_file = None
         try:
             self._destinations_file.parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +127,7 @@ class MockRobotAdapter(BaseRobotAdapter):
             with open(temp_file, "w", encoding="utf-8") as f:
                 yaml.dump({
                     "map_id": "airport_floor_1",
-                    "destinations": self._destinations
+                    "destinations": destinations_data
                 }, f, allow_unicode=True, sort_keys=False)
                 f.flush()
                 os.fsync(f.fileno())
@@ -138,6 +141,14 @@ class MockRobotAdapter(BaseRobotAdapter):
                     pass
             print(f"[MockRobotAdapter] Lỗi lưu destinations: {e}")
             return False
+
+    def _save_destinations(self) -> bool:
+        if not hasattr(self, "_io_lock"):
+            self._io_lock = threading.Lock()
+        with self._lock:
+            snapshot = list(self._destinations)
+        with self._io_lock:
+            return self._write_destinations_file(snapshot)
 
     def _background_loop(self):
         while self._running:
@@ -221,6 +232,7 @@ class MockRobotAdapter(BaseRobotAdapter):
                 "destinations_version": self._destinations_version,
                 "manual_consumer_available": getattr(self, "_manual_consumer_available", True),
                 "manual_operator_id": getattr(self, "_manual_operator_id", None),
+                "external_goal_active": getattr(self, "_nav2_has_active_goal", False),
                 "readiness": readiness,
                 "last_updated": self._last_updated
             }
@@ -242,11 +254,11 @@ class MockRobotAdapter(BaseRobotAdapter):
             return self._destinations_version
 
     def upsert_destination(self, destination: Dict[str, Any]) -> Dict[str, Any]:
+        dest_id = destination.get("id")
+        if not dest_id:
+            return {"success": False, "message": "Destination ID không được để trống"}
+
         with self._lock:
-            dest_id = destination.get("id")
-            if not dest_id:
-                return {"success": False, "message": "Destination ID không được để trống"}
-            
             # Kiểm tra xem đang dẫn đường tới điểm này không
             if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                 return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' khi đang có chuyến dẫn đường tới điểm này (trạng thái: {self._navigation_state})"}
@@ -261,7 +273,14 @@ class MockRobotAdapter(BaseRobotAdapter):
             if not found:
                 self._destinations.append(destination)
 
-            saved = self._save_destinations()
+            snapshot = list(self._destinations)
+
+        if not hasattr(self, "_io_lock"):
+            self._io_lock = threading.Lock()
+        with self._io_lock:
+            saved = self._write_destinations_file(snapshot)
+
+        with self._lock:
             if not saved:
                 self._destinations = old_destinations
                 return {"success": False, "message": "Không thể lưu điểm đến"}
@@ -271,11 +290,11 @@ class MockRobotAdapter(BaseRobotAdapter):
             return {"success": True, "message": f"Đã lưu điểm đến '{destination.get('name')}' thành công"}
 
     def delete_destination(self, destination_id: str) -> Dict[str, Any]:
-        with self._lock:
-            dest_id = str(destination_id).strip()
-            if not dest_id:
-                return {"success": False, "message": "Destination ID không được để trống"}
+        dest_id = str(destination_id).strip()
+        if not dest_id:
+            return {"success": False, "message": "Destination ID không được để trống"}
 
+        with self._lock:
             # Chặn xóa điểm đang có chuyến dẫn đường chưa kết thúc
             if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
                 return {"success": False, "message": f"Không thể xóa điểm đến '{dest_id}' vì đang có chuyến dẫn đường chưa kết thúc tới điểm này (trạng thái: {self._navigation_state})"}
@@ -286,14 +305,20 @@ class MockRobotAdapter(BaseRobotAdapter):
 
             old_destinations = list(self._destinations)
             deleted_dest = self._destinations.pop(existing_idx)
+            deleted_name = deleted_dest.get("name") or dest_id
+            snapshot = list(self._destinations)
 
-            saved = self._save_destinations()
+        if not hasattr(self, "_io_lock"):
+            self._io_lock = threading.Lock()
+        with self._io_lock:
+            saved = self._write_destinations_file(snapshot)
+
+        with self._lock:
             if not saved:
                 self._destinations = old_destinations
                 return {"success": False, "message": "Không thể lưu điểm đến sau khi xóa"}
 
             self._destinations_version += 1
-            deleted_name = deleted_dest.get("name") or dest_id
             event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
             return {"success": True, "message": f"Đã xóa thành công điểm đến '{deleted_name}'", "destinations_version": self._destinations_version}
 
@@ -670,65 +695,127 @@ class MockRobotAdapter(BaseRobotAdapter):
                 self._released_hold_ids = collections.OrderedDict()
 
             now = time.monotonic()
+
+            # Dọn dẹp cache hold đã giải phóng (> 60s và giữ tối đa 500 phần tử)
+            stale_keys = [k for k, t in self._released_hold_ids.items() if (now - t) > 60.0]
+            for k in stale_keys:
+                self._released_hold_ids.pop(k, None)
+            while len(self._released_hold_ids) > 500:
+                self._released_hold_ids.popitem(last=False)
+
             is_stop_cmd = (abs(linear_x) < 1e-4 and abs(angular_z) < 1e-4)
 
+            # 1. Xử lý Lệnh Dừng (Stop / Emergency Stop)
             if is_stop_cmd:
-                self._publish_zero_velocity()
-                self._current_manual_twist = (0.0, 0.0)
-                self._last_manual_cmd_time = now
-                if getattr(self, "_active_hold_id", None):
-                    self._released_hold_ids[self._active_hold_id] = now
-                    self._active_hold_id = None
-                if hold_id:
-                    self._released_hold_ids[hold_id] = now
-                while len(self._released_hold_ids) > 500:
-                    self._released_hold_ids.popitem(last=False)
-                if seq > getattr(self, "_last_manual_seq", 0):
-                    self._last_manual_seq = seq
-                was_manual = (getattr(self, "_control_mode", "AUTO") == "MANUAL")
-                self._control_mode = "AUTO"
-                self._manual_operator_id = None
-                self._message = "Chế độ tự động (AUTO) sẵn sàng"
-                if was_manual:
-                    event_logger.track_control_mode("AUTO")
-                return {"success": True, "message": "Đã gửi lệnh dừng robot an toàn."}
+                if not hold_id:
+                    # Emergency Stop không gắn hold_id:
+                    # Bất kỳ Admin nào gọi cũng dừng xe ngay lập tức, hủy mọi active hold và đưa về AUTO.
+                    self._publish_zero_velocity()
+                    self._current_manual_twist = (0.0, 0.0)
+                    self._last_manual_cmd_time = now
+                    if getattr(self, "_active_hold_id", None):
+                        self._released_hold_ids[self._active_hold_id] = now
+                        self._active_hold_id = None
+                    was_manual = (getattr(self, "_control_mode", "AUTO") == "MANUAL")
+                    self._control_mode = "AUTO"
+                    self._manual_operator_id = None
+                    self._message = "Chế độ tự động (AUTO) sẵn sàng"
+                    if was_manual:
+                        event_logger.track_control_mode("AUTO")
+                    return {"success": True, "message": "Đã gửi lệnh dừng khẩn cấp (Emergency Stop) thành công."}
 
-            # 1. Kiểm tra điều kiện lái tay và quyền Admin TRƯỚC TIÊN
+                # Lệnh Dừng giải phóng hold cụ thể (release specific hold)
+                self._released_hold_ids[hold_id] = now
+                active_id = getattr(self, "_active_hold_id", None)
+                if active_id == hold_id:
+                    self._active_hold_id = None
+                    self._publish_zero_velocity()
+                    self._current_manual_twist = (0.0, 0.0)
+                    self._last_manual_cmd_time = now
+                    if seq > getattr(self, "_last_manual_seq", 0):
+                        self._last_manual_seq = seq
+                    was_manual = (getattr(self, "_control_mode", "AUTO") == "MANUAL")
+                    self._control_mode = "AUTO"
+                    self._manual_operator_id = None
+                    self._message = "Chế độ tự động (AUTO) sẵn sàng"
+                    if was_manual:
+                        event_logger.track_control_mode("AUTO")
+                    return {"success": True, "message": "Đã giải phóng hold và dừng robot an toàn."}
+                else:
+                    # Hold cũ hoặc không khớp active hold -> Không dừng hay làm gián đoạn active hold mới
+                    return {"success": True, "ignored": True, "message": f"Hold '{hold_id}' không còn là active hold, bỏ qua dừng."}
+
+            # 2. Xử lý Lệnh Chuyển động (Vận tốc khác 0)
+            # BẮT BUỘC có hold_id và seq >= 1 (Loại bỏ hoàn toàn single-shot/legacy branch cho lệnh chuyển động)
+            if not hold_id or seq is None or seq < 1:
+                return {
+                    "success": False,
+                    "message": "Yêu cầu hold_id và seq (seq >= 1) hợp lệ cho lệnh vận tốc di chuyển."
+                }
+
+            # Kiểm tra hold đã giải phóng
+            if hold_id in self._released_hold_ids:
+                return {
+                    "success": True,
+                    "ignored": True,
+                    "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."
+                }
+
+            # Kiểm tra thứ tự và thời gian tạo hold (Tránh hold cũ đến muộn chiếm quyền hold mới)
+            hold_timestamp_ms = None
+            if hold_id.startswith("hold_"):
+                parts = hold_id.split("_")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    hold_timestamp_ms = int(parts[1])
+
+            if getattr(self, "_active_hold_id", None) == hold_id:
+                last_seq = getattr(self, "_last_manual_seq", 0)
+                if seq <= last_seq:
+                    return {
+                        "success": True,
+                        "ignored": True,
+                        "message": f"Bỏ qua lệnh vận tốc đến trễ hoặc lặp seq (seq {seq} <= {last_seq})."
+                    }
+                self._last_manual_seq = seq
+            else:
+                # Hold mới được khởi tạo
+                if hold_timestamp_ms is not None:
+                    last_hold_ts = getattr(self, "_last_hold_timestamp_ms", 0)
+                    if hold_timestamp_ms < last_hold_ts:
+                        logger.warning(
+                            f"Bỏ qua hold cũ đến trễ: {hold_id} (ts: {hold_timestamp_ms} < {last_hold_ts})"
+                        )
+                        return {
+                            "success": True,
+                            "ignored": True,
+                            "message": "Bỏ qua hold cũ đến trễ hơn hold đã xử lý."
+                        }
+                    self._last_hold_timestamp_ms = hold_timestamp_ms
+
+                # Nếu đang có hold hoạt động khác:
+                if getattr(self, "_active_hold_id", None) is not None:
+                    current_op = getattr(self, "_manual_operator_id", None)
+                    if current_op and operator_id and current_op != operator_id:
+                        return {
+                            "success": False,
+                            "message": f"Quyền điều khiển đang thuộc về phiên khác ({current_op})."
+                        }
+                    # Đưa hold cũ vào cache giải phóng
+                    self._released_hold_ids[self._active_hold_id] = now
+
+                self._active_hold_id = hold_id
+                self._last_manual_seq = seq
+
+            # 3. Kiểm tra điều kiện lái tay và quyền Admin TRƯỚC TIÊN
             can_drive, reason = self._can_manual_control_locked(operator_id)
             if not can_drive:
                 return {"success": False, "message": reason or "Không đủ điều kiện điều khiển tay."}
 
-            # 2. Kiểm tra dữ liệu đầu vào hữu hạn
+            # 4. Kiểm tra dữ liệu đầu vào hữu hạn
             if not (math.isfinite(linear_x) and math.isfinite(angular_z)):
                 return {"success": False, "message": "Giá trị vận tốc không hợp lệ (NaN hoặc Inf)."}
 
-            # 3. Phân biệt có hold_id (direct press-and-hold) và không có hold_id (single-shot / legacy test)
-            if hold_id:
-                if seq is None or seq < 1:
-                    return {"success": False, "message": "Yêu cầu seq hợp lệ (seq >= 1) cho lượt giữ nút."}
-                if hold_id in self._released_hold_ids:
-                    return {"success": True, "ignored": True, "message": "Bỏ qua lệnh vận tốc của lượt bấm đã kết thúc."}
-                if getattr(self, "_active_hold_id", None) == hold_id:
-                    last_seq = getattr(self, "_last_manual_seq", 0)
-                    if seq <= last_seq:
-                        return {"success": True, "ignored": True, "message": f"Bỏ qua lệnh vận tốc đến trễ hoặc lặp seq (seq {seq} <= {last_seq})."}
-                    self._last_manual_seq = seq
-                else:
-                    if getattr(self, "_active_hold_id", None) is not None:
-                        current_op = getattr(self, "_manual_operator_id", None)
-                        if current_op and operator_id and current_op != operator_id:
-                            return {"success": False, "message": f"Quyền điều khiển đang thuộc về phiên khác ({current_op})."}
-                        self._released_hold_ids[self._active_hold_id] = now
-                        while len(self._released_hold_ids) > 500:
-                            self._released_hold_ids.popitem(last=False)
-                    self._active_hold_id = hold_id
-                    self._last_manual_seq = seq
-            elif seq and seq > 0:
-                return {"success": False, "message": "Yêu cầu hold_id hợp lệ cho gói lệnh tuần tự."}
-            else:
-                self._last_manual_seq = getattr(self, "_last_manual_seq", 0) + 1
-
-            # Tự động lấy quyền MANUAL tạm thời cho lượt giữ này
+            # 5. Kích hoạt MANUAL
             was_auto = (getattr(self, "_control_mode", "AUTO") != "MANUAL")
             self._control_mode = "MANUAL"
             self._manual_operator_id = operator_id

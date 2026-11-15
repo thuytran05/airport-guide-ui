@@ -1988,7 +1988,11 @@ async def test_manual_control_arbitration_concurrency_and_timeout():
         assert adapter._control_mode == "MANUAL"
 
         # Gửi vận tốc qua Admin API
-        res_admin_vel = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.1}, headers=admin_headers)
+        res_admin_vel = await client.post(
+            "/api/robot/control/velocity",
+            json={"linear_x": 0.2, "angular_z": 0.1, "seq": 1, "hold_id": "hold_adm_1"},
+            headers=admin_headers
+        )
         assert res_admin_vel.status_code == 200
         assert res_admin_vel.json()["success"] is True
 
@@ -2049,7 +2053,7 @@ async def test_manual_control_arbitration_concurrency_and_timeout():
     assert res_admin2_enable["success"] is False
     assert "thuộc về Admin khác (admin1)" in res_admin2_enable["message"]
 
-    res_admin2_vel = adapter.send_manual_velocity(0.2, 0.0, operator_id="admin2")
+    res_admin2_vel = adapter.send_manual_velocity(0.2, 0.0, operator_id="admin2", seq=1, hold_id="hold_adm_2")
     assert res_admin2_vel["success"] is False
     assert "thuộc về Admin khác (admin1)" in res_admin2_vel["message"]
 
@@ -2057,7 +2061,7 @@ async def test_manual_control_arbitration_concurrency_and_timeout():
     # Phân đoạn 4: Giới hạn tốc độ (Speed Clamping) & Watchdog
     # -------------------------------------------------------------
     # Gửi vận tốc vượt trần: linear_x=2.0 (trần 0.3), angular_z=-3.0 (trần -0.5)
-    res_clamped = adapter.send_manual_velocity(2.0, -3.0, operator_id="admin1")
+    res_clamped = adapter.send_manual_velocity(2.0, -3.0, operator_id="admin1", seq=1, hold_id="hold_adm_clamp")
     assert res_clamped["success"] is True
     assert adapter._current_manual_twist == (0.3, -0.5)
 
@@ -2835,12 +2839,20 @@ async def test_admin_multi_session_distinct_control_arbitration():
         assert op1 is not None and op1.startswith("sess_")
 
         # Phiên 2 gửi lệnh vận tốc chuyển động (khác 0) -> BỊ TỪ CHỐI
-        r_vel2 = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.0}, headers=h2)
+        r_vel2 = await client.post(
+            "/api/robot/control/velocity",
+            json={"linear_x": 0.2, "angular_z": 0.0, "seq": 1, "hold_id": "hold_s2_1"},
+            headers=h2
+        )
         assert r_vel2.status_code == 400
         assert "thuộc về" in r_vel2.json()["detail"] or "Admin khác" in r_vel2.json()["detail"]
 
         # Phiên 1 gửi lệnh vận tốc chuyển động -> THÀNH CÔNG
-        r_vel1 = await client.post("/api/robot/control/velocity", json={"linear_x": 0.2, "angular_z": 0.0}, headers=h1)
+        r_vel1 = await client.post(
+            "/api/robot/control/velocity",
+            json={"linear_x": 0.2, "angular_z": 0.0, "seq": 1, "hold_id": "hold_s1_1"},
+            headers=h1
+        )
         assert r_vel1.status_code == 200
         assert adapter._current_manual_twist[0] > 0
 
@@ -3279,6 +3291,242 @@ async def test_direct_manual_control_press_hold_and_voice_privacy(tmp_path):
         assert guest_data["voice_response"] is None
         assert guest_data["can_manual_control"] is False
         assert guest_data["manual_lock_reason"] == "Yêu cầu quyền Admin"
+
+    app.dependency_overrides.pop(get_robot_adapter, None)
+
+
+@pytest.mark.anyio
+async def test_manual_control_cmd_vel_twist_and_issues_a_to_f(tmp_path):
+    """
+    Kiểm thử chuyên sâu cho toàn bộ 6 lỗi và cấu hình mới của điều khiển tay:
+    - Sim profile: /cmd_vel với kiểu geometry_msgs/msg/Twist
+    - Issue C: Từ chối gói chuyển động thiếu hold_id hoặc seq < 1; cho phép Emergency Stop không hold_id
+    - Issue D: Chống hold cũ đến muộn chiếm quyền hold mới; nhả hold cũ không hủy hold mới
+    - Issue E: Watchdog & khóa luồng không bị nghẽn khi lưu destination chậm (I/O ngoài self._lock)
+    - Issue F: is_manual_consumer_available lọc endpoint tiêu thụ (ros_gz_bridge/command_timeout);
+               Khóa manual khi Nav2 đang có mục tiêu ngoại vi (RViz)
+    """
+    from app.ros_config import get_ros_config
+    from app.adapters.mock_adapter import MockRobotAdapter
+    from app.adapters.factory import get_robot_adapter
+    from app.main import app
+
+    # 1. Kiểm tra cấu hình ROS sim profile
+    cfg = get_ros_config(reload=True)
+    cmd_cfg = cfg.get_topic("cmd_vel_manual")
+    assert cmd_cfg is not None
+    assert cmd_cfg.name == "/cmd_vel"
+    assert cmd_cfg.type == "geometry_msgs/msg/Twist"
+    assert cmd_cfg.qos["reliability"] == "reliable"
+    assert cmd_cfg.qos["durability"] == "volatile"
+
+    adapter = MockRobotAdapter()
+    adapter._destinations_file = tmp_path / "destinations.yaml"
+    adapter._manual_consumer_available = True
+    adapter._is_connected = True
+    adapter._is_data_stale = False
+
+    app.dependency_overrides[get_robot_adapter] = lambda: adapter
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Lấy token Admin
+        login_res = await client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+        adm_tok = login_res.json()["access_token"]
+        adm_headers = {"Authorization": f"Bearer {adm_tok}"}
+
+        # ------------------------------------------------------------------
+        # PHẦN 2 (ISSUE C): Kiểm tra từ chối lệnh chuyển động thiếu hold_id / seq
+        # ------------------------------------------------------------------
+        # 2.1 Gửi lệnh chuyển động thiếu hold_id -> 400 Bad Request
+        r_no_hold = await client.post(
+            "/api/robot/control/velocity",
+            json={"linear_x": 0.25, "angular_z": 0.0},
+            headers=adm_headers
+        )
+        assert r_no_hold.status_code == 400
+        assert "hold_id" in r_no_hold.json()["detail"]
+
+        # 2.2 Gửi lệnh chuyển động có hold_id nhưng seq < 1 -> 400 Bad Request
+        r_bad_seq = await client.post(
+            "/api/robot/control/velocity",
+            json={"linear_x": 0.25, "angular_z": 0.0, "hold_id": "hold_1000_test", "seq": 0},
+            headers=adm_headers
+        )
+        assert r_bad_seq.status_code == 400
+        assert "seq" in r_bad_seq.json()["detail"]
+
+        # 2.3 Emergency Stop (0, 0 không có hold_id) -> Phải THÀNH CÔNG từ Admin
+        r_estop = await client.post(
+            "/api/robot/control/velocity",
+            json={"linear_x": 0.0, "angular_z": 0.0},
+            headers=adm_headers
+        )
+        assert r_estop.status_code == 200
+        assert adapter._current_manual_twist == (0.0, 0.0)
+        assert adapter._control_mode == "AUTO"
+
+        # ------------------------------------------------------------------
+        # PHẦN 3 (ISSUE D): Chống hold cũ đến muộn và cô lập giải phóng hold
+        # ------------------------------------------------------------------
+        # 3.1 Bắt đầu Hold 2 (timestamp mới hơn: 200000)
+        res_h2 = adapter.send_manual_velocity(
+            linear_x=0.25, angular_z=0.0,
+            operator_id="admin_session_1",
+            seq=1, hold_id="hold_200000_abc"
+        )
+        assert res_h2["success"] is True
+        assert adapter._active_hold_id == "hold_200000_abc"
+
+        # 3.2 Gói đầu tiên của Hold 1 cũ (timestamp cũ hơn: 100000) đến trễ
+        # -> Phải bị bỏ qua (ignored), KHÔNG được chiếm quyền hay thay thế Hold 2
+        res_h1_late = adapter.send_manual_velocity(
+            linear_x=0.2, angular_z=0.1,
+            operator_id="admin_session_1",
+            seq=1, hold_id="hold_100000_xyz"
+        )
+        assert res_h1_late.get("ignored") is True
+        assert adapter._active_hold_id == "hold_200000_abc"
+
+        # 3.3 Lệnh nhả hold của Hold 1 cũ gửi tới -> Bị bỏ qua, KHÔNG làm dừng hay hủy Hold 2
+        res_h1_release = adapter.send_manual_velocity(
+            linear_x=0.0, angular_z=0.0,
+            operator_id="admin_session_1",
+            seq=2, hold_id="hold_100000_xyz"
+        )
+        assert res_h1_release.get("ignored") is True
+        assert adapter._active_hold_id == "hold_200000_abc"
+        assert adapter._control_mode == "MANUAL"
+
+        # 3.4 Tiếp tục gửi tick của Hold 2 -> Vẫn hoạt động bình thường
+        res_h2_seq2 = adapter.send_manual_velocity(
+            linear_x=0.25, angular_z=0.0,
+            operator_id="admin_session_1",
+            seq=2, hold_id="hold_200000_abc"
+        )
+        assert res_h2_seq2["success"] is True
+
+        # 3.5 Nhả đúng Hold 2 -> Giải phóng an toàn về AUTO
+        res_h2_release = adapter.send_manual_velocity(
+            linear_x=0.0, angular_z=0.0,
+            operator_id="admin_session_1",
+            seq=3, hold_id="hold_200000_abc"
+        )
+        assert res_h2_release["success"] is True
+        assert adapter._active_hold_id is None
+        assert adapter._control_mode == "AUTO"
+
+        # 3.6 Lệnh trễ của Hold 2 đã giải phóng -> Không kích hoạt lại
+        res_h2_late = adapter.send_manual_velocity(
+            linear_x=0.25, angular_z=0.0,
+            operator_id="admin_session_1",
+            seq=4, hold_id="hold_200000_abc"
+        )
+        assert res_h2_late.get("ignored") is True
+        assert adapter._control_mode == "AUTO"
+
+        # ------------------------------------------------------------------
+        # PHẦN 4 (ISSUE E): Watchdog & Khóa luồng khi lưu destination chậm
+        # ------------------------------------------------------------------
+        # Kích hoạt lái tay
+        adapter.send_manual_velocity(
+            linear_x=0.25, angular_z=0.0,
+            operator_id="admin_session_1",
+            seq=1, hold_id="hold_300000_slow"
+        )
+        assert adapter._control_mode == "MANUAL"
+        assert adapter._current_manual_twist[0] > 0
+
+        # Giả lập thao tác ghi tệp tốn 0.4s
+        orig_write = adapter._write_destinations_file
+        def slow_write(data):
+            time.sleep(0.4)
+            return orig_write(data)
+        adapter._write_destinations_file = slow_write
+
+        # Gọi upsert_destination trong worker thread qua API
+        import threading
+        save_thread = threading.Thread(
+            target=lambda: adapter.upsert_destination({
+                "id": "gate_slow_test",
+                "name": "Gate Slow Test",
+                "pose": {"x": 1.0, "y": 2.0, "theta": 0.0}
+            })
+        )
+        save_thread.start()
+        time.sleep(0.05)  # Đảm bảo save_thread đang trong _write_destinations_file
+
+        # Kiểm tra: trong khi đang lưu tệp, check_manual_timeout hoặc send_manual_velocity dừng xe
+        # KHÔNG bị chặn bởi self._lock!
+        t_start = time.monotonic()
+        adapter._last_manual_cmd_time = time.monotonic() - 1.0
+        adapter.check_manual_timeout()
+        t_elapsed = time.monotonic() - t_start
+
+        # Thời gian check watchdog phải cực nhanh (< 0.1s), không bị khóa 0.4s bởi disk write
+        assert t_elapsed < 0.15, f"Watchdog bị chặn bởi I/O khóa luồng! Thời gian đo: {t_elapsed}s"
+        assert adapter._control_mode == "AUTO"
+        assert adapter._current_manual_twist == (0.0, 0.0)
+
+        save_thread.join()
+        adapter._write_destinations_file = orig_write
+
+        # ------------------------------------------------------------------
+        # PHẦN 5 (ISSUE F): Khóa khi Nav2 có RViz goal & Xác thực consumer
+        # ------------------------------------------------------------------
+        # 5.1 Khi Nav2 có active goal từ RViz
+        adapter._nav2_has_active_goal = True
+        st = adapter.get_status()
+        assert st["external_goal_active"] is True
+
+        r_st = await client.get("/api/robot/status", headers=adm_headers)
+        st_data = r_st.json()
+        assert st_data["can_manual_control"] is False
+        assert "RViz" in st_data["manual_lock_reason"]
+
+        # Gọi lệnh vận tốc di chuyển -> Bị từ chối 400
+        r_vel_blocked = await client.post(
+            "/api/robot/control/velocity",
+            json={"linear_x": 0.2, "angular_z": 0.0, "hold_id": "hold_400000_rviz", "seq": 1},
+            headers=adm_headers
+        )
+        assert r_vel_blocked.status_code == 400
+        assert "ngoài" in r_vel_blocked.json()["detail"] or "RViz" in r_vel_blocked.json()["detail"]
+
+        # 5.2 Kiểm tra logic lọc endpoint trong RosRobotAdapter.is_manual_consumer_available()
+        from app.adapters.ros_adapter import RosRobotAdapter
+        class DummySub:
+            def __init__(self, name, topic_type):
+                self.node_name = name
+                self.topic_type = topic_type
+
+        class DummyPub:
+            def __init__(self, topic_name):
+                self.topic_name = topic_name
+            def get_subscription_count(self):
+                return 1
+
+        class DummyNode:
+            def __init__(self, subs):
+                self._subs = subs
+            def get_subscriptions_info_by_topic(self, topic):
+                return self._subs
+
+        ros_dummy = object.__new__(RosRobotAdapter)
+        ros_dummy._pub_cmd_vel = DummyPub("/cmd_vel")
+        ros_dummy._cmd_vel_is_twist = True
+
+        # Khi chỉ có CLI topic echo (_ros2cli_echo) -> Không coi là consumer hợp lệ
+        ros_dummy._node = DummyNode([DummySub("_ros2cli_echo_123", "geometry_msgs/msg/Twist")])
+        assert ros_dummy.is_manual_consumer_available() is False
+
+        # Khi có ros_gz_bridge với geometry_msgs/msg/Twist -> Hợp lệ
+        ros_dummy._node = DummyNode([DummySub("ros_gz_bridge", "geometry_msgs/msg/Twist")])
+        assert ros_dummy.is_manual_consumer_available() is True
+
+        # Khi có command_timeout với geometry_msgs/msg/Twist -> Hợp lệ
+        ros_dummy._node = DummyNode([DummySub("command_timeout", "geometry_msgs/msg/Twist")])
+        assert ros_dummy.is_manual_consumer_available() is True
 
     app.dependency_overrides.pop(get_robot_adapter, None)
 

@@ -146,7 +146,7 @@ async def telemetry_broadcaster_loop():
                     manual_lock_reason = "Dữ liệu định vị bị trễ (stale)"
                 elif not status.get("manual_consumer_available", False):
                     can_manual_control = False
-                    manual_lock_reason = "Đường lệnh điều khiển tay ROS (/airport/cmd_vel_manual) chưa có consumer tiếp nhận"
+                    manual_lock_reason = "Đường lệnh điều khiển tay ROS chưa có consumer tiếp nhận"
                 elif current_manual_op and not is_manual_controller:
                     can_manual_control = False
                     manual_lock_reason = f"Quyền điều khiển đang thuộc về phiên Admin khác ({current_manual_op})"

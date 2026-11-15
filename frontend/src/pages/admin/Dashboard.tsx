@@ -271,6 +271,8 @@ export default function AdminDashboard() {
   const activeHoldIdRef = useRef<string | null>(null);
   const holdSeqRef = useRef<number>(0);
   const stopDriveRef = useRef<() => void>(() => {});
+  const isVelocityInFlightRef = useRef<boolean>(false);
+  const currentAbortControllerRef = useRef<AbortController | null>(null);
 
   const [showSystemDetails, setShowSystemDetails] = useState(false);
   const [isRefreshingEvents, setIsRefreshingEvents] = useState(false);
@@ -291,9 +293,17 @@ export default function AdminDashboard() {
       clearInterval(driveTimerRef.current);
       driveTimerRef.current = null;
     }
+    // Hủy request vận tốc in-flight nếu đang bay
+    if (currentAbortControllerRef.current) {
+      currentAbortControllerRef.current.abort();
+      currentAbortControllerRef.current = null;
+    }
+    isVelocityInFlightRef.current = false;
+
     const finishedHoldId = activeHoldIdRef.current;
     activeHoldIdRef.current = null;
     activeVelRef.current = { lin: 0, ang: 0 };
+
     if (finishedHoldId) {
       holdSeqRef.current += 1;
       sendManualVelocity(0, 0, holdSeqRef.current, finishedHoldId);
@@ -304,32 +314,75 @@ export default function AdminDashboard() {
     stopDriveRef.current = stopDrive;
   }, [stopDrive]);
 
+  // Ngắt hold ngay lập tức khi mất kết nối backend hoặc dữ liệu telemetry stale
+  useEffect(() => {
+    if (!isBackendConnected || status.isDataStale || !status.isConnected) {
+      if (activeHoldIdRef.current) {
+        stopDriveRef.current();
+      }
+    }
+  }, [isBackendConnected, status.isDataStale, status.isConnected]);
+
   const startDrive = (lin: number, ang: number) => {
     if (!canDrive) return;
     if (driveTimerRef.current) {
       clearInterval(driveTimerRef.current);
       driveTimerRef.current = null;
     }
+    if (currentAbortControllerRef.current) {
+      currentAbortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    currentAbortControllerRef.current = abortController;
+    isVelocityInFlightRef.current = false;
+
     const holdId = `hold_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     activeHoldIdRef.current = holdId;
     holdSeqRef.current = 1;
     activeVelRef.current = { lin, ang };
 
     // Gửi ngay lập tức tick đầu tiên (Backend tự động chuyển tạm sang MANUAL)
-    sendManualVelocity(lin, ang, 1, holdId);
+    isVelocityInFlightRef.current = true;
+    sendManualVelocity(lin, ang, 1, holdId, abortController.signal)
+      .then((ok) => {
+        if (activeHoldIdRef.current !== holdId) return;
+        if (!ok) {
+          stopDriveRef.current();
+        }
+      })
+      .finally(() => {
+        if (activeHoldIdRef.current === holdId) {
+          isVelocityInFlightRef.current = false;
+        }
+      });
 
     // Gửi chu kỳ 10Hz (100ms) trong khi còn giữ nút
     driveTimerRef.current = setInterval(async () => {
       if (activeHoldIdRef.current !== holdId) return;
+      // Bỏ nhịp tick nếu request trước vẫn đang in-flight (> 100-300ms)
+      if (isVelocityInFlightRef.current) {
+        return;
+      }
       holdSeqRef.current += 1;
-      const ok = await sendManualVelocity(
-        activeVelRef.current.lin,
-        activeVelRef.current.ang,
-        holdSeqRef.current,
-        holdId
-      );
-      if (!ok) {
-        stopDrive();
+      const currentSeq = holdSeqRef.current;
+      isVelocityInFlightRef.current = true;
+      try {
+        const ok = await sendManualVelocity(
+          activeVelRef.current.lin,
+          activeVelRef.current.ang,
+          currentSeq,
+          holdId,
+          abortController.signal
+        );
+        // Bỏ qua kết quả nếu holdId đã kết thúc hoặc chuyển sang hold khác
+        if (activeHoldIdRef.current !== holdId) return;
+        if (!ok) {
+          stopDriveRef.current();
+        }
+      } finally {
+        if (activeHoldIdRef.current === holdId) {
+          isVelocityInFlightRef.current = false;
+        }
       }
     }, 100);
   };
@@ -827,10 +880,20 @@ export default function AdminDashboard() {
                     type="button"
                     className={`${styles.dpadBtn} ${styles.stopBtn}`}
                     onClick={() => {
-                      stopDrive();
+                      if (driveTimerRef.current) {
+                        clearInterval(driveTimerRef.current);
+                        driveTimerRef.current = null;
+                      }
+                      if (currentAbortControllerRef.current) {
+                        currentAbortControllerRef.current.abort();
+                        currentAbortControllerRef.current = null;
+                      }
+                      isVelocityInFlightRef.current = false;
+                      activeHoldIdRef.current = null;
+                      activeVelRef.current = { lin: 0, ang: 0 };
                       sendManualVelocity(0, 0, 0, undefined);
                     }}
-                    title="Dừng robot ngay lập tức"
+                    title="Dừng robot ngay lập tức (Emergency Stop)"
                     aria-label="Dừng di chuyển"
                   >
                     Dừng

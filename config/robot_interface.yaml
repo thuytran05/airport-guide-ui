@@ -285,6 +285,17 @@ profiles:
           durability: "volatile"
           depth: 1
         description: "Đường đi quy hoạch toàn cục từ Nav2 planner trong mô phỏng Gazebo"
+      cmd_vel_manual:
+        name: "/cmd_vel"
+        type: "geometry_msgs/msg/Twist"
+        direction: "publish"
+        enabled: true
+        required: false
+        qos:
+          reliability: "reliable"
+          durability: "volatile"
+          depth: 1
+        description: "Lệnh vận tốc điều khiển tay trực tiếp tới robot trong mô phỏng Gazebo (geometry_msgs/msg/Twist)"
     # Ánh xạ nguồn nội bộ (nếu Nav2 hoặc Gazebo phát tên mặc định)
     internal_sources:
       gazebo_scan: "/scan"

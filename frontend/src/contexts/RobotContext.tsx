@@ -26,7 +26,7 @@ interface RobotContextType {
   confirmVoiceProposal: (proposalId: string, destinationId?: string) => Promise<{ success: boolean; message?: string }>;
   dismissVoiceProposal: () => Promise<{ success: boolean; message?: string }>;
   setManualControl: (enable: boolean) => Promise<{ success: boolean; message?: string }>;
-  sendManualVelocity: (linear_x: number, angular_z: number, seq?: number, hold_id?: string) => Promise<boolean>;
+  sendManualVelocity: (linear_x: number, angular_z: number, seq?: number, hold_id?: string, signal?: AbortSignal) => Promise<boolean>;
   upsertDestination: (dest: Destination) => Promise<{ success: boolean; message?: string }>;
   deleteDestination: (id: string) => Promise<{ success: boolean; message?: string }>;
 }
@@ -416,7 +416,8 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     linear_x: number,
     angular_z: number,
     seq?: number,
-    hold_id?: string
+    hold_id?: string,
+    signal?: AbortSignal
   ): Promise<boolean> => {
     try {
       await apiClient.post('/api/robot/control/velocity', {
@@ -424,7 +425,7 @@ export function RobotProvider({ children }: { children: ReactNode }) {
         angular_z,
         seq: seq ?? 0,
         hold_id: hold_id || undefined,
-      });
+      }, { signal });
       return true;
     } catch {
       return false;
