@@ -1137,26 +1137,30 @@ class RosRobotAdapter(BaseRobotAdapter):
             saved = False
             save_err = ""
             try:
-                # Lưu file bền vững ngoài self._lock (dưới self._io_lock) để không chặn watchdog hay lệnh vận tốc
-                saved, save_err = self._write_destinations_file(snapshot)
+                try:
+                    # Lưu file bền vững ngoài self._lock (dưới self._io_lock) để không chặn watchdog hay lệnh vận tốc
+                    saved, save_err = self._write_destinations_file(snapshot)
+                except Exception as exc:
+                    saved = False
+                    save_err = str(exc)
+
+                # Quyết định commit hoặc báo lỗi và gỡ reservation trong cùng lần giữ self._lock
+                with self._lock:
+                    if not saved:
+                        self._pending_dest_modifications.discard(dest_id)
+                        # Ghi file thất bại: Bộ nhớ hoàn toàn không bị ảnh hưởng, không đổi file
+                        return {"success": False, "message": f"Không thể lưu điểm đến: {save_err}"}
+
+                    # Ghi file thành công: Commit vào bộ nhớ và gỡ reservation trong cùng lần giữ self._lock
+                    self._destinations = new_destinations
+                    self._destinations_version = getattr(self, "_destinations_version", 0) + 1
+                    self._pending_dest_modifications.discard(dest_id)
+                    event_logger.add_event("SUCCESS", "DESTINATION", f"Đã lưu điểm đến '{name}' ({dest_id})")
+                    return {"success": True, "message": f"Đã lưu điểm đến '{name}' thành công"}
             finally:
+                # Đảm bảo gỡ reservation kể cả khi có ngoại lệ ngoài dự kiến
                 with self._lock:
                     self._pending_dest_modifications.discard(dest_id)
-
-            with self._lock:
-                if not saved:
-                    # Ghi file thất bại: Bộ nhớ hoàn toàn không bị ảnh hưởng, không cần rollback
-                    return {"success": False, "message": f"Không thể lưu điểm đến: {save_err}"}
-
-                # Kiểm tra lại trạng thái dẫn đường: nếu có race lọt qua, từ chối commit an toàn
-                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
-                    return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"}
-
-                # Ghi file thành công: Commit vào bộ nhớ và tăng version
-                self._destinations = new_destinations
-                self._destinations_version = getattr(self, "_destinations_version", 0) + 1
-                event_logger.add_event("SUCCESS", "DESTINATION", f"Đã lưu điểm đến '{name}' ({dest_id})")
-                return {"success": True, "message": f"Đã lưu điểm đến '{name}' thành công"}
 
     def delete_destination(self, destination_id: str) -> Dict[str, Any]:
         """
@@ -1202,37 +1206,38 @@ class RosRobotAdapter(BaseRobotAdapter):
             saved_ok = False
             save_err = ""
             try:
-                # Lưu bền vững ra tệp YAML ngoài self._lock (dưới self._io_lock)
-                saved_ok, save_err = self._write_destinations_file(snapshot)
+                try:
+                    # Lưu bền vững ra tệp YAML ngoài self._lock (dưới self._io_lock)
+                    saved_ok, save_err = self._write_destinations_file(snapshot)
+                except Exception as exc:
+                    saved_ok = False
+                    save_err = str(exc)
+
+                # Quyết định commit hoặc báo lỗi và gỡ reservation trong cùng lần giữ self._lock
+                with self._lock:
+                    if not saved_ok:
+                        self._pending_dest_modifications.discard(dest_id)
+                        # Ghi file thất bại: Bộ nhớ không đổi
+                        return {"success": False, "message": f"Không thể lưu điểm đến sau khi xóa: {save_err}"}
+
+                    # Ghi file thành công: Commit bộ nhớ và gỡ reservation trong cùng lần giữ self._lock
+                    self._destinations = new_destinations
+                    self._destinations_version = getattr(self, "_destinations_version", 0) + 1
+                    self._pending_dest_modifications.discard(dest_id)
+                    event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
+                    logger.info(
+                        f"Đã xóa thành công điểm đến '{dest_id}' ({deleted_name}). "
+                        f"Danh sách còn lại {len(self._destinations)} điểm. destinations_version={self._destinations_version}"
+                    )
+                    return {
+                        "success": True,
+                        "message": f"Đã xóa thành công điểm đến '{deleted_name}'",
+                        "destinations_version": self._destinations_version,
+                    }
             finally:
+                # Đảm bảo gỡ reservation kể cả khi có ngoại lệ ngoài dự kiến
                 with self._lock:
                     self._pending_dest_modifications.discard(dest_id)
-
-            with self._lock:
-                if not saved_ok:
-                    # Ghi file thất bại: Bộ nhớ không đổi
-                    return {"success": False, "message": f"Không thể lưu điểm đến sau khi xóa: {save_err}"}
-
-                # Kiểm tra lại trạng thái dẫn đường: nếu có race lọt qua, từ chối commit an toàn
-                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
-                    return {
-                        "success": False,
-                        "message": f"Không thể xóa điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"
-                    }
-
-                # Ghi file thành công: Commit bộ nhớ
-                self._destinations = new_destinations
-                self._destinations_version = getattr(self, "_destinations_version", 0) + 1
-                event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
-                logger.info(
-                    f"Đã xóa thành công điểm đến '{dest_id}' ({deleted_name}). "
-                    f"Danh sách còn lại {len(self._destinations)} điểm. destinations_version={self._destinations_version}"
-                )
-                return {
-                    "success": True,
-                    "message": f"Đã xóa thành công điểm đến '{deleted_name}'",
-                    "destinations_version": self._destinations_version,
-                }
 
     def start_navigation(self, destination_id: str, owner_id: str) -> Dict[str, Any]:
         with self._lock:

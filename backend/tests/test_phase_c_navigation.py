@@ -4082,6 +4082,198 @@ def test_destinations_navigation_race_and_linearization(tmp_path):
             assert len(adapter.get_destinations()) == 1
 
 
+# =========================================================================
+# 13. Concurrency Race: Start Navigation Exactly Post-Write & Pre-Commit
+# =========================================================================
+
+def test_destinations_start_navigation_race_post_write_pre_commit(tmp_path):
+    """
+    Kiểm thử đồng thời ép start_navigation xảy ra ĐÚNG LÚC GHI FILE VỪA XONG
+    nhưng bộ nhớ CHƯA COMMIT:
+    - Kiểm tra start_navigation bị từ chối trong khoảng giữa này (vì reservation vẫn được giữ).
+    - Sau khi cho phép commit hoàn thành:
+      + Đối với Delete: Delete trả success=True, file và bộ nhớ đều đã xóa điểm (đồng nhất 100%).
+      + Đối với Upsert: Upsert trả success=True, file và bộ nhớ đều đã cập nhật điểm (đồng nhất 100%).
+    - Kiểm tra cả trên MockRobotAdapter và RosRobotAdapter cô lập.
+    """
+    from collections import OrderedDict
+    from app.adapters.ros_adapter import RosRobotAdapter
+    from app.adapters.mock_adapter import MockRobotAdapter
+    from app.coordinate.transform import MapMetadata
+
+    def create_test_adapters(base_dir, name):
+        f_mock = base_dir / f"{name}_mock_dest.yaml"
+        f_ros = base_dir / f"{name}_ros_dest.yaml"
+
+        ad_mock = MockRobotAdapter()
+        ad_mock._destinations = []
+        ad_mock._destinations_version = 0
+        ad_mock._destinations_file = f_mock
+        ad_mock._navigation_state = "IDLE"
+        ad_mock._destination_id = None
+        ad_mock._control_mode = "AUTO"
+        ad_mock._manual_operator_id = None
+        ad_mock._active_hold_id = None
+        ad_mock._released_hold_ids = OrderedDict()
+        ad_mock._last_manual_seq = 0
+        ad_mock._current_manual_twist = (0.0, 0.0)
+        ad_mock._last_manual_cmd_time = 0.0
+        ad_mock._pending_dest_modifications = set()
+
+        ad_ros = object.__new__(RosRobotAdapter)
+        ad_ros._lock = threading.Lock()
+        ad_ros._io_lock = threading.Lock()
+        ad_ros._cfg = get_ros_config()
+        ad_ros._destinations = []
+        ad_ros._destinations_version = 0
+        ad_ros._destinations_file = f_ros
+        ad_ros._navigation_state = "IDLE"
+        ad_ros._destination_id = None
+        ad_ros._control_mode = "AUTO"
+        ad_ros._manual_operator_id = None
+        ad_ros._active_hold_id = None
+        ad_ros._released_hold_ids = OrderedDict()
+        ad_ros._last_manual_seq = 0
+        ad_ros._current_manual_twist = (0.0, 0.0)
+        ad_ros._last_manual_cmd_time = 0.0
+        ad_ros._pub_cmd_vel = None
+        ad_ros._pending_dest_modifications = set()
+        ad_ros._map_meta = MapMetadata(width=200, height=200, resolution=0.05, origin_x=0.0, origin_y=0.0, origin_yaw=0.0)
+        ad_ros._occupancy_grid_data = [0] * 40000
+
+        return [("MockAdapter", ad_mock, f_mock), ("RosAdapter", ad_ros, f_ros)]
+
+    # -------------------------------------------------------------
+    # 1. DELETE: Ghi file xong nhưng CHƯA COMMIT -> Start bị từ chối
+    # -------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_test_adapters(tmp_path, "post_write_delete"):
+        initial_dest = {
+            "id": "gate_pw_del",
+            "name": "Cổng Test Xóa Post-Write",
+            "pose": {"position": {"x": 2.0, "y": 3.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+        res_init = adapter.upsert_destination(initial_dest)
+        assert res_init["success"] is True
+
+        orig_write = adapter._write_destinations_file
+        event_file_written = threading.Event()
+        event_allow_commit = threading.Event()
+
+        def hook_write_delete(dest_list):
+            res = orig_write(dest_list)
+            # TẠI ĐÂY: File đĩa đã được ghi (đã xóa điểm khỏi file),
+            # nhưng chưa trả về adapter để adapter lấy self._lock commit bộ nhớ!
+            event_file_written.set()
+            assert event_allow_commit.wait(timeout=5.0), "Timeout chờ commit"
+            return res
+
+        adapter._write_destinations_file = hook_write_delete
+
+        res_delete_box = {}
+        def run_delete():
+            res_delete_box["res"] = adapter.delete_destination("gate_pw_del")
+
+        t_del = threading.Thread(target=run_delete)
+        t_del.start()
+
+        # Chờ đúng lúc file đã ghi xong trên đĩa
+        assert event_file_written.wait(timeout=5.0)
+
+        # Kiểm chứng trạng thái ở khoảng giữa:
+        # a) File trên đĩa ĐÃ MẤT gate_pw_del
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data = yaml.safe_load(f)
+        assert len(disk_data.get("destinations", [])) == 0, f"[{adapter_name}] File đĩa phải đã xóa gate_pw_del"
+
+        # b) Bộ nhớ vẫn CHƯA COMMIT (vẫn còn gate_pw_del)
+        mem_dests_pre = adapter.get_destinations()
+        assert len(mem_dests_pre) == 1, f"[{adapter_name}] Bộ nhớ chưa commit phải vẫn còn điểm"
+
+        # c) ÉP GỌI start_navigation tới gate_pw_del TRONG KHOẢNG NÀY:
+        # PHẢI BỊ TỪ CHỐI AN TOÀN vì điểm vẫn đang trong reservation (_pending_dest_modifications)
+        res_nav = adapter.start_navigation("gate_pw_del", "passenger_1")
+        assert res_nav["success"] is False, f"[{adapter_name}] Start navigation phải bị từ chối: {res_nav}"
+        assert "đang trong quá trình cập nhật hoặc lưu trữ" in res_nav["message"]
+
+        # d) Cho phép adapter tiếp tục commit bộ nhớ
+        event_allow_commit.set()
+        t_del.join(timeout=5.0)
+
+        # e) Kết quả sau khi commit hoàn tất:
+        assert res_delete_box["res"]["success"] is True, f"[{adapter_name}] Xóa phải thành công: {res_delete_box}"
+        # Bộ nhớ và file trên đĩa đồng nhất 100% (cả hai đều đã xóa sạch)
+        assert len(adapter.get_destinations()) == 0
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data_final = yaml.safe_load(f)
+        assert len(disk_data_final.get("destinations", [])) == 0
+        assert len(adapter._pending_dest_modifications) == 0
+
+    # -------------------------------------------------------------
+    # 2. UPSERT: Ghi file xong nhưng CHƯA COMMIT -> Start bị từ chối
+    # -------------------------------------------------------------
+    for adapter_name, adapter, dest_file in create_test_adapters(tmp_path, "post_write_upsert"):
+        initial_dest = {
+            "id": "gate_pw_up",
+            "name": "Cổng Gốc",
+            "pose": {"position": {"x": 1.0, "y": 1.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+        res_init = adapter.upsert_destination(initial_dest)
+        assert res_init["success"] is True
+
+        orig_write = adapter._write_destinations_file
+        event_file_written = threading.Event()
+        event_allow_commit = threading.Event()
+
+        def hook_write_upsert(dest_list):
+            res = orig_write(dest_list)
+            event_file_written.set()
+            assert event_allow_commit.wait(timeout=5.0), "Timeout chờ commit"
+            return res
+
+        adapter._write_destinations_file = hook_write_upsert
+
+        updated_dest = {
+            "id": "gate_pw_up",
+            "name": "Cổng Đã Cập Nhật",
+            "pose": {"position": {"x": 7.0, "y": 8.0, "z": 0.0}, "orientation": {"z": 0.0, "w": 1.0}}
+        }
+
+        res_upsert_box = {}
+        def run_upsert():
+            res_upsert_box["res"] = adapter.upsert_destination(updated_dest)
+
+        t_up = threading.Thread(target=run_upsert)
+        t_up.start()
+
+        assert event_file_written.wait(timeout=5.0)
+
+        # a) File trên đĩa ĐÃ CẬP NHẬT tọa độ mới
+        with open(dest_file, "r", encoding="utf-8") as f:
+            disk_data = yaml.safe_load(f)
+        assert disk_data["destinations"][0]["pose"]["position"]["x"] == 7.0
+
+        # b) Bộ nhớ vẫn CHƯA COMMIT (vẫn là tọa độ cũ 1.0)
+        mem_dests_pre = adapter.get_destinations()
+        assert mem_dests_pre[0]["pose"]["position"]["x"] == 1.0
+
+        # c) ÉP GỌI start_navigation tới gate_pw_up TRONG KHOẢNG NÀY:
+        res_nav = adapter.start_navigation("gate_pw_up", "passenger_1")
+        assert res_nav["success"] is False, f"[{adapter_name}] Start navigation phải bị từ chối: {res_nav}"
+        assert "đang trong quá trình cập nhật hoặc lưu trữ" in res_nav["message"]
+
+        # d) Cho phép commit bộ nhớ
+        event_allow_commit.set()
+        t_up.join(timeout=5.0)
+
+        # e) Kết quả sau khi commit:
+        assert res_upsert_box["res"]["success"] is True
+        mem_dests_final = adapter.get_destinations()
+        assert mem_dests_final[0]["pose"]["position"]["x"] == 7.0
+        assert mem_dests_final[0]["name"] == "Cổng Đã Cập Nhật"
+        assert len(adapter._pending_dest_modifications) == 0
+
+
+
 
 
 

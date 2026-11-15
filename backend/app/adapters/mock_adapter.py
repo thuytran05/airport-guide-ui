@@ -288,24 +288,26 @@ class MockRobotAdapter(BaseRobotAdapter):
 
             saved = False
             try:
-                saved = self._write_destinations_file(snapshot)
+                try:
+                    saved = self._write_destinations_file(snapshot)
+                except Exception:
+                    saved = False
+
+                with self._lock:
+                    if not saved:
+                        self._pending_dest_modifications.discard(dest_id)
+                        # Ghi file thất bại: Bộ nhớ hoàn toàn không bị ảnh hưởng, không cần rollback
+                        return {"success": False, "message": "Không thể lưu điểm đến"}
+
+                    # Ghi file thành công: Commit bộ nhớ và gỡ reservation trong cùng lần giữ self._lock
+                    self._destinations = new_destinations
+                    self._destinations_version += 1
+                    self._pending_dest_modifications.discard(dest_id)
+                    event_logger.add_event("SUCCESS", "DESTINATION", f"Đã lưu điểm đến '{destination.get('name')}' ({dest_id})")
+                    return {"success": True, "message": f"Đã lưu điểm đến '{destination.get('name')}' thành công"}
             finally:
                 with self._lock:
                     self._pending_dest_modifications.discard(dest_id)
-
-            with self._lock:
-                if not saved:
-                    # Ghi file thất bại: Bộ nhớ hoàn toàn không bị ảnh hưởng, không cần rollback
-                    return {"success": False, "message": "Không thể lưu điểm đến"}
-
-                # Kiểm tra lại trạng thái dẫn đường nếu có race
-                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
-                    return {"success": False, "message": f"Không thể cập nhật điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"}
-
-                self._destinations = new_destinations
-                self._destinations_version += 1
-                event_logger.add_event("SUCCESS", "DESTINATION", f"Đã lưu điểm đến '{destination.get('name')}' ({dest_id})")
-                return {"success": True, "message": f"Đã lưu điểm đến '{destination.get('name')}' thành công"}
 
     def delete_destination(self, destination_id: str) -> Dict[str, Any]:
         dest_id = str(destination_id).strip()
@@ -338,27 +340,26 @@ class MockRobotAdapter(BaseRobotAdapter):
 
             saved = False
             try:
-                saved = self._write_destinations_file(snapshot)
+                try:
+                    saved = self._write_destinations_file(snapshot)
+                except Exception:
+                    saved = False
+
+                with self._lock:
+                    if not saved:
+                        self._pending_dest_modifications.discard(dest_id)
+                        # Ghi file thất bại: Bộ nhớ không đổi
+                        return {"success": False, "message": "Không thể lưu điểm đến sau khi xóa"}
+
+                    # Ghi file thành công: Commit bộ nhớ và gỡ reservation trong cùng lần giữ self._lock
+                    self._destinations = new_destinations
+                    self._destinations_version += 1
+                    self._pending_dest_modifications.discard(dest_id)
+                    event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
+                    return {"success": True, "message": f"Đã xóa thành công điểm đến '{deleted_name}'", "destinations_version": self._destinations_version}
             finally:
                 with self._lock:
                     self._pending_dest_modifications.discard(dest_id)
-
-            with self._lock:
-                if not saved:
-                    # Ghi file thất bại: Bộ nhớ không đổi
-                    return {"success": False, "message": "Không thể lưu điểm đến sau khi xóa"}
-
-                # Kiểm tra lại trạng thái dẫn đường nếu có race
-                if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING") and self._destination_id == dest_id:
-                    return {
-                        "success": False,
-                        "message": f"Không thể xóa điểm đến '{dest_id}' vì đã có chuyến dẫn đường vừa bắt đầu tới điểm này"
-                    }
-
-                self._destinations = new_destinations
-                self._destinations_version += 1
-                event_logger.add_event("INFO", "DESTINATION", f"Đã xóa điểm đến '{deleted_name}' ({dest_id})")
-                return {"success": True, "message": f"Đã xóa thành công điểm đến '{deleted_name}'", "destinations_version": self._destinations_version}
 
     def start_navigation(self, destination_id: str, owner_id: str) -> Dict[str, Any]:
         with self._lock:
