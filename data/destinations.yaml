@@ -52,3 +52,29 @@ destinations:
       y: 0
       z: 0
       w: 1
+- id: '123'
+  name: '123'
+  map_id: airport_floor_1
+  pose:
+    position:
+      x: -2.66
+      y: 0.02
+      z: 0
+    orientation:
+      x: 0
+      y: 0
+      z: 0
+      w: 1
+- id: 2d
+  name: sd
+  map_id: airport_floor_1
+  pose:
+    position:
+      x: 1.35
+      y: -0.73
+      z: 0
+    orientation:
+      x: 0
+      y: 0
+      z: 0
+      w: 1
