@@ -91,3 +91,16 @@ destinations:
       y: 0
       z: 0
       w: 1
+- id: w
+  name: wqe
+  map_id: airport_floor_1
+  pose:
+    position:
+      x: -0.01
+      y: 1.78
+      z: 0
+    orientation:
+      x: 0
+      y: 0
+      z: -0.3502073812594674
+      w: 0.9366721892483977
