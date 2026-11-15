@@ -2,7 +2,7 @@
 **Dự án:** Airport Guide Robot UI (`airport-guide-ui`)  
 **Môi trường:** ROS 2 Jazzy (Docker, Domain ID 0, Sim Time = True)  
 **Thời gian cập nhật:** 15/11/2026  
-**Trạng thái nghiệm thu:** **21 / 21 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, Pause & Resume Navigation Architecture Completed, **Startup Lifecycle & Expired Token Recovery Fully Verified**.
+**Trạng thái nghiệm thu:** **23 / 23 Pytest PASSED (100%)**, Frontend & Backend Docker Rebuilt, Persistent Storage & Deletion Verified, Pause & Resume Navigation Architecture Completed, **Startup Lifecycle, AMCL Epoch Synchronization & Expired Token Recovery Fully Verified**.
 
 ---
 
@@ -537,8 +537,10 @@ INFO:     127.0.0.1:0 - "POST /api/robot/navigate HTTP/1.1" 200 OK
 
 ### 10.4. Kết Quả Kiểm Thử Toàn Diện
 1. **Kiểm thử tự động Backend (Pytest):**
-   - Chạy toàn bộ 21 test case trong container `airport_guide_backend`: **21 / 21 PASSED (100%)**.
+   - Chạy toàn bộ 23 test case trong container `airport_guide_backend`: **23 / 23 PASSED (100%)**.
    - Bổ sung các bài thử mới:
+     - `test_amcl_epoch_pose_before_clock_initial_connection`: Xác thực pose AMCL đến trước `/clock` khi khởi động lần đầu, robot đứng yên vẫn kết nối thành công (`is_connected = True`, Robot: OK, nút Bắt đầu mở).
+     - `test_amcl_epoch_clock_rewind_requires_new_pose_after_gazebo_reset`: Xác thực `/clock` quay lùi sau reset Gazebo, pose cũ không tự động được công nhận chỉ vì `/clock` tiếp tục tăng; chờ pose hợp lệ của phiên mới rồi mới báo Robot: OK và cho phép gửi lệnh dẫn đường.
      - `test_sensitive_data_filter_redacts_tokens`: Xác thực regex che dấu token JWT trong nhật ký.
      - `test_expired_token_handling_in_map_endpoint`: Xác thực endpoint `/api/robot/map` trả về 401 khi dùng token hết hạn và chấp nhận `X-Passenger-Token` từ phiên khách hợp lệ.
      - `test_health_check`: Kiểm tra trường `spin_thread_alive` và trạng thái kết nối ROS.
@@ -556,4 +558,25 @@ INFO:     127.0.0.1:0 - "POST /api/robot/navigate HTTP/1.1" 200 OK
      - [Ảnh chụp kết thúc bước kiểm thử](file:///home/thuytran/.gemini/antigravity/brain/81c31923-1a72-4ddf-a742-05d774507e12/browser_evidence/fa2814f0-93a9-4ea7-b13b-f44a0e0cd99c/final_step_75.png)
 4. **Cam kết an toàn:**
    - Hoàn toàn ở chế độ Read-Only đối với hệ ROS và mô phỏng Gazebo. Không gửi goal, không phát lệnh vận tốc `cmd_vel`. Không commit hay push lên git repository.
+
+---
+
+### 10.5. Chi Tiết Đồng Bộ Epoch AMCL & Reset Mô Phỏng (Lượt Rà Soát Kỹ Thuật Chuyên Sâu)
+- **Tình huống (1): Pose AMCL đến trước `/clock` khi kết nối lần đầu (Robot đứng yên):**
+  - Khởi tạo adapter với `_pose_epoch = 0`, `_pose_received_epoch = -1`, `_sim_restarted = False`, `_last_clock_sec = None`.
+  - Khi AMCL latched message đến trước: gán `_pose_received_epoch = _pose_epoch = 0`.
+  - Khi `/clock` đến sau (lần đầu tiên): `_last_clock_sec = new_sec`, không kích hoạt clock rollback, `_pose_epoch` giữ nguyên `0`.
+  - Robot đứng yên (không có pose AMCL mới phát sinh): `has_valid_pose` vẫn thỏa mãn `(pose is not None and not _sim_restarted and _pose_received_epoch == _pose_epoch)`.
+  - Kết quả: `is_connected = True` (Robot: OK), nút Bắt đầu được mở bình thường.
+- **Tình huống (2): `/clock` quay lùi sau reset Gazebo:**
+  - Phiên cũ có `_pose_epoch = 0`, `_pose_received_epoch = 0`.
+  - Reset Gazebo khiến clock quay lùi (`new_sec < _last_clock_sec - 0.5`): `_sim_restarted = True`, `_pose_epoch += 1` (lên 1), hủy các goal cũ đang treo.
+  - Sau đó clock tiếp tục tăng tiến trong phiên mới (1s ➔ 2s ➔ 5s):
+    - Đã gỡ bỏ đoạn code xóa cờ `_sim_restarted` theo clock thông thường.
+    - Cờ `_sim_restarted` và điều kiện `_pose_received_epoch != _pose_epoch` tiếp tục duy trì.
+    - Pose cũ **tuyệt đối không được công nhận**. Trạng thái báo `is_connected = False` (Robot: KHÔNG OK, `is_data_stale = True`), thông báo *"Mô phỏng đang khởi động lại, chờ vị trí mới từ AMCL..."*.
+    - Nút "Bắt đầu dẫn đường" ở cả Frontend lẫn Backend (`start_navigation`, `resume_navigation`) bị khóa chặt chẽ.
+  - Khi AMCL trong phiên Gazebo mới định vị và phát pose mới:
+    - Callback gán `_pose_received_epoch = _pose_epoch = 1` và xóa cờ `_sim_restarted = False`.
+    - Trạng thái chuyển sang `is_connected = True` (Robot: OK), `is_data_stale = False`. Nút Bắt đầu được mở lại an toàn.
 

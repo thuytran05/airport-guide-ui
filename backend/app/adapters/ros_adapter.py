@@ -388,6 +388,7 @@ class RosRobotAdapter(BaseRobotAdapter):
             }
             self._last_pose_time = time.time()
             self._pose_received_epoch = self._pose_epoch
+            self._sim_restarted = False
             self._is_connected = True
             if self._message == "Đang kết nối tới các topic ROS...":
                 self._message = "Hệ thống sẵn sàng đón khách"
@@ -413,6 +414,7 @@ class RosRobotAdapter(BaseRobotAdapter):
             }
             self._last_pose_time = time.time()
             self._pose_received_epoch = self._pose_epoch
+            self._sim_restarted = False
             self._is_connected = True
             if self._message == "Đang kết nối tới các topic ROS...":
                 self._message = "Hệ thống sẵn sàng đón khách"
@@ -438,8 +440,11 @@ class RosRobotAdapter(BaseRobotAdapter):
                     )
                     self._sim_restarted = True
                     self._pose_epoch += 1
-                    # Không xóa pose cũ ngay — giữ tham chiếu để frontend biết vị trí cuối
-                    # nhưng đánh dấu stale cho đến khi nhận pose mới từ epoch mới
+                    if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED"):
+                        self._navigation_state = "IDLE"
+                        self._current_goal_handle = None
+                        self._path = None
+                        self._path_version = getattr(self, "_path_version", 0) + 1
 
             self._last_clock_sec = new_sec
             self._last_clock_monotonic = now_mono
@@ -646,18 +651,14 @@ class RosRobotAdapter(BaseRobotAdapter):
                 if self._last_clock_sec is not None:
                     if (now_mono - self._last_clock_monotonic) > 3.0:
                         self._clock_stalled = True
-                    else:
-                        # Clock đang tiến triển bình thường
-                        if self._sim_restarted and (now_mono - self._last_clock_monotonic) < 1.0:
-                            if self._pose is not None:
-                                self._sim_restarted = False
                 else:
                     self._clock_stalled = True
 
-                # Pose hợp lệ: đã nhận ít nhất 1 pose
+                # Pose hợp lệ: đã nhận ít nhất 1 pose và thuộc đúng epoch hiện tại
                 has_valid_pose = (
                     self._pose is not None
-                    and (not self._sim_restarted or self._pose_received_epoch == self._pose_epoch)
+                    and not getattr(self, "_sim_restarted", False)
+                    and (getattr(self, "_pose_received_epoch", 0) == getattr(self, "_pose_epoch", 0))
                 )
 
                 # is_connected cho sim:
@@ -671,7 +672,7 @@ class RosRobotAdapter(BaseRobotAdapter):
                 is_stale = False
                 if self._clock_stalled:
                     is_stale = True
-                elif self._sim_restarted and not has_valid_pose:
+                elif self._sim_restarted or not has_valid_pose:
                     is_stale = True
                 elif self._pose is None:
                     is_stale = True
@@ -684,8 +685,8 @@ class RosRobotAdapter(BaseRobotAdapter):
                         status_message = "Đang chờ dữ liệu vị trí từ AMCL..."
                 elif self._clock_stalled:
                     status_message = "Mô phỏng không cập nhật (clock ngừng tiến)"
-                elif self._sim_restarted and not has_valid_pose:
-                    status_message = "Mô phỏng đang khởi động lại, chờ vị trí mới..."
+                elif self._sim_restarted or (self._pose_received_epoch != self._pose_epoch):
+                    status_message = "Mô phỏng đang khởi động lại, chờ vị trí mới từ AMCL..."
                 elif self._message == "Đang kết nối tới các topic ROS...":
                     status_message = "Hệ thống sẵn sàng đón khách"
                 else:
@@ -1031,8 +1032,17 @@ class RosRobotAdapter(BaseRobotAdapter):
                 return {"success": False, "message": "Robot đang ở chế độ điều khiển thủ công (MANUAL). Hãy chuyển sang AUTO trước."}
 
             # 3. Kiểm tra sim clock stalled (nếu dùng sim time)
-            if self._cfg.use_sim_time and self._clock_stalled:
+            if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False):
                 return {"success": False, "message": "Mô phỏng đang tạm dừng (sim clock stalled). Không thể gửi mục tiêu."}
+
+            if self._cfg.use_sim_time and (
+                getattr(self, "_sim_restarted", False)
+                or getattr(self, "_pose_received_epoch", 0) != getattr(self, "_pose_epoch", 0)
+            ):
+                return {
+                    "success": False,
+                    "message": "Mô phỏng vừa khởi động lại. Đang chờ dữ liệu vị trí robot mới từ AMCL."
+                }
 
             # 4. Kiểm tra xem robot có đang bận thực hiện chuyến nào không (Chống gửi trùng)
             if self._navigation_state in ("PENDING", "ACCEPTED", "NAVIGATING", "PAUSING", "PAUSED", "CANCELING"):
@@ -1402,6 +1412,15 @@ class RosRobotAdapter(BaseRobotAdapter):
             # 2. Kiểm tra sim clock nếu use_sim_time
             if self._cfg.use_sim_time and getattr(self, "_clock_stalled", False):
                 return {"success": False, "message": "Mô phỏng đang tạm dừng (sim clock stalled). Không thể tiếp tục."}
+
+            if self._cfg.use_sim_time and (
+                getattr(self, "_sim_restarted", False)
+                or getattr(self, "_pose_received_epoch", 0) != getattr(self, "_pose_epoch", 0)
+            ):
+                return {
+                    "success": False,
+                    "message": "Mô phỏng vừa khởi động lại. Đang chờ dữ liệu vị trí robot mới từ AMCL."
+                }
 
             # 3. Kiểm tra vị trí robot hiện tại từ AMCL
             if not self._pose:

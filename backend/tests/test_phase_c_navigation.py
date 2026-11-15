@@ -1638,3 +1638,288 @@ async def test_navigation_pause_resume_lifecycle_and_permissions(tmp_path):
                 app_adapter._destinations = orig_dests
 
 
+# =========================================================================
+# 11. AMCL Epoch Synchronization & Simulation Clock Reset Regression Tests
+# =========================================================================
+
+class MockClockHeader:
+    def __init__(self, sec: int = 0, nanosec: int = 0):
+        self.sec = sec
+        self.nanosec = nanosec
+
+class MockClockMsg:
+    def __init__(self, sec: int, nanosec: int = 0):
+        self.clock = MockClockHeader(sec=sec, nanosec=nanosec)
+
+class MockPoint:
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x = x
+        self.y = y
+        self.z = z
+
+class MockQuaternion:
+    def __init__(self, x=0.0, y=0.0, z=0.0, w=1.0):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.w = w
+
+class MockPoseInner:
+    def __init__(self, x=0.0, y=0.0):
+        self.position = MockPoint(x, y)
+        self.orientation = MockQuaternion()
+
+class MockPoseWithCovariance:
+    def __init__(self, x=0.0, y=0.0):
+        self.pose = MockPoseInner(x, y)
+
+class MockAmclMsg:
+    def __init__(self, x=0.0, y=0.0, frame_id="map", sec=1):
+        class MockHeader:
+            def __init__(self, fid, s):
+                self.frame_id = fid
+                self.stamp = MockClockHeader(sec=s)
+        self.header = MockHeader(frame_id, sec)
+        self.pose = MockPoseWithCovariance(x, y)
+
+class MockDummyActionClient:
+    def __init__(self):
+        self.last_goal = None
+    def server_is_ready(self):
+        return True
+    def wait_for_server(self, timeout_sec=0.5):
+        return True
+    def send_goal_async(self, goal, feedback_callback=None):
+        self.last_goal = goal
+        class DummyFuture:
+            def add_done_callback(self, cb):
+                pass
+        return DummyFuture()
+
+def create_isolated_ros_adapter():
+    adapter = RosRobotAdapter.__new__(RosRobotAdapter)
+    adapter._lock = threading.Lock()
+    adapter._cfg = get_ros_config()
+    adapter._navigation_state = "IDLE"
+    adapter._control_mode = "AUTO"
+    adapter._has_goal = False
+    adapter._goal_id = ""
+    adapter._trip_id = ""
+    adapter._destination_id = ""
+    adapter._destinations = [
+        {"id": "d1", "name": "Điểm 1", "pose": {"position": {"x": 1.0, "y": 1.0, "z": 0.0}}}
+    ]
+    adapter._owner_id = ""
+    adapter._distance_remaining = None
+    adapter._estimated_time_remaining = None
+    adapter._number_of_recoveries = 0
+    adapter._voice_state = "IDLE"
+    adapter._voice_transcript = None
+    adapter._voice_response = None
+    adapter._message = "Đang kết nối tới các topic ROS..."
+    adapter._current_goal_handle = None
+    adapter._nav2_has_active_goal = False
+    adapter._path = None
+    adapter._path_version = 0
+    adapter._battery_percent = 90.0
+    adapter._map_version = "v1"
+    adapter._destinations_version = 1
+    adapter._last_pose_time = 0.0
+    adapter._pose = None
+    adapter._pose_frame_id = ""
+    adapter._pose_stamp = None
+
+    # Sim clock & epoch fields
+    adapter._last_clock_sec = None
+    adapter._last_clock_monotonic = 0.0
+    adapter._clock_stalled = False
+    adapter._sim_restarted = False
+    adapter._pose_epoch = 0
+    adapter._pose_received_epoch = -1
+
+    # Mock action client & MapMetadata
+    adapter._action_nav = MockDummyActionClient()
+    adapter._map_meta = MapMetadata(width=100, height=100, resolution=0.1, origin_x=0.0, origin_y=0.0, origin_yaw=0.0)
+    adapter._occupancy_grid_data = [0] * 10000
+
+    class DummyClock:
+        def now(self):
+            class DummyTime:
+                def to_msg(self):
+                    return MockClockHeader(sec=1, nanosec=0)
+            return DummyTime()
+
+    class DummyNode:
+        def get_clock(self):
+            return DummyClock()
+
+    adapter._node = DummyNode()
+    return adapter
+
+def test_amcl_epoch_pose_before_clock_initial_connection():
+    """
+    Regression Test (1):
+    Pose AMCL đến trước /clock lúc kết nối lần đầu.
+    Robot đứng yên (không có pose mới sau khi clock đến) vẫn kết nối thành công (Robot: OK, Bắt đầu mở).
+    """
+    adapter = create_isolated_ros_adapter()
+    import app.adapters.ros_adapter as ra_mod
+    orig_has_action = ra_mod.HAS_NAV2_ACTION
+    orig_nav_cls = ra_mod.NavigateToPose
+    ra_mod.HAS_NAV2_ACTION = True
+
+    class MockGoalMsg:
+        class Goal:
+            def __init__(self):
+                class MockTargetPose:
+                    def __init__(self):
+                        class MockHeader:
+                            def __init__(self):
+                                self.frame_id = "map"
+                                self.stamp = MockClockHeader()
+                        class MockPoseContent:
+                            def __init__(self):
+                                self.position = MockPoint()
+                                self.orientation = MockQuaternion()
+                        self.header = MockHeader()
+                        self.pose = MockPoseContent()
+                self.pose = MockTargetPose()
+
+    ra_mod.NavigateToPose = MockGoalMsg
+
+    try:
+        # Ban đầu chưa có dữ liệu gì: is_connected = False, sim_clock_stalled = True
+        init_st = adapter.get_status()
+        assert init_st["is_connected"] is False
+        assert init_st["sim_clock_stalled"] is True
+        assert "Đang chờ mô phỏng" in init_st["message"]
+
+        # 1. Pose AMCL đến TRƯỚC /clock (ví dụ AMCL latched pose đến trước)
+        adapter._on_amcl_pose(MockAmclMsg(x=1.5, y=2.5))
+        assert adapter._pose is not None
+        assert adapter._pose["x"] == 1.5
+        assert adapter._pose_received_epoch == 0
+        assert adapter._sim_restarted is False
+
+        # Tại thời điểm này /clock vẫn chưa đến -> vẫn chưa báo OK vì clock chưa tiến
+        mid_st = adapter.get_status()
+        assert mid_st["is_connected"] is False
+        assert mid_st["sim_clock_stalled"] is True
+
+        # 2. Sau đó /clock message đầu tiên xuất hiện (ví dụ lúc t = 10s)
+        adapter._on_clock(MockClockMsg(sec=10, nanosec=0))
+        assert adapter._last_clock_sec == 10.0
+        assert adapter._clock_stalled is False
+        assert adapter._pose_epoch == 0  # Không bị tăng epoch
+        assert adapter._sim_restarted is False
+
+        # 3. Robot đứng yên! AMCL không gửi thêm pose nào nữa.
+        # Clock tiếp tục tiến:
+        adapter._on_clock(MockClockMsg(sec=11, nanosec=0))
+        adapter._on_clock(MockClockMsg(sec=12, nanosec=0))
+
+        # Kiểm tra trạng thái: Robot đứng yên VẪN KẾT NỐI ĐƯỢC
+        final_st = adapter.get_status()
+        assert final_st["is_connected"] is True  # Robot: OK
+        assert final_st["is_data_stale"] is False
+        assert final_st["sim_restarted"] is False
+        assert final_st["sim_clock_stalled"] is False
+        assert final_st["pose"]["x"] == 1.5
+        assert final_st["message"] == "Hệ thống sẵn sàng đón khách"
+
+        # Nút "Bắt đầu dẫn đường" được phép kích hoạt thành công
+        start_res = adapter.start_navigation("d1", owner_id="admin")
+        assert start_res["success"] is True
+        assert adapter._navigation_state == "PENDING"
+    finally:
+        ra_mod.HAS_NAV2_ACTION = orig_has_action
+        ra_mod.NavigateToPose = orig_nav_cls
+
+
+def test_amcl_epoch_clock_rewind_requires_new_pose_after_gazebo_reset():
+    """
+    Regression Test (2):
+    /clock quay lùi sau reset Gazebo:
+    - Pose cũ KHÔNG được tự động công nhận cho phiên mới chỉ vì /clock tiếp tục tăng.
+    - Chờ pose hợp lệ của phiên mới rồi mới báo Robot: OK và mở lại nút Bắt đầu.
+    """
+    adapter = create_isolated_ros_adapter()
+    import app.adapters.ros_adapter as ra_mod
+    orig_has_action = ra_mod.HAS_NAV2_ACTION
+    orig_nav_cls = ra_mod.NavigateToPose
+    ra_mod.HAS_NAV2_ACTION = True
+
+    class MockGoalMsg:
+        class Goal:
+            def __init__(self):
+                class MockTargetPose:
+                    def __init__(self):
+                        class MockHeader:
+                            def __init__(self):
+                                self.frame_id = "map"
+                                self.stamp = MockClockHeader()
+                        class MockPoseContent:
+                            def __init__(self):
+                                self.position = MockPoint()
+                                self.orientation = MockQuaternion()
+                        self.header = MockHeader()
+                        self.pose = MockPoseContent()
+                self.pose = MockTargetPose()
+
+    ra_mod.NavigateToPose = MockGoalMsg
+
+    try:
+        # Giai đoạn 1: Phiên 1 đang chạy bình thường ở epoch 0
+        adapter._on_amcl_pose(MockAmclMsg(x=8.0, y=9.0))
+        adapter._on_clock(MockClockMsg(sec=120, nanosec=0))
+        s1 = adapter.get_status()
+        assert s1["is_connected"] is True
+        assert s1["pose"]["x"] == 8.0
+
+        # Giai đoạn 2: Gazebo bị reset! Clock quay lùi từ 120s về 0.5s
+        adapter._on_clock(MockClockMsg(sec=0, nanosec=500_000_000))
+        assert adapter._sim_restarted is True
+        assert adapter._pose_epoch == 1
+        assert adapter._pose_received_epoch == 0  # Thuộc epoch cũ!
+
+        # Giai đoạn 3: Trong phiên mới, clock tiếp tục tăng tiến bình thường (0.6s -> 5.0s)
+        adapter._on_clock(MockClockMsg(sec=1, nanosec=0))
+        adapter._on_clock(MockClockMsg(sec=2, nanosec=0))
+        adapter._on_clock(MockClockMsg(sec=5, nanosec=0))
+
+        # Quan trọng: Dù /clock tiếp tục tăng, pose cũ TUYỆT ĐỐI KHÔNG ĐƯỢC CÔNG NHẬN
+        s2 = adapter.get_status()
+        assert s2["is_connected"] is False  # Robot: KHÔNG OK
+        assert s2["is_data_stale"] is True
+        assert s2["sim_restarted"] is True
+        assert "khởi động lại" in s2["message"]
+
+        # Nút "Bắt đầu dẫn đường" bị khóa ở backend và trả về lỗi rõ ràng
+        blocked_start = adapter.start_navigation("d1", owner_id="admin")
+        assert blocked_start["success"] is False
+        assert "Mô phỏng vừa khởi động lại" in blocked_start["message"] or "chờ dữ liệu vị trí robot mới" in blocked_start["message"]
+
+        # Giai đoạn 4: AMCL trong phiên Gazebo mới định vị xong và phát pose mới (epoch 1)
+        adapter._on_amcl_pose(MockAmclMsg(x=0.0, y=0.0))  # Robot xuất hiện ở tọa độ gốc mới
+        assert adapter._pose_epoch == 1
+        assert adapter._pose_received_epoch == 1
+        assert adapter._sim_restarted is False
+
+        # Sau khi có pose của phiên mới: Robot: OK và nút Bắt đầu được mở lại
+        s3 = adapter.get_status()
+        assert s3["is_connected"] is True  # Robot: OK
+        assert s3["is_data_stale"] is False
+        assert s3["sim_restarted"] is False
+        assert s3["pose"]["x"] == 0.0
+        assert s3["message"] == "Hệ thống sẵn sàng đón khách"
+
+        # Bắt đầu dẫn đường thành công
+        ok_start = adapter.start_navigation("d1", owner_id="admin")
+        assert ok_start["success"] is True
+        assert adapter._navigation_state == "PENDING"
+    finally:
+        ra_mod.HAS_NAV2_ACTION = orig_has_action
+        ra_mod.NavigateToPose = orig_nav_cls
+
+
+
